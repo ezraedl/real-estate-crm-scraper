@@ -11,11 +11,9 @@ restartPolicyMaxRetries = 10
 [env]
 MONGODB_URI = "mongodb://localhost:27017/mlscraper"
 API_HOST = "0.0.0.0"
-API_PORT = "8000"
 MAX_CONCURRENT_JOBS = "5"
 REQUEST_DELAY = "1.0"
 MAX_RETRIES = "3"
 RATE_LIMIT_PER_MINUTE = "60"
 LOG_LEVEL = "INFO"
-PORT = "8000"
 NODE_ENV = "production"
