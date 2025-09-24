@@ -1,0 +1,20 @@
+# MongoDB Configuration
+MONGODB_URL=mongodb://localhost:27017
+DATABASE_NAME=mls_scraper
+
+# API Configuration
+API_HOST=0.0.0.0
+API_PORT=8000
+
+# Scraping Configuration
+MAX_CONCURRENT_JOBS=5
+REQUEST_DELAY=1.0
+MAX_RETRIES=3
+RATE_LIMIT_PER_MINUTE=60
+
+# DataImpulse Proxy Configuration
+DATAIMPULSE_API_KEY=your_dataimpulse_api_key_here
+DATAIMPULSE_ENDPOINT=https://api.dataimpulse.com/v1/proxies
+
+# Logging
+LOG_LEVEL=INFO
