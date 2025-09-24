@@ -1,338 +1,214 @@
-# MLS Scraping Server
+# Real Estate CRM - Scraper
 
-A high-performance, production-ready MLS data scraping server built with FastAPI, MongoDB, and HomeHarvest. This server provides immediate and scheduled scraping capabilities with advanced anti-bot measures and proxy support.
+Python-based MLS scraper service for the Real Estate CRM system.
 
-## Features
+## 🚀 Features
 
-### 🚀 Core Functionality
-- **Immediate Scraping**: High-priority on-demand property data updates
-- **Scheduled Jobs**: One-time and recurring scraping jobs with cron expressions
-- **MongoDB Storage**: Efficient property data storage with proper indexing
-- **Job Queue System**: MongoDB-based job management with status tracking
+- **MLS Data Scraping** - Extract property data from multiple sources
+- **FastAPI Web Service** - RESTful API for scraping operations
+- **MongoDB Integration** - Store scraped property data
+- **Scheduled Jobs** - Automated scraping with cron-like scheduling
+- **Proxy Support** - Rotate proxies for large-scale scraping
+- **Railway Deployment** - Production-ready deployment
 
-### 🛡️ Anti-Bot Measures
-- **DataImpulse Proxy Integration**: Rotating proxy support for better scraping success
-- **Random User Agents**: Multiple browser user agent rotation
-- **Request Delays**: Configurable delays between requests
-- **Header Randomization**: Dynamic HTTP headers to avoid detection
+## 🛠️ Tech Stack
 
-### 📊 Monitoring & Management
-- **Real-time Job Status**: Track scraping progress and completion
-- **Statistics Dashboard**: Server and scraping performance metrics
-- **Proxy Management**: Monitor and manage proxy performance
-- **Error Handling**: Comprehensive error tracking and recovery
+- **Python 3.8+** - Programming language
+- **FastAPI** - Web framework
+- **MongoDB** - Database
+- **Pymongo** - MongoDB driver
+- **Requests** - HTTP client
+- **BeautifulSoup** - HTML parsing
+- **Puppeteer** - Browser automation (via Node.js)
 
-## Quick Start
+## 📋 Prerequisites
 
-### Prerequisites
-- Python 3.9+
-- MongoDB 4.4+
-- DataImpulse API key (optional, for proxy support)
+- Python 3.8+
+- MongoDB
+- Node.js (for Puppeteer)
 
-### Test Structure
-- **`tests/`** - Permanent CI/CD tests that must work every time
-- **`temp_tests/`** - Temporary development/debug tests (can be deleted after use)
+## 🔧 Installation
 
-Run permanent tests: `python tests/run_tests.py`
-
-### Installation
-
-1. **Clone and setup**:
 ```bash
-git clone <your-repo>
-cd mls-scraping-server
+# Install Python dependencies
 pip install -r requirements.txt
-```
 
-2. **Configure environment**:
-```bash
+# Install Node.js dependencies (if using Puppeteer)
+npm install
+
+# Copy environment file
 cp env_example.txt .env
-# Edit .env with your MongoDB and proxy settings
+
+# Configure environment variables
+# Edit .env with your settings
 ```
 
-3. **Start MongoDB**:
-```bash
-# Make sure MongoDB is running on localhost:27017
-# Or update MONGODB_URL in .env
-```
+## 🚀 Development
 
-4. **Run the server**:
 ```bash
+# Start development server
+python start_server.py
+
+# Run scraper directly
 python main.py
+
+# Run tests
+python -m pytest tests/
+
+# Start scheduler
+python start_scheduler.py
 ```
 
-The server will start on `http://localhost:8000`
+## 🔐 Environment Variables
 
-### Test the Installation
+Create a `.env` file with the following variables:
 
-```bash
-python test_server.py
-```
-
-## API Endpoints
-
-### Immediate Scraping
-```http
-POST /scrape/immediate
-Content-Type: application/json
-
-{
-  "locations": ["92104", "San Diego, CA"],
-  "listing_type": "for_sale",
-  "property_types": ["single_family", "condos"],
-  "limit": 100
-}
-```
-
-### Scheduled Scraping
-```http
-POST /scrape/scheduled
-Content-Type: application/json
-
-{
-  "locations": ["San Diego, CA"],
-  "listing_type": "for_rent",
-  "past_days": 30,
-  "scheduled_at": "2024-01-15T10:00:00Z",
-  "priority": "normal"
-}
-```
-
-### Recurring Jobs
-```http
-POST /scrape/scheduled
-Content-Type: application/json
-
-{
-  "locations": ["92104"],
-  "listing_type": "sold",
-  "cron_expression": "0 */6 * * *",
-  "priority": "low"
-}
-```
-
-### Job Management
-```http
-GET /jobs/{job_id}          # Get job status
-GET /jobs                   # List all jobs
-POST /jobs/{job_id}/cancel  # Cancel a job
-```
-
-### Statistics
-```http
-GET /health                 # Health check
-GET /stats                  # Server statistics
-GET /proxies/stats          # Proxy statistics
-```
-
-## Configuration
-
-### Environment Variables
-
-```bash
-# MongoDB Configuration
-MONGODB_URL=mongodb://localhost:27017
-DATABASE_NAME=mls_scraper
+```env
+# Database
+MONGODB_URI=mongodb://localhost:27017/mlscraper
 
 # API Configuration
 API_HOST=0.0.0.0
 API_PORT=8000
 
 # Scraping Configuration
-MAX_CONCURRENT_JOBS=5
+MAX_CONCURRENT_JOBS=3
 REQUEST_DELAY=1.0
 MAX_RETRIES=3
 
 # Rate Limiting
 RATE_LIMIT_PER_MINUTE=60
 
-# DataImpulse Proxy (optional)
-DATAIMPULSE_API_KEY=your_api_key_here
+# DataImpulse Configuration (Optional)
+DATAIMPULSE_LOGIN=your-login
+DATAIMPULSE_PASSWORD=your-password
+DATAIMPULSE_ENDPOINT=your-endpoint
+
+# Logging
+LOG_LEVEL=INFO
 ```
 
-### Supported Parameters
+## 📡 API Endpoints
 
-#### Location Formats
-- ZIP codes: `"92104"`
-- Cities: `"San Diego"`
-- City, State: `"San Diego, CA"`
-- Full addresses: `"1234 Main St, San Diego, CA 92104"`
-- Radius searches: Include `radius` parameter
+### Health Check
+- `GET /health` - Service health status
 
-#### Listing Types
-- `for_sale` - Properties currently for sale
-- `for_rent` - Properties currently for rent
-- `sold` - Recently sold properties
-- `pending` - Pending/contingent sales
+### Scraping Jobs
+- `POST /scrape/location` - Start location-based scraping
+- `GET /jobs/{job_id}` - Get job status
+- `POST /jobs/{job_id}/trigger` - Trigger job execution
+- `GET /jobs` - List all jobs
 
-#### Property Types
-- `single_family`
-- `multi_family`
-- `condos`
-- `townhomes`
-- `duplex_triplex`
-- `farm`
-- `land`
-- `mobile`
+### Properties
+- `GET /properties` - Get scraped properties
+- `GET /properties/{property_id}` - Get specific property
+- `DELETE /properties/{property_id}` - Delete property
 
-## Data Schema
+## 🗄️ Database Schema
 
-### Property Model
+### Properties Collection
 ```json
 {
-  "property_id": "unique_identifier",
-  "mls_id": "MLS123456",
-  "address": {
-    "street": "123 Main St",
-    "city": "San Diego",
-    "state": "CA",
-    "zip_code": "92104",
-    "formatted_address": "123 Main St, San Diego, CA 92104"
-  },
-  "description": {
-    "beds": 3,
-    "full_baths": 2,
-    "half_baths": 1,
-    "sqft": 1500,
-    "year_built": 2020,
-    "property_type": "single_family"
-  },
-  "financial": {
-    "list_price": 750000,
-    "sold_price": 720000,
-    "price_per_sqft": 480
-  },
-  "dates": {
-    "list_date": "2024-01-01T00:00:00Z",
-    "last_sold_date": "2024-01-15T00:00:00Z"
-  },
+  "_id": "ObjectId",
+  "property_id": "string",
+  "address": "string",
+  "price": "number",
+  "bedrooms": "number",
+  "bathrooms": "number",
+  "square_feet": "number",
+  "lot_size": "number",
+  "property_type": "string",
+  "status": "string",
+  "year_built": "number",
+  "description": "string",
+  "images": ["string"],
   "location": {
-    "latitude": 32.7157,
-    "longitude": -117.1611,
-    "neighborhoods": ["Downtown"]
-  }
+    "latitude": "number",
+    "longitude": "number"
+  },
+  "scraped_at": "datetime",
+  "source": "string"
 }
 ```
 
-## Advanced Usage
-
-### Custom Proxy Configuration
-```python
-# Add custom proxies
-from proxy_manager import proxy_manager
-
-proxy_manager.add_proxy("proxy1.example.com", 8080, "username", "password")
-proxy_manager.add_proxy("proxy2.example.com", 8080, "username", "password")
+### Jobs Collection
+```json
+{
+  "_id": "ObjectId",
+  "job_id": "string",
+  "type": "string",
+  "status": "string",
+  "parameters": "object",
+  "created_at": "datetime",
+  "updated_at": "datetime",
+  "completed_at": "datetime",
+  "error": "string"
+}
 ```
 
-### DataImpulse Integration
-```python
-# Initialize DataImpulse proxies
-await proxy_manager.initialize_dataimpulse_proxies("your_api_key")
-```
+## 🚀 Deployment
 
-### Custom Scraping Jobs
-```python
-from models import ScrapingJob, JobPriority, ListingType
+### Railway
 
-job = ScrapingJob(
-    job_id="custom_job_123",
-    priority=JobPriority.HIGH,
-    locations=["San Diego, CA", "Los Angeles, CA"],
-    listing_type=ListingType.FOR_SALE,
-    property_types=[PropertyType.SINGLE_FAMILY],
-    past_days=30,
-    limit=5000
-)
-```
+This scraper is configured for Railway deployment:
 
-## Monitoring & Maintenance
+1. Connect your GitHub repository to Railway
+2. Set environment variables in Railway dashboard
+3. Deploy automatically on push
 
-### Health Checks
-The server provides comprehensive health monitoring:
-- Database connectivity
-- Scraper service status
-- Proxy availability
-- Job queue status
+### Docker
 
-### Performance Tuning
-- Adjust `MAX_CONCURRENT_JOBS` based on your server capacity
-- Tune `REQUEST_DELAY` to balance speed vs. detection avoidance
-- Monitor proxy success rates and rotate as needed
-
-### Error Handling
-- Automatic retry logic for failed requests
-- Proxy rotation on failures
-- Job status tracking with error messages
-- Comprehensive logging
-
-## Production Deployment
-
-### Docker Support
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-EXPOSE 8000
-
-CMD ["python", "main.py"]
-```
-
-### Environment Setup
-1. Use production MongoDB instance
-2. Configure proper proxy rotation
-3. Set up monitoring and alerting
-4. Implement log aggregation
-5. Configure backup strategies
-
-## Troubleshooting
-
-### Common Issues
-
-1. **MongoDB Connection Failed**
-   - Check MongoDB is running
-   - Verify connection string in `.env`
-
-2. **Scraping Failures**
-   - Check proxy configuration
-   - Verify rate limiting settings
-   - Monitor for IP blocks
-
-3. **Job Queue Issues**
-   - Check job status endpoints
-   - Verify MongoDB indexes
-   - Monitor server resources
-
-### Debug Mode
 ```bash
-# Enable debug logging
-export LOG_LEVEL=DEBUG
-python main.py
+# Build Docker image
+docker build -t real-estate-crm-scraper .
+
+# Run container
+docker run -p 8000:8000 real-estate-crm-scraper
 ```
 
-## Contributing
+## 📝 Scripts
+
+- `main.py` - Main FastAPI application
+- `scraper.py` - Core scraping logic
+- `database.py` - Database operations
+- `scheduler.py` - Job scheduling
+- `start_server.py` - Development server
+- `start_scheduler.py` - Start job scheduler
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+python -m pytest tests/
+
+# Run specific test
+python -m pytest tests/test_scraper_basic.py
+
+# Run with coverage
+python -m pytest --cov=. tests/
+```
+
+## 📊 Monitoring
+
+- **Health Check**: `GET /health`
+- **Job Status**: `GET /jobs`
+- **Metrics**: Built-in FastAPI metrics
+- **Logs**: Structured logging with configurable levels
+
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Add tests
+4. Add tests if applicable
 5. Submit a pull request
 
-## License
+## 📄 License
 
-MIT License - see LICENSE file for details
+MIT License
 
-## Support
+## 🔗 Related Repositories
 
-For issues and questions:
-- Create an issue in the repository
-- Check the troubleshooting section
-- Review the API documentation
-
----
-
-**Note**: This server is designed for legitimate real estate data collection. Please ensure compliance with all applicable terms of service and legal requirements.
+- [Backend](https://github.com/ezraedl/real-estate-crm-backend) - API server
+- [Frontend](https://github.com/ezraedl/real-estate-crm-frontend) - Web application
+- [Chrome Extension](https://github.com/ezraedl/real-estate-crm-extension) - Browser extension
