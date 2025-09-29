@@ -709,6 +709,124 @@ async def reset_proxy_stats():
         raise HTTPException(status_code=500, detail="Failed to reset proxy statistics")
 
 # Documentation endpoints
+# Properties API endpoint
+@app.get("/api/properties")
+async def get_properties(
+    page: int = 1,
+    limit: int = 25,
+    status: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    locations: Optional[str] = None,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+    bedrooms: Optional[int] = None,
+    bathrooms: Optional[float] = None,
+    property_types: Optional[str] = None,
+    search: Optional[str] = None,
+    sort_by: Optional[str] = "scraped_at",
+    sort_order: Optional[str] = "desc"
+):
+    """Get properties with pagination, filtering, and sorting"""
+    try:
+        # Build MongoDB query filters
+        filters = {}
+        
+        # Status filtering
+        if status_filter == 'active':
+            filters["status"] = {"$in": ["FOR_SALE", "ACTIVE", "PENDING", "CONTINGENT"]}
+        elif status_filter == 'sold':
+            filters["status"] = "SOLD"
+        elif status:
+            filters["status"] = status
+        
+        # Location filtering
+        if locations:
+            location_list = locations.split(',')
+            location_filters = []
+            for loc in location_list:
+                loc = loc.strip()
+                location_filters.extend([
+                    {"address.city": {"$regex": loc, "$options": "i"}},
+                    {"address.state": {"$regex": loc, "$options": "i"}},
+                    {"address.zip_code": {"$regex": loc, "$options": "i"}},
+                    {"address.formatted_address": {"$regex": loc, "$options": "i"}}
+                ])
+            if location_filters:
+                filters["$or"] = location_filters
+        
+        # Price filtering
+        if price_min or price_max:
+            filters["financial.list_price"] = {}
+            if price_min:
+                filters["financial.list_price"]["$gte"] = price_min
+            if price_max:
+                filters["financial.list_price"]["$lte"] = price_max
+        
+        # Bedrooms filtering
+        if bedrooms:
+            filters["description.beds"] = bedrooms
+        
+        # Bathrooms filtering
+        if bathrooms:
+            filters["description.full_baths"] = bathrooms
+        
+        # Property type filtering
+        if property_types:
+            type_list = property_types.split(',')
+            filters["description.property_type"] = {"$in": [t.strip() for t in type_list]}
+        
+        # Search filtering
+        if search:
+            search_term = search.strip()
+            filters["$or"] = [
+                {"address.street": {"$regex": search_term, "$options": "i"}},
+                {"address.city": {"$regex": search_term, "$options": "i"}},
+                {"address.state": {"$regex": search_term, "$options": "i"}},
+                {"description.text": {"$regex": search_term, "$options": "i"}},
+                {"address.formatted_address": {"$regex": search_term, "$options": "i"}}
+            ]
+        
+        # Calculate skip for pagination
+        skip = (page - 1) * limit
+        
+        # Build sort criteria
+        sort_criteria = []
+        if sort_by and sort_order:
+            sort_direction = 1 if sort_order.lower() == "asc" else -1
+            sort_criteria.append((sort_by, sort_direction))
+        else:
+            sort_criteria.append(("scraped_at", -1))  # Default sort by scraped_at desc
+        
+        # Get total count
+        total_count = await db.properties_collection.count_documents(filters)
+        
+        # Get properties with pagination
+        cursor = db.properties_collection.find(filters).sort(sort_criteria).skip(skip).limit(limit)
+        
+        properties = []
+        async for prop_data in cursor:
+            prop_data["_id"] = str(prop_data["_id"])
+            properties.append(prop_data)
+        
+        # Calculate pagination info
+        total_pages = (total_count + limit - 1) // limit
+        has_next_page = page < total_pages
+        has_prev_page = page > 1
+        
+        return {
+            "properties": properties,
+            "totalCount": total_count,
+            "page": page,
+            "limit": limit,
+            "totalPages": total_pages,
+            "hasNextPage": has_next_page,
+            "hasPrevPage": has_prev_page
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting properties: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving properties: {str(e)}")
+
 @app.get("/documentation/database-schema", response_class=HTMLResponse)
 async def get_database_schema_docs():
     """Serve database schema documentation as HTML"""
