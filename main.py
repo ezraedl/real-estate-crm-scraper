@@ -648,7 +648,8 @@ async def trigger_existing_job(request: TriggerJobRequest):
                 priority=request.priority,
                 scheduled_job_id=scheduled_job.scheduled_job_id,  # Link to parent scheduled job
                 locations=scheduled_job.locations,
-                listing_type=scheduled_job.listing_type,
+                listing_types=scheduled_job.listing_types,  # Use multi-select field
+                listing_type=scheduled_job.listing_type,  # Keep for backward compatibility
                 property_types=scheduled_job.property_types,
                 past_days=past_days,  # Use the calculated past_days
                 date_from=scheduled_job.date_from,
@@ -1013,7 +1014,8 @@ async def list_scheduled_jobs(
                 "status": job_data.get("status"),
                 "cron_expression": job_data.get("cron_expression"),
                 "locations": job_data.get("locations"),
-                "listing_type": job_data.get("listing_type"),
+                "listing_types": job_data.get("listing_types", ["for_sale", "sold", "for_rent", "pending"]),  # New multi-select field
+                "listing_type": job_data.get("listing_type"),  # Backward compatibility
                 "run_count": actual_run_count,  # Use actual count from jobs collection
                 "has_running_job": has_running_job,  # Indicator if a job is currently running
                 "last_run_at": job_data.get("last_run_at"),
@@ -1045,6 +1047,11 @@ async def create_scheduled_job(job_data: dict):
         scheduled_job_id = f"scheduled_{job_data.get('listing_type', 'job')}_{int(datetime.utcnow().timestamp())}"
         
         # Create ScheduledJob instance
+        # Default to all listing types if not specified
+        listing_types = job_data.get('listing_types')
+        if not listing_types or len(listing_types) == 0:
+            listing_types = ["for_sale", "sold", "for_rent", "pending"]
+        
         scheduled_job = ScheduledJob(
             scheduled_job_id=scheduled_job_id,
             name=job_data.get('name'),
@@ -1053,7 +1060,8 @@ async def create_scheduled_job(job_data: dict):
             cron_expression=job_data.get('cron_expression'),
             timezone=job_data.get('timezone', 'UTC'),
             locations=job_data.get('locations'),
-            listing_type=job_data.get('listing_type'),
+            listing_types=listing_types,  # Use multi-select field
+            listing_type=job_data.get('listing_type'),  # Keep for backward compatibility
             property_types=job_data.get('property_types'),
             past_days=job_data.get('past_days'),
             date_from=job_data.get('date_from'),

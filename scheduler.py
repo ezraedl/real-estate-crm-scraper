@@ -183,7 +183,8 @@ class JobScheduler:
                 priority=scheduled_job.priority,
                 scheduled_job_id=scheduled_job.scheduled_job_id,  # Reference to parent
                 locations=scheduled_job.locations,
-                listing_type=scheduled_job.listing_type,
+                listing_types=scheduled_job.listing_types,  # Use new multi-select field
+                listing_type=scheduled_job.listing_type,  # Keep for backward compatibility
                 property_types=scheduled_job.property_types,
                 past_days=scheduled_job.past_days,
                 date_from=scheduled_job.date_from,

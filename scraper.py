@@ -174,19 +174,28 @@ class MLSScraper:
                 del self.current_jobs[job.job_id]
     
     async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None) -> List[Property]:
-        """Scrape ALL properties for a specific location - no filtering"""
+        """Scrape properties for a specific location based on job's listing_types"""
         try:
             all_properties = []
             
-            # Define all property types to scrape for comprehensive data
-            # Note: homeharvest doesn't support 'off_market' as a listing type
-            all_listing_types = ["for_sale", "sold", "for_rent", "pending"]
+            # Determine which listing types to scrape
+            if job.listing_types and len(job.listing_types) > 0:
+                # Use specified listing types
+                listing_types_to_scrape = job.listing_types
+                print(f"   [TARGET] Scraping specified types in {location}: {listing_types_to_scrape}")
+            elif job.listing_type:
+                # Backward compatibility: use single listing_type
+                listing_types_to_scrape = [job.listing_type]
+                print(f"   [TARGET] Scraping single type in {location}: {job.listing_type}")
+            else:
+                # Default: scrape all types for comprehensive data
+                listing_types_to_scrape = ["for_sale", "sold", "for_rent", "pending"]
+                print(f"   [TARGET] Scraping ALL property types in {location} (default)")
             
-            print(f"   [TARGET] Scraping ALL property types in {location} (no filtering)...")
-            print(f"   [DEBUG] Available listing types: {all_listing_types}")
+            print(f"   [DEBUG] Listing types to scrape: {listing_types_to_scrape}")
             print(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
-            for listing_type in all_listing_types:
+            for listing_type in listing_types_to_scrape:
                 try:
                     print(f"   [FETCH] Fetching {listing_type} properties...")
                     # Use higher limit to ensure we find the exact property

@@ -61,7 +61,8 @@ class ScheduledJob(BaseModel):
     
     # Scraping parameters (template for job instances)
     locations: List[str] = Field(..., description="List of locations to scrape")
-    listing_type: Optional[ListingType] = None
+    listing_types: Optional[List[ListingType]] = Field(default=None, description="List of listing types to scrape (for_sale, sold, etc.)")
+    listing_type: Optional[ListingType] = Field(default=None, description="DEPRECATED: Use listing_types instead")
     property_types: Optional[List[PropertyType]] = None
     past_days: Optional[int] = None
     date_from: Optional[str] = None
@@ -114,7 +115,8 @@ class ScrapingJob(BaseModel):
     
     # Scraping parameters
     locations: List[str] = Field(..., description="List of locations to scrape")
-    listing_type: Optional[ListingType] = None
+    listing_types: Optional[List[ListingType]] = Field(default=None, description="List of listing types to scrape (for_sale, sold, etc.)")
+    listing_type: Optional[ListingType] = Field(default=None, description="DEPRECATED: Use listing_types instead")
     property_types: Optional[List[PropertyType]] = None
     past_days: Optional[int] = None
     date_from: Optional[str] = None
