@@ -652,6 +652,127 @@ async def get_job_status(job_id: str):
         logger.error(f"Error getting job status: {e}")
         raise HTTPException(status_code=500, detail="Failed to get job status")
 
+# Get statistics for a scheduled job (MUST come before generic /{scheduled_job_id} route)
+@app.get("/scheduled-jobs/{scheduled_job_id}/stats")
+async def get_scheduled_job_stats(scheduled_job_id: str):
+    """Get detailed statistics for a scheduled job"""
+    try:
+        # Get the scheduled job
+        scheduled_job = await db.get_scheduled_job(scheduled_job_id)
+        if not scheduled_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        # Get all job runs for this scheduled job
+        job_runs_cursor = db.jobs_collection.find(
+            {"scheduled_job_id": scheduled_job_id}
+        ).sort([("created_at", -1)])
+        
+        total_runs = 0
+        successful_runs = 0
+        failed_runs = 0
+        total_properties_scraped = 0
+        total_properties_saved = 0
+        total_duration_seconds = 0
+        duration_count = 0
+        last_successful_run = None
+        
+        async for job_data in job_runs_cursor:
+            total_runs += 1
+            
+            if job_data.get('status') == 'completed':
+                successful_runs += 1
+                total_properties_scraped += job_data.get('properties_scraped', 0)
+                total_properties_saved += job_data.get('properties_saved', 0)
+                
+                # Calculate duration
+                if job_data.get('started_at') and job_data.get('completed_at'):
+                    duration = (job_data['completed_at'] - job_data['started_at']).total_seconds()
+                    total_duration_seconds += duration
+                    duration_count += 1
+                
+                # Track last successful run
+                if not last_successful_run:
+                    last_successful_run = {
+                        "job_id": job_data.get('job_id'),
+                        "completed_at": job_data.get('completed_at'),
+                        "properties_scraped": job_data.get('properties_scraped', 0),
+                        "properties_saved": job_data.get('properties_saved', 0)
+                    }
+                    
+            elif job_data.get('status') == 'failed':
+                failed_runs += 1
+        
+        # Calculate success rate
+        success_rate = (successful_runs / total_runs * 100) if total_runs > 0 else 0
+        
+        # Calculate average duration
+        average_duration_seconds = (total_duration_seconds / duration_count) if duration_count > 0 else 0
+        
+        # Count unique properties added (properties with this job's scheduled_job_id)
+        unique_properties_count = await db.properties_collection.count_documents({
+            "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"}
+        })
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "total_runs": total_runs,
+            "successful_runs": successful_runs,
+            "failed_runs": failed_runs,
+            "success_rate": round(success_rate, 1),
+            "total_properties_scraped": total_properties_scraped,
+            "total_properties_saved": total_properties_saved,
+            "unique_properties_added": unique_properties_count,
+            "average_duration_seconds": round(average_duration_seconds, 1),
+            "last_successful_run": last_successful_run,
+            "next_run_at": scheduled_job.next_run_at
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job statistics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get job statistics: {str(e)}")
+
+# Toggle scheduled job status (MUST come before generic /{scheduled_job_id} route)
+@app.patch("/scheduled-jobs/{scheduled_job_id}/status")
+async def toggle_scheduled_job_status(scheduled_job_id: str, status_data: dict):
+    """Toggle the status of a scheduled job (active/inactive/paused)"""
+    try:
+        from models import ScheduledJobStatus
+        
+        # Validate status
+        status = status_data.get('status')
+        if not status:
+            raise HTTPException(status_code=400, detail="Status field is required")
+        
+        if status not in [s.value for s in ScheduledJobStatus]:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}. Must be one of: active, inactive, paused")
+        
+        # Check if job exists
+        existing_job = await db.get_scheduled_job(scheduled_job_id)
+        if not existing_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        # Update status
+        success = await db.update_scheduled_job_status(scheduled_job_id, ScheduledJobStatus(status))
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update job status")
+        
+        logger.info(f"Updated status of scheduled job {scheduled_job_id} to {status}")
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "status": status,
+            "message": f"Status updated to {status}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error toggling job status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to toggle job status: {str(e)}")
+
 # Get scheduled job details and run history
 @app.get("/scheduled-jobs/{scheduled_job_id}")
 async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = True, limit: int = 50):
@@ -901,46 +1022,6 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
         logger.error(f"Error updating scheduled job: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update scheduled job: {str(e)}")
 
-# Toggle scheduled job status
-@app.patch("/scheduled-jobs/{scheduled_job_id}/status")
-async def toggle_scheduled_job_status(scheduled_job_id: str, status_data: dict):
-    """Toggle the status of a scheduled job (active/inactive/paused)"""
-    try:
-        from models import ScheduledJobStatus
-        
-        # Validate status
-        status = status_data.get('status')
-        if not status:
-            raise HTTPException(status_code=400, detail="Status field is required")
-        
-        if status not in [s.value for s in ScheduledJobStatus]:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}. Must be one of: active, inactive, paused")
-        
-        # Check if job exists
-        existing_job = await db.get_scheduled_job(scheduled_job_id)
-        if not existing_job:
-            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
-        
-        # Update status
-        success = await db.update_scheduled_job_status(scheduled_job_id, ScheduledJobStatus(status))
-        
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to update job status")
-        
-        logger.info(f"Updated status of scheduled job {scheduled_job_id} to {status}")
-        
-        return {
-            "scheduled_job_id": scheduled_job_id,
-            "status": status,
-            "message": f"Status updated to {status}"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error toggling job status: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to toggle job status: {str(e)}")
-
 # Delete scheduled job
 @app.delete("/scheduled-jobs/{scheduled_job_id}")
 async def delete_scheduled_job(scheduled_job_id: str):
@@ -969,87 +1050,6 @@ async def delete_scheduled_job(scheduled_job_id: str):
     except Exception as e:
         logger.error(f"Error deleting scheduled job: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete scheduled job: {str(e)}")
-
-# Get statistics for a scheduled job
-@app.get("/scheduled-jobs/{scheduled_job_id}/stats")
-async def get_scheduled_job_stats(scheduled_job_id: str):
-    """Get detailed statistics for a scheduled job"""
-    try:
-        # Get the scheduled job
-        scheduled_job = await db.get_scheduled_job(scheduled_job_id)
-        if not scheduled_job:
-            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
-        
-        # Get all job runs for this scheduled job
-        job_runs_cursor = db.jobs_collection.find(
-            {"scheduled_job_id": scheduled_job_id}
-        ).sort([("created_at", -1)])
-        
-        total_runs = 0
-        successful_runs = 0
-        failed_runs = 0
-        total_properties_scraped = 0
-        total_properties_saved = 0
-        total_duration_seconds = 0
-        duration_count = 0
-        last_successful_run = None
-        
-        async for job_data in job_runs_cursor:
-            total_runs += 1
-            
-            if job_data.get('status') == 'completed':
-                successful_runs += 1
-                total_properties_scraped += job_data.get('properties_scraped', 0)
-                total_properties_saved += job_data.get('properties_saved', 0)
-                
-                # Calculate duration
-                if job_data.get('started_at') and job_data.get('completed_at'):
-                    duration = (job_data['completed_at'] - job_data['started_at']).total_seconds()
-                    total_duration_seconds += duration
-                    duration_count += 1
-                
-                # Track last successful run
-                if not last_successful_run:
-                    last_successful_run = {
-                        "job_id": job_data.get('job_id'),
-                        "completed_at": job_data.get('completed_at'),
-                        "properties_scraped": job_data.get('properties_scraped', 0),
-                        "properties_saved": job_data.get('properties_saved', 0)
-                    }
-                    
-            elif job_data.get('status') == 'failed':
-                failed_runs += 1
-        
-        # Calculate success rate
-        success_rate = (successful_runs / total_runs * 100) if total_runs > 0 else 0
-        
-        # Calculate average duration
-        average_duration_seconds = (total_duration_seconds / duration_count) if duration_count > 0 else 0
-        
-        # Count unique properties added (properties with this job's scheduled_job_id)
-        unique_properties_count = await db.properties_collection.count_documents({
-            "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"}
-        })
-        
-        return {
-            "scheduled_job_id": scheduled_job_id,
-            "total_runs": total_runs,
-            "successful_runs": successful_runs,
-            "failed_runs": failed_runs,
-            "success_rate": round(success_rate, 1),
-            "total_properties_scraped": total_properties_scraped,
-            "total_properties_saved": total_properties_saved,
-            "unique_properties_added": unique_properties_count,
-            "average_duration_seconds": round(average_duration_seconds, 1),
-            "last_successful_run": last_successful_run,
-            "next_run_at": scheduled_job.next_run_at
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting job statistics: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get job statistics: {str(e)}")
 
 # List jobs
 @app.get("/jobs")
