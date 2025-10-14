@@ -106,7 +106,10 @@ class Database:
             update_data.update(kwargs)
             
             if status == JobStatus.RUNNING:
-                update_data["started_at"] = datetime.utcnow()
+                # Only set started_at if not already set (don't overwrite on progress updates)
+                existing_job = await self.jobs_collection.find_one({"job_id": job_id})
+                if existing_job and not existing_job.get("started_at"):
+                    update_data["started_at"] = datetime.utcnow()
             elif status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                 update_data["completed_at"] = datetime.utcnow()
             
