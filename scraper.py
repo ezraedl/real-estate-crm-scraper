@@ -105,14 +105,31 @@ class MLSScraper:
                 properties_saved=saved_properties
             )
             
-            # Update run history for recurring jobs
-            if job.original_job_id:
+            # Update run history for scheduled jobs (new architecture)
+            if job.scheduled_job_id:
+                # Calculate next run time
+                scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                if scheduled_job and scheduled_job.cron_expression:
+                    import croniter
+                    cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+                    next_run = cron.get_next(datetime)
+                    
+                    await db.update_scheduled_job_run_history(
+                        job.scheduled_job_id,
+                        job.job_id,
+                        JobStatus.COMPLETED,
+                        next_run_at=next_run
+                    )
+                    print(f"Updated run history for scheduled job: {job.scheduled_job_id}")
+            
+            # Legacy: Update run history for old recurring jobs
+            elif job.original_job_id:
                 await db.update_recurring_job_run_history(
                     job.original_job_id,
                     job.job_id,
                     JobStatus.COMPLETED
                 )
-                print(f"Updated run history for recurring job: {job.original_job_id}")
+                print(f"Updated run history for legacy recurring job: {job.original_job_id}")
             
             print(f"Job {job.job_id} completed: {saved_properties} properties saved")
             
@@ -124,14 +141,30 @@ class MLSScraper:
                 error_message=str(e)
             )
             
-            # Update run history for recurring jobs (failed)
-            if job.original_job_id:
+            # Update run history for scheduled jobs (new architecture)
+            if job.scheduled_job_id:
+                scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                if scheduled_job and scheduled_job.cron_expression:
+                    import croniter
+                    cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+                    next_run = cron.get_next(datetime)
+                    
+                    await db.update_scheduled_job_run_history(
+                        job.scheduled_job_id,
+                        job.job_id,
+                        JobStatus.FAILED,
+                        next_run_at=next_run
+                    )
+                    print(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
+            
+            # Legacy: Update run history for old recurring jobs (failed)
+            elif job.original_job_id:
                 await db.update_recurring_job_run_history(
                     job.original_job_id,
                     job.job_id,
                     JobStatus.FAILED
                 )
-                print(f"Updated run history for recurring job (failed): {job.original_job_id}")
+                print(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
         
         finally:
             # Remove from current jobs
