@@ -966,7 +966,13 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
                     "completed_at": job_data.get("completed_at"),
                     "properties_scraped": job_data.get("properties_scraped", 0),
                     "properties_saved": job_data.get("properties_saved", 0),
-                    "error_message": job_data.get("error_message")
+                    "properties_inserted": job_data.get("properties_inserted", 0),
+                    "properties_updated": job_data.get("properties_updated", 0),
+                    "properties_skipped": job_data.get("properties_skipped", 0),
+                    "completed_locations": job_data.get("completed_locations", 0),
+                    "total_locations": job_data.get("total_locations", 0),
+                    "error_message": job_data.get("error_message"),
+                    "progress_logs": job_data.get("progress_logs", [])  # Include progress logs!
                 })
             
             response["job_runs"] = job_runs
