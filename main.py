@@ -47,6 +47,134 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Helper function to handle stuck jobs on startup
+async def handle_stuck_jobs():
+    """
+    Check for jobs stuck in 'running' status and retry them.
+    For each scheduled job, only retry the most recent stuck job.
+    All other stuck jobs for the same scheduled job are marked as failed immediately.
+    Jobs are retried up to 3 times (original + 2 retries).
+    After 3 failed attempts, mark as failed.
+    """
+    try:
+        # Find all jobs stuck in "running" status
+        stuck_jobs_cursor = db.jobs_collection.find({"status": JobStatus.RUNNING.value}).sort([("created_at", -1)])
+        stuck_jobs = []
+        async for job_data in stuck_jobs_cursor:
+            job_data["_id"] = str(job_data["_id"])
+            stuck_jobs.append(ScrapingJob(**job_data))
+        
+        if not stuck_jobs:
+            logger.info("No stuck jobs found")
+            return
+        
+        logger.warning(f"Found {len(stuck_jobs)} stuck jobs in 'running' status")
+        
+        # Group stuck jobs by scheduled_job_id (or None for one-time jobs)
+        jobs_by_scheduled = {}
+        for job in stuck_jobs:
+            key = job.scheduled_job_id or job.job_id
+            if key not in jobs_by_scheduled:
+                jobs_by_scheduled[key] = []
+            jobs_by_scheduled[key].append(job)
+        
+        # Process each group
+        for scheduled_key, job_group in jobs_by_scheduled.items():
+            if len(job_group) > 1:
+                logger.warning(
+                    f"Found {len(job_group)} stuck jobs for scheduled_job_id={scheduled_key}. "
+                    f"Will retry only the most recent one and fail the rest."
+                )
+                # Most recent is first (sorted by created_at desc)
+                job_to_retry = job_group[0]
+                jobs_to_fail = job_group[1:]
+                
+                # Mark the older ones as failed immediately
+                for old_job in jobs_to_fail:
+                    logger.info(f"Marking old stuck job as failed: {old_job.job_id}")
+                    await db.update_job_status(
+                        old_job.job_id,
+                        JobStatus.FAILED,
+                        error_message="Job stuck in running status. Newer job found for same scheduled job."
+                    )
+            else:
+                job_to_retry = job_group[0]
+            
+            # Now handle the job to retry
+            job = job_to_retry
+            try:
+                # Check how many times this job has been retried
+                retry_count = job.job_id.count("_retry_")
+                
+                if retry_count >= 2:
+                    # Already retried twice (3 total attempts), mark as failed
+                    logger.warning(
+                        f"Job {job.job_id} has been retried {retry_count} times. Marking as failed."
+                    )
+                    await db.update_job_status(
+                        job.job_id,
+                        JobStatus.FAILED,
+                        error_message="Job stuck in running status after service restart. Max retries exceeded."
+                    )
+                    
+                    # Update scheduled job history if applicable
+                    if job.scheduled_job_id:
+                        await db.update_scheduled_job_run_history(
+                            job.scheduled_job_id,
+                            job.job_id,
+                            JobStatus.FAILED
+                        )
+                else:
+                    # Retry the job
+                    logger.info(
+                        f"Retrying stuck job {job.job_id} (attempt {retry_count + 2}/3)"
+                    )
+                    
+                    # Create a retry job
+                    retry_job_id = f"{job.job_id}_retry_{retry_count + 1}"
+                    retry_job = ScrapingJob(
+                        job_id=retry_job_id,
+                        priority=JobPriority.HIGH,  # High priority for retries
+                        scheduled_job_id=job.scheduled_job_id,
+                        locations=job.locations,
+                        listing_type=job.listing_type,
+                        property_types=job.property_types,
+                        past_days=job.past_days,
+                        date_from=job.date_from,
+                        date_to=job.date_to,
+                        radius=job.radius,
+                        mls_only=job.mls_only,
+                        foreclosure=job.foreclosure,
+                        exclude_pending=job.exclude_pending,
+                        limit=job.limit,
+                        proxy_config=job.proxy_config,
+                        user_agent=job.user_agent,
+                        request_delay=job.request_delay,
+                        total_locations=job.total_locations
+                    )
+                    
+                    # Mark the stuck job as failed
+                    await db.update_job_status(
+                        job.job_id,
+                        JobStatus.FAILED,
+                        error_message=f"Job stuck in running status. Retrying as {retry_job_id}"
+                    )
+                    
+                    # Create and start the retry job
+                    await db.create_job(retry_job)
+                    asyncio.create_task(scraper.process_job(retry_job))
+                    
+                    logger.info(f"Created retry job: {retry_job_id}")
+                    
+            except Exception as job_error:
+                logger.error(f"Error handling stuck job {job.job_id}: {job_error}")
+                continue
+        
+        logger.info("Finished handling stuck jobs")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_stuck_jobs: {e}")
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
@@ -56,6 +184,10 @@ async def startup_event():
         try:
             await db.connect()
             logger.info("Database connected")
+            
+            # Handle stuck "running" jobs on startup
+            await handle_stuck_jobs()
+            
         except Exception as db_error:
             logger.warning(f"Database connection failed: {db_error}")
             logger.warning("Running without database connection")
@@ -861,15 +993,29 @@ async def list_scheduled_jobs(
         
         scheduled_jobs = []
         async for job_data in cursor:
+            scheduled_job_id = job_data.get("scheduled_job_id")
+            
+            # Get actual run count from jobs collection
+            actual_run_count = await db.jobs_collection.count_documents({
+                "scheduled_job_id": scheduled_job_id
+            })
+            
+            # Check if any job is currently running
+            has_running_job = await db.jobs_collection.count_documents({
+                "scheduled_job_id": scheduled_job_id,
+                "status": JobStatus.RUNNING.value
+            }) > 0
+            
             scheduled_jobs.append({
-                "scheduled_job_id": job_data.get("scheduled_job_id"),
+                "scheduled_job_id": scheduled_job_id,
                 "name": job_data.get("name"),
                 "description": job_data.get("description"),
                 "status": job_data.get("status"),
                 "cron_expression": job_data.get("cron_expression"),
                 "locations": job_data.get("locations"),
                 "listing_type": job_data.get("listing_type"),
-                "run_count": job_data.get("run_count", 0),
+                "run_count": actual_run_count,  # Use actual count from jobs collection
+                "has_running_job": has_running_job,  # Indicator if a job is currently running
                 "last_run_at": job_data.get("last_run_at"),
                 "last_run_status": job_data.get("last_run_status"),
                 "next_run_at": job_data.get("next_run_at"),

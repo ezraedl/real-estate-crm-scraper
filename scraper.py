@@ -3,6 +3,7 @@ import random
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pandas as pd
 import numpy as np
@@ -16,6 +17,7 @@ class MLSScraper:
     def __init__(self):
         self.is_running = False
         self.current_jobs = {}
+        self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
     
     async def start(self):
         """Start the scraper service"""
@@ -237,8 +239,12 @@ class MLSScraper:
             # Note: We're not setting foreclosure=False, exclude_pending=False, etc.
             # This allows the scraper to get off-market, foreclosures, and all other property types
             
-            # Scrape properties
-            properties_df = scrape_property(**scrape_params)
+            # Scrape properties - Run blocking call in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            properties_df = await loop.run_in_executor(
+                self.executor,
+                lambda: scrape_property(**scrape_params)
+            )
             
             # Convert DataFrame to our Property models
             properties = []
