@@ -488,12 +488,75 @@ async def trigger_existing_job(request: TriggerJobRequest):
     """
     Trigger an existing scheduled job to run immediately.
     This creates a new immediate job based on the existing job's configuration.
+    Supports both ScheduledJob (from scheduled_jobs collection) and legacy ScrapingJob.
     """
     try:
-        # Get the existing job
+        # First, try to get from scheduled_jobs collection (new architecture)
+        scheduled_job = await db.get_scheduled_job(request.job_id)
+        
+        if scheduled_job:
+            # This is a scheduled job (cron job) - create instance linked to it
+            logger.info(f"Triggering scheduled job: {request.job_id} ({scheduled_job.name})")
+            
+            # Create immediate job ID
+            immediate_job_id = f"triggered_{scheduled_job.scheduled_job_id}_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
+            
+            # Determine past_days based on listing type for triggered jobs
+            # SOLD properties should always go back 1 year (365 days) for comprehensive comp analysis
+            if scheduled_job.listing_type == ListingType.SOLD:
+                past_days = 365  # Full year for sold properties
+            elif scheduled_job.listing_type == ListingType.PENDING:
+                past_days = 30   # 30 days for pending properties
+            else:
+                past_days = scheduled_job.past_days  # Keep original for other types
+            
+            # Create new immediate job based on scheduled job
+            immediate_job = ScrapingJob(
+                job_id=immediate_job_id,
+                priority=request.priority,
+                scheduled_job_id=scheduled_job.scheduled_job_id,  # Link to parent scheduled job
+                locations=scheduled_job.locations,
+                listing_type=scheduled_job.listing_type,
+                property_types=scheduled_job.property_types,
+                past_days=past_days,  # Use the calculated past_days
+                date_from=scheduled_job.date_from,
+                date_to=scheduled_job.date_to,
+                radius=scheduled_job.radius,
+                mls_only=scheduled_job.mls_only,
+                foreclosure=scheduled_job.foreclosure,
+                exclude_pending=scheduled_job.exclude_pending,
+                limit=scheduled_job.limit,
+                proxy_config=scheduled_job.proxy_config,
+                user_agent=scheduled_job.user_agent,
+                request_delay=scheduled_job.request_delay,
+                total_locations=len(scheduled_job.locations)
+            )
+            
+            # Save immediate job to database
+            await db.create_job(immediate_job)
+            
+            # Start the scraper service if not already running
+            if not scraper.is_running:
+                asyncio.create_task(scraper.start())
+            
+            # Process the job immediately
+            asyncio.create_task(scraper.process_job(immediate_job))
+            
+            logger.info(f"Triggered scheduled job {request.job_id} as immediate job {immediate_job_id}")
+            
+            return JobResponse(
+                job_id=immediate_job_id,
+                status=JobStatus.PENDING,
+                message=f"Triggered scheduled job '{scheduled_job.name}' to run immediately",
+                created_at=immediate_job.created_at
+            )
+        
+        # If not found in scheduled_jobs, try legacy jobs collection
         existing_job = await db.get_job(request.job_id)
         if not existing_job:
             raise HTTPException(status_code=404, detail=f"Job not found: {request.job_id}")
+        
+        logger.info(f"Triggering legacy job: {request.job_id}")
         
         # Create immediate job ID
         immediate_job_id = f"immediate_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
@@ -511,6 +574,7 @@ async def trigger_existing_job(request: TriggerJobRequest):
         immediate_job = ScrapingJob(
             job_id=immediate_job_id,
             priority=request.priority,
+            scheduled_job_id=existing_job.scheduled_job_id,  # Preserve scheduled_job_id if exists
             locations=existing_job.locations,
             listing_type=existing_job.listing_type,
             property_types=existing_job.property_types,
@@ -526,7 +590,7 @@ async def trigger_existing_job(request: TriggerJobRequest):
             user_agent=existing_job.user_agent,
             request_delay=existing_job.request_delay,
             total_locations=existing_job.total_locations,
-            original_job_id=request.job_id  # Track the original job
+            original_job_id=request.job_id  # Track the original job (legacy)
         )
         
         # Save immediate job to database
@@ -587,6 +651,120 @@ async def get_job_status(job_id: str):
     except Exception as e:
         logger.error(f"Error getting job status: {e}")
         raise HTTPException(status_code=500, detail="Failed to get job status")
+
+# Get scheduled job details and run history
+@app.get("/scheduled-jobs/{scheduled_job_id}")
+async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = True, limit: int = 50):
+    """
+    Get scheduled job details including run history.
+    This shows the cron job definition and all job executions linked to it.
+    """
+    try:
+        # Get the scheduled job
+        scheduled_job = await db.get_scheduled_job(scheduled_job_id)
+        if not scheduled_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        response = {
+            "scheduled_job": {
+                "scheduled_job_id": scheduled_job.scheduled_job_id,
+                "name": scheduled_job.name,
+                "description": scheduled_job.description,
+                "status": scheduled_job.status,
+                "cron_expression": scheduled_job.cron_expression,
+                "locations": scheduled_job.locations,
+                "listing_type": scheduled_job.listing_type,
+                "run_count": scheduled_job.run_count,
+                "last_run_at": scheduled_job.last_run_at,
+                "last_run_status": scheduled_job.last_run_status,
+                "last_run_job_id": scheduled_job.last_run_job_id,
+                "next_run_at": scheduled_job.next_run_at,
+                "created_at": scheduled_job.created_at,
+                "updated_at": scheduled_job.updated_at
+            }
+        }
+        
+        # Get all job runs for this scheduled job
+        if include_runs:
+            job_runs_cursor = db.jobs_collection.find(
+                {"scheduled_job_id": scheduled_job_id}
+            ).sort([("created_at", -1)]).limit(limit)
+            
+            job_runs = []
+            async for job_data in job_runs_cursor:
+                job_runs.append({
+                    "job_id": job_data.get("job_id"),
+                    "status": job_data.get("status"),
+                    "priority": job_data.get("priority"),
+                    "created_at": job_data.get("created_at"),
+                    "started_at": job_data.get("started_at"),
+                    "completed_at": job_data.get("completed_at"),
+                    "properties_scraped": job_data.get("properties_scraped", 0),
+                    "properties_saved": job_data.get("properties_saved", 0),
+                    "error_message": job_data.get("error_message")
+                })
+            
+            response["job_runs"] = job_runs
+            response["total_runs"] = len(job_runs)
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting scheduled job details: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get scheduled job details")
+
+# List all scheduled jobs
+@app.get("/scheduled-jobs")
+async def list_scheduled_jobs(
+    status: Optional[str] = None,
+    limit: int = 50
+):
+    """List all scheduled jobs (cron jobs) with optional status filtering"""
+    try:
+        if status:
+            from models import ScheduledJobStatus
+            # Validate status
+            if status not in [s.value for s in ScheduledJobStatus]:
+                raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+            
+            cursor = db.scheduled_jobs_collection.find(
+                {"status": status}
+            ).sort([("next_run_at", 1)]).limit(limit)
+        else:
+            cursor = db.scheduled_jobs_collection.find().sort([
+                ("status", 1),
+                ("next_run_at", 1)
+            ]).limit(limit)
+        
+        scheduled_jobs = []
+        async for job_data in cursor:
+            scheduled_jobs.append({
+                "scheduled_job_id": job_data.get("scheduled_job_id"),
+                "name": job_data.get("name"),
+                "description": job_data.get("description"),
+                "status": job_data.get("status"),
+                "cron_expression": job_data.get("cron_expression"),
+                "locations": job_data.get("locations"),
+                "listing_type": job_data.get("listing_type"),
+                "run_count": job_data.get("run_count", 0),
+                "last_run_at": job_data.get("last_run_at"),
+                "last_run_status": job_data.get("last_run_status"),
+                "next_run_at": job_data.get("next_run_at"),
+                "created_at": job_data.get("created_at")
+            })
+        
+        return {
+            "scheduled_jobs": scheduled_jobs,
+            "total": len(scheduled_jobs)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing scheduled jobs: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list scheduled jobs")
 
 # List jobs
 @app.get("/jobs")
