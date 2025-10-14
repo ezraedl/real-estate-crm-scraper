@@ -103,15 +103,32 @@ class JobScheduler:
             if not job.cron_expression:
                 return False
             
-            # Parse cron expression
-            cron = croniter.croniter(job.cron_expression, job.created_at)
+            # Determine base time: use last_run if available, otherwise use a recent time
+            # Don't use created_at as it could be weeks/months ago
+            if job.last_run:
+                base_time = job.last_run
+            else:
+                # If never run, check if it's time to run now by going back 1 day
+                base_time = now - timedelta(days=1)
             
-            # Get next run time
+            # Parse cron expression starting from base_time
+            cron = croniter.croniter(job.cron_expression, base_time)
+            
+            # Get next scheduled run time after base_time
             next_run = cron.get_next(datetime)
             
-            # Check if it's time to run (within the last minute)
-            time_diff = (now - next_run).total_seconds()
-            return -60 <= time_diff <= 0
+            # If next_run is in the past (we missed it), the job should run now
+            if next_run <= now:
+                logger.info(f"Job {job.job_id} is overdue (scheduled for {next_run}, now is {now})")
+                return True
+            
+            # Otherwise, check if next_run is within the next minute (upcoming)
+            time_until = (next_run - now).total_seconds()
+            if 0 < time_until <= 60:
+                logger.info(f"Job {job.job_id} will run in {time_until:.2f} seconds")
+                return True
+            
+            return False
             
         except Exception as e:
             logger.error(f"Error checking cron expression for job {job.job_id}: {e}")
