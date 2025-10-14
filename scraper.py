@@ -51,8 +51,17 @@ class MLSScraper:
         self.current_jobs[job.job_id] = job
         
         try:
-            # Update job status to running
-            await db.update_job_status(job.job_id, JobStatus.RUNNING)
+            # Initialize progress logs with job start
+            progress_logs = [{
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "job_started",
+                "message": f"Job started - Processing {len(job.locations)} location(s)",
+                "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"],
+                "total_locations": len(job.locations)
+            }]
+            
+            # Update job status to running with initial log
+            await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
             
             print(f"Processing job {job.job_id} for {len(job.locations)} locations")
             
@@ -61,10 +70,18 @@ class MLSScraper:
             total_inserted = 0
             total_updated = 0
             total_skipped = 0
-            progress_logs = []
             
             # Process each location
             for i, location in enumerate(job.locations):
+                # Log location start
+                progress_logs.append({
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "event": "location_started",
+                    "location": location,
+                    "location_index": i + 1,
+                    "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
+                })
+                await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                 try:
                     print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
                     
@@ -227,6 +244,14 @@ class MLSScraper:
                     start_time = datetime.utcnow()
                     print(f"   [FETCH] Fetching {listing_type} properties...")
                     
+                    # Log API call START
+                    listing_type_logs.append({
+                        "listing_type": listing_type,
+                        "status": "fetching",
+                        "message": f"Fetching {listing_type} properties...",
+                        "timestamp": start_time.isoformat()
+                    })
+                    
                     # Use higher limit to ensure we find the exact property
                     properties = await self._scrape_listing_type(location, job, proxy_config, listing_type, limit=200, past_days=90)
                     
@@ -236,13 +261,14 @@ class MLSScraper:
                     all_properties.extend(properties)
                     print(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
                     
-                    # Log this API call
-                    listing_type_logs.append({
+                    # Update log with completion
+                    listing_type_logs[-1] = {
                         "listing_type": listing_type,
+                        "status": "completed",
                         "properties_found": len(properties),
                         "duration_seconds": round(duration, 2),
                         "timestamp": start_time.isoformat()
-                    })
+                    }
                     
                     # Reduced delay for faster response
                     await asyncio.sleep(0.5)
