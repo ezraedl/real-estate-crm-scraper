@@ -61,6 +61,7 @@ class MLSScraper:
             total_inserted = 0
             total_updated = 0
             total_skipped = 0
+            progress_logs = []
             
             # Process each location
             for i, location in enumerate(job.locations):
@@ -71,7 +72,7 @@ class MLSScraper:
                     proxy_config = await self.get_proxy_config(job)
                     
                     # Scrape properties for this location
-                    properties = await self.scrape_location(
+                    properties, location_logs = await self.scrape_location(
                         location=location,
                         job=job,
                         proxy_config=proxy_config
@@ -86,9 +87,24 @@ class MLSScraper:
                         total_updated += save_results["updated"]
                         total_skipped += save_results["skipped"]
                         
+                        # Add summary log for this location
+                        location_summary = {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "location": location,
+                            "location_index": i + 1,
+                            "total_locations": len(job.locations),
+                            "properties_found": len(properties),
+                            "inserted": save_results["inserted"],
+                            "updated": save_results["updated"],
+                            "skipped": save_results["skipped"],
+                            "errors": save_results["errors"],
+                            "listing_type_breakdown": location_logs  # Per listing type details
+                        }
+                        progress_logs.append(location_summary)
+                        
                         print(f"Location {location}: {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped, {save_results['errors']} errors")
                     
-                    # Update job progress with detailed breakdown
+                    # Update job progress with detailed breakdown and logs
                     await db.update_job_status(
                         job.job_id,
                         JobStatus.RUNNING,
@@ -97,7 +113,8 @@ class MLSScraper:
                         properties_saved=saved_properties,
                         properties_inserted=total_inserted,
                         properties_updated=total_updated,
-                        properties_skipped=total_skipped
+                        properties_skipped=total_skipped,
+                        progress_logs=progress_logs
                     )
                     
                     # Random delay between locations
@@ -182,10 +199,11 @@ class MLSScraper:
             if job.job_id in self.current_jobs:
                 del self.current_jobs[job.job_id]
     
-    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None) -> List[Property]:
-        """Scrape properties for a specific location based on job's listing_types"""
+    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None):
+        """Scrape properties for a specific location based on job's listing_types. Returns (properties, logs)"""
         try:
             all_properties = []
+            listing_type_logs = []
             
             # Determine which listing types to scrape
             if job.listing_types and len(job.listing_types) > 0:
@@ -206,25 +224,46 @@ class MLSScraper:
             
             for listing_type in listing_types_to_scrape:
                 try:
+                    start_time = datetime.utcnow()
                     print(f"   [FETCH] Fetching {listing_type} properties...")
+                    
                     # Use higher limit to ensure we find the exact property
                     properties = await self._scrape_listing_type(location, job, proxy_config, listing_type, limit=200, past_days=90)
+                    
+                    end_time = datetime.utcnow()
+                    duration = (end_time - start_time).total_seconds()
+                    
                     all_properties.extend(properties)
-                    print(f"   [OK] Found {len(properties)} {listing_type} properties")
+                    print(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
+                    
+                    # Log this API call
+                    listing_type_logs.append({
+                        "listing_type": listing_type,
+                        "properties_found": len(properties),
+                        "duration_seconds": round(duration, 2),
+                        "timestamp": start_time.isoformat()
+                    })
                     
                     # Reduced delay for faster response
                     await asyncio.sleep(0.5)
                     
                 except Exception as e:
                     print(f"   [WARNING] Error scraping {listing_type} properties: {e}")
+                    # Log the error
+                    listing_type_logs.append({
+                        "listing_type": listing_type,
+                        "properties_found": 0,
+                        "error": str(e),
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
                     continue
             
             print(f"   [TOTAL] Total properties scraped: {len(all_properties)}")
-            return all_properties
+            return all_properties, listing_type_logs
             
         except Exception as e:
             print(f"Error scraping location {location}: {e}")
-            return []
+            return [], []
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""

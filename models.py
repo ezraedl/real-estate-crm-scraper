@@ -147,6 +147,9 @@ class ScrapingJob(BaseModel):
     total_locations: int = 0
     completed_locations: int = 0
     
+    # Detailed progress logs
+    progress_logs: List[Dict[str, Any]] = Field(default_factory=list, description="Detailed logs per location and listing type")
+    
     # Anti-bot configuration
     proxy_config: Optional[Dict[str, Any]] = None
     user_agent: Optional[str] = None
