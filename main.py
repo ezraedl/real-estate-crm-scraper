@@ -766,6 +766,291 @@ async def list_scheduled_jobs(
         logger.error(f"Error listing scheduled jobs: {e}")
         raise HTTPException(status_code=500, detail="Failed to list scheduled jobs")
 
+# Create new scheduled job
+@app.post("/scheduled-jobs")
+async def create_scheduled_job(job_data: dict):
+    """Create a new scheduled job (cron job)"""
+    try:
+        from models import ScheduledJob
+        import uuid
+        
+        # Generate scheduled_job_id
+        scheduled_job_id = f"scheduled_{job_data.get('listing_type', 'job')}_{int(datetime.utcnow().timestamp())}"
+        
+        # Create ScheduledJob instance
+        scheduled_job = ScheduledJob(
+            scheduled_job_id=scheduled_job_id,
+            name=job_data.get('name'),
+            description=job_data.get('description'),
+            status=job_data.get('status', 'active'),
+            cron_expression=job_data.get('cron_expression'),
+            timezone=job_data.get('timezone', 'UTC'),
+            locations=job_data.get('locations'),
+            listing_type=job_data.get('listing_type'),
+            property_types=job_data.get('property_types'),
+            past_days=job_data.get('past_days'),
+            date_from=job_data.get('date_from'),
+            date_to=job_data.get('date_to'),
+            radius=job_data.get('radius'),
+            mls_only=job_data.get('mls_only', False),
+            foreclosure=job_data.get('foreclosure', False),
+            exclude_pending=job_data.get('exclude_pending', False),
+            limit=job_data.get('limit', 10000),
+            proxy_config=job_data.get('proxy_config'),
+            user_agent=job_data.get('user_agent'),
+            request_delay=job_data.get('request_delay', 1.0),
+            priority=job_data.get('priority', 'normal')
+        )
+        
+        # Calculate next run time
+        import croniter
+        cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+        scheduled_job.next_run_at = cron.get_next(datetime)
+        
+        # Save to database
+        await db.create_scheduled_job(scheduled_job)
+        
+        logger.info(f"Created new scheduled job: {scheduled_job_id}")
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "message": "Scheduled job created successfully",
+            "next_run_at": scheduled_job.next_run_at
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating scheduled job: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create scheduled job: {str(e)}")
+
+# Update scheduled job
+@app.put("/scheduled-jobs/{scheduled_job_id}")
+async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
+    """Update an existing scheduled job"""
+    try:
+        # Check if job exists
+        existing_job = await db.get_scheduled_job(scheduled_job_id)
+        if not existing_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        # Build update data
+        update_data = {}
+        
+        # Only update fields that are provided
+        if 'name' in job_data:
+            update_data['name'] = job_data['name']
+        if 'description' in job_data:
+            update_data['description'] = job_data['description']
+        if 'status' in job_data:
+            update_data['status'] = job_data['status']
+        if 'cron_expression' in job_data:
+            update_data['cron_expression'] = job_data['cron_expression']
+            # Recalculate next run time if cron changed
+            import croniter
+            cron = croniter.croniter(job_data['cron_expression'], datetime.utcnow())
+            update_data['next_run_at'] = cron.get_next(datetime)
+        if 'timezone' in job_data:
+            update_data['timezone'] = job_data['timezone']
+        if 'locations' in job_data:
+            update_data['locations'] = job_data['locations']
+        if 'listing_type' in job_data:
+            update_data['listing_type'] = job_data['listing_type']
+        if 'property_types' in job_data:
+            update_data['property_types'] = job_data['property_types']
+        if 'past_days' in job_data:
+            update_data['past_days'] = job_data['past_days']
+        if 'date_from' in job_data:
+            update_data['date_from'] = job_data['date_from']
+        if 'date_to' in job_data:
+            update_data['date_to'] = job_data['date_to']
+        if 'radius' in job_data:
+            update_data['radius'] = job_data['radius']
+        if 'mls_only' in job_data:
+            update_data['mls_only'] = job_data['mls_only']
+        if 'foreclosure' in job_data:
+            update_data['foreclosure'] = job_data['foreclosure']
+        if 'exclude_pending' in job_data:
+            update_data['exclude_pending'] = job_data['exclude_pending']
+        if 'limit' in job_data:
+            update_data['limit'] = job_data['limit']
+        if 'proxy_config' in job_data:
+            update_data['proxy_config'] = job_data['proxy_config']
+        if 'user_agent' in job_data:
+            update_data['user_agent'] = job_data['user_agent']
+        if 'request_delay' in job_data:
+            update_data['request_delay'] = job_data['request_delay']
+        if 'priority' in job_data:
+            update_data['priority'] = job_data['priority']
+        
+        # Update in database
+        success = await db.update_scheduled_job(scheduled_job_id, update_data)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update scheduled job")
+        
+        logger.info(f"Updated scheduled job: {scheduled_job_id}")
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "message": "Scheduled job updated successfully",
+            "updated_fields": list(update_data.keys())
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating scheduled job: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update scheduled job: {str(e)}")
+
+# Toggle scheduled job status
+@app.patch("/scheduled-jobs/{scheduled_job_id}/status")
+async def toggle_scheduled_job_status(scheduled_job_id: str, status_data: dict):
+    """Toggle the status of a scheduled job (active/inactive/paused)"""
+    try:
+        from models import ScheduledJobStatus
+        
+        # Validate status
+        status = status_data.get('status')
+        if not status:
+            raise HTTPException(status_code=400, detail="Status field is required")
+        
+        if status not in [s.value for s in ScheduledJobStatus]:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}. Must be one of: active, inactive, paused")
+        
+        # Check if job exists
+        existing_job = await db.get_scheduled_job(scheduled_job_id)
+        if not existing_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        # Update status
+        success = await db.update_scheduled_job_status(scheduled_job_id, ScheduledJobStatus(status))
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update job status")
+        
+        logger.info(f"Updated status of scheduled job {scheduled_job_id} to {status}")
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "status": status,
+            "message": f"Status updated to {status}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error toggling job status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to toggle job status: {str(e)}")
+
+# Delete scheduled job
+@app.delete("/scheduled-jobs/{scheduled_job_id}")
+async def delete_scheduled_job(scheduled_job_id: str):
+    """Delete a scheduled job"""
+    try:
+        # Check if job exists
+        existing_job = await db.get_scheduled_job(scheduled_job_id)
+        if not existing_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        # Delete from database
+        success = await db.delete_scheduled_job(scheduled_job_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete scheduled job")
+        
+        logger.info(f"Deleted scheduled job: {scheduled_job_id}")
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "message": "Scheduled job deleted successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting scheduled job: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete scheduled job: {str(e)}")
+
+# Get statistics for a scheduled job
+@app.get("/scheduled-jobs/{scheduled_job_id}/stats")
+async def get_scheduled_job_stats(scheduled_job_id: str):
+    """Get detailed statistics for a scheduled job"""
+    try:
+        # Get the scheduled job
+        scheduled_job = await db.get_scheduled_job(scheduled_job_id)
+        if not scheduled_job:
+            raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
+        
+        # Get all job runs for this scheduled job
+        job_runs_cursor = db.jobs_collection.find(
+            {"scheduled_job_id": scheduled_job_id}
+        ).sort([("created_at", -1)])
+        
+        total_runs = 0
+        successful_runs = 0
+        failed_runs = 0
+        total_properties_scraped = 0
+        total_properties_saved = 0
+        total_duration_seconds = 0
+        duration_count = 0
+        last_successful_run = None
+        
+        async for job_data in job_runs_cursor:
+            total_runs += 1
+            
+            if job_data.get('status') == 'completed':
+                successful_runs += 1
+                total_properties_scraped += job_data.get('properties_scraped', 0)
+                total_properties_saved += job_data.get('properties_saved', 0)
+                
+                # Calculate duration
+                if job_data.get('started_at') and job_data.get('completed_at'):
+                    duration = (job_data['completed_at'] - job_data['started_at']).total_seconds()
+                    total_duration_seconds += duration
+                    duration_count += 1
+                
+                # Track last successful run
+                if not last_successful_run:
+                    last_successful_run = {
+                        "job_id": job_data.get('job_id'),
+                        "completed_at": job_data.get('completed_at'),
+                        "properties_scraped": job_data.get('properties_scraped', 0),
+                        "properties_saved": job_data.get('properties_saved', 0)
+                    }
+                    
+            elif job_data.get('status') == 'failed':
+                failed_runs += 1
+        
+        # Calculate success rate
+        success_rate = (successful_runs / total_runs * 100) if total_runs > 0 else 0
+        
+        # Calculate average duration
+        average_duration_seconds = (total_duration_seconds / duration_count) if duration_count > 0 else 0
+        
+        # Count unique properties added (properties with this job's scheduled_job_id)
+        unique_properties_count = await db.properties_collection.count_documents({
+            "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"}
+        })
+        
+        return {
+            "scheduled_job_id": scheduled_job_id,
+            "total_runs": total_runs,
+            "successful_runs": successful_runs,
+            "failed_runs": failed_runs,
+            "success_rate": round(success_rate, 1),
+            "total_properties_scraped": total_properties_scraped,
+            "total_properties_saved": total_properties_saved,
+            "unique_properties_added": unique_properties_count,
+            "average_duration_seconds": round(average_duration_seconds, 1),
+            "last_successful_run": last_successful_run,
+            "next_run_at": scheduled_job.next_run_at
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job statistics: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get job statistics: {str(e)}")
+
 # List jobs
 @app.get("/jobs")
 async def list_jobs(
