@@ -252,8 +252,15 @@ class MLSScraper:
                         "timestamp": start_time.isoformat()
                     })
                     
-                    # Use higher limit to ensure we find the exact property
-                    properties = await self._scrape_listing_type(location, job, proxy_config, listing_type, limit=200, past_days=90)
+                    # Use job's limit (or None to get all properties)
+                    properties = await self._scrape_listing_type(
+                        location, 
+                        job, 
+                        proxy_config, 
+                        listing_type, 
+                        limit=job.limit if job.limit else None,
+                        past_days=job.past_days if job.past_days else 90
+                    )
                     
                     end_time = datetime.utcnow()
                     duration = (end_time - start_time).total_seconds()
