@@ -846,6 +846,16 @@ async def get_scheduled_job_stats(scheduled_job_id: str):
             "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"}
         })
         
+        # Count unique properties by listing type
+        properties_by_type = {}
+        for listing_type in ["for_sale", "sold", "for_rent", "pending"]:
+            count = await db.properties_collection.count_documents({
+                "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"},
+                "listing_type": listing_type
+            })
+            if count > 0:
+                properties_by_type[listing_type] = count
+        
         return {
             "scheduled_job_id": scheduled_job_id,
             "total_runs": total_runs,
@@ -855,6 +865,7 @@ async def get_scheduled_job_stats(scheduled_job_id: str):
             "total_properties_scraped": total_properties_scraped,
             "total_properties_saved": total_properties_saved,
             "unique_properties_added": unique_properties_count,
+            "properties_by_listing_type": properties_by_type,  # Breakdown by type
             "average_duration_seconds": round(average_duration_seconds, 1),
             "last_successful_run": last_successful_run,
             "next_run_at": scheduled_job.next_run_at
