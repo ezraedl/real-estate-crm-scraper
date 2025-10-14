@@ -17,6 +17,7 @@ class ScheduledJobStatus(str, Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
     PAUSED = "paused"
+    DELETED = "deleted"
 
 class JobPriority(str, Enum):
     IMMEDIATE = "immediate"

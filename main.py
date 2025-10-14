@@ -973,9 +973,10 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
 @app.get("/scheduled-jobs")
 async def list_scheduled_jobs(
     status: Optional[str] = None,
-    limit: int = 50
+    limit: int = 50,
+    include_deleted: bool = False
 ):
-    """List all scheduled jobs (cron jobs) with optional status filtering"""
+    """List all scheduled jobs (cron jobs) with optional status filtering. Deleted jobs are excluded by default."""
     try:
         if status:
             from models import ScheduledJobStatus
@@ -987,7 +988,9 @@ async def list_scheduled_jobs(
                 {"status": status}
             ).sort([("next_run_at", 1)]).limit(limit)
         else:
-            cursor = db.scheduled_jobs_collection.find().sort([
+            # Exclude deleted jobs by default
+            query = {} if include_deleted else {"status": {"$ne": "deleted"}}
+            cursor = db.scheduled_jobs_collection.find(query).sort([
                 ("status", 1),
                 ("next_run_at", 1)
             ]).limit(limit)
@@ -1176,23 +1179,25 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
         logger.error(f"Error updating scheduled job: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update scheduled job: {str(e)}")
 
-# Delete scheduled job
+# Delete scheduled job (soft delete)
 @app.delete("/scheduled-jobs/{scheduled_job_id}")
 async def delete_scheduled_job(scheduled_job_id: str):
-    """Delete a scheduled job"""
+    """Soft delete a scheduled job by marking it as deleted"""
     try:
+        from models import ScheduledJobStatus
+        
         # Check if job exists
         existing_job = await db.get_scheduled_job(scheduled_job_id)
         if not existing_job:
             raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
         
-        # Delete from database
-        success = await db.delete_scheduled_job(scheduled_job_id)
+        # Soft delete: set status to deleted instead of removing from database
+        success = await db.update_scheduled_job_status(scheduled_job_id, ScheduledJobStatus.DELETED)
         
         if not success:
             raise HTTPException(status_code=500, detail="Failed to delete scheduled job")
         
-        logger.info(f"Deleted scheduled job: {scheduled_job_id}")
+        logger.info(f"Soft deleted scheduled job: {scheduled_job_id}")
         
         return {
             "scheduled_job_id": scheduled_job_id,
