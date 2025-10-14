@@ -141,6 +141,9 @@ class ScrapingJob(BaseModel):
     # Results
     properties_scraped: int = 0
     properties_saved: int = 0
+    properties_inserted: int = Field(default=0, description="New properties added to database")
+    properties_updated: int = Field(default=0, description="Existing properties updated")
+    properties_skipped: int = Field(default=0, description="Properties skipped (no content change)")
     total_locations: int = 0
     completed_locations: int = 0
     

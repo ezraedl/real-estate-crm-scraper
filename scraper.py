@@ -58,6 +58,9 @@ class MLSScraper:
             
             total_properties = 0
             saved_properties = 0
+            total_inserted = 0
+            total_updated = 0
+            total_skipped = 0
             
             # Process each location
             for i, location in enumerate(job.locations):
@@ -79,16 +82,22 @@ class MLSScraper:
                         save_results = await db.save_properties_batch(properties)
                         saved_properties += save_results["inserted"] + save_results["updated"]
                         total_properties += len(properties)
+                        total_inserted += save_results["inserted"]
+                        total_updated += save_results["updated"]
+                        total_skipped += save_results["skipped"]
                         
                         print(f"Location {location}: {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped, {save_results['errors']} errors")
                     
-                    # Update job progress
+                    # Update job progress with detailed breakdown
                     await db.update_job_status(
                         job.job_id,
                         JobStatus.RUNNING,
                         completed_locations=i + 1,
                         properties_scraped=total_properties,
-                        properties_saved=saved_properties
+                        properties_saved=saved_properties,
+                        properties_inserted=total_inserted,
+                        properties_updated=total_updated,
+                        properties_skipped=total_skipped
                     )
                     
                     # Random delay between locations
