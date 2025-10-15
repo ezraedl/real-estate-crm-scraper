@@ -21,7 +21,9 @@ from models import (
     JobStatus,
     JobPriority,
     Property,
-    ListingType
+    ListingType,
+    ScheduledJob,
+    ScheduledJobStatus
 )
 from database import db
 from scraper import scraper
@@ -83,6 +85,48 @@ def get_remaining_locations(job: ScrapingJob) -> List[str]:
         remaining = job.locations  # Safety: retry everything if something seems wrong
     
     return remaining
+
+# Helper function to create active properties re-scraping job
+async def create_active_properties_rescraping_job():
+    """
+    Create a scheduled job that automatically re-scrapes properties with crm_status='active'.
+    This job runs every hour by default (configurable via environment variable).
+    """
+    try:
+        # Check if the job already exists
+        existing_job = await db.scheduled_jobs_collection.find_one({
+            "scheduled_job_id": "active_properties_rescraping"
+        })
+        
+        if existing_job:
+            logger.info("Active properties re-scraping job already exists")
+            return
+        
+        # Get scraping frequency from environment (default: every hour)
+        scraping_frequency = os.getenv('ACTIVE_PROPERTIES_SCRAPING_FREQUENCY', '0 * * * *')  # Every hour by default
+        
+        # Create the scheduled job
+        scheduled_job = ScheduledJob(
+            scheduled_job_id="active_properties_rescraping",
+            name="Active Properties Re-scraping",
+            description="Automatically re-scrapes properties with crm_status='active' to keep data fresh",
+            status=ScheduledJobStatus.ACTIVE,
+            cron_expression=scraping_frequency,
+            timezone="UTC",
+            locations=[],  # Will be populated dynamically based on active properties
+            listing_types=[ListingType.FOR_SALE],  # Focus on active listings
+            limit=1000,  # Reasonable limit for re-scraping
+            priority=JobPriority.NORMAL,
+            created_by="system",
+            request_delay=2.0  # Be respectful to MLS systems
+        )
+        
+        # Save to database
+        await db.scheduled_jobs_collection.insert_one(scheduled_job.dict(by_alias=True, exclude={"id"}))
+        logger.info(f"Created active properties re-scraping job with frequency: {scraping_frequency}")
+        
+    except Exception as e:
+        logger.error(f"Error creating active properties re-scraping job: {e}")
 
 # Helper function to handle stuck jobs on startup
 async def handle_stuck_jobs():
@@ -240,6 +284,9 @@ async def startup_event():
             # Handle stuck "running" jobs on startup
             await handle_stuck_jobs()
             
+            # Create active properties re-scraping job
+            await create_active_properties_rescraping_job()
+            
         except Exception as db_error:
             logger.warning(f"Database connection failed: {db_error}")
             logger.warning("Running without database connection")
@@ -287,6 +334,206 @@ async def shutdown_event():
         logger.info("Services stopped")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
+
+# Active Properties Re-scraping Management
+@app.get("/active-properties-config")
+async def get_active_properties_config():
+    """Get the current configuration for active properties re-scraping"""
+    try:
+        job = await db.scheduled_jobs_collection.find_one({
+            "scheduled_job_id": "active_properties_rescraping"
+        })
+        
+        if not job:
+            return {
+                "exists": False,
+                "message": "Active properties re-scraping job not found"
+            }
+        
+        return {
+            "exists": True,
+            "job": {
+                "scheduled_job_id": job["scheduled_job_id"],
+                "name": job["name"],
+                "description": job["description"],
+                "status": job["status"],
+                "cron_expression": job["cron_expression"],
+                "timezone": job["timezone"],
+                "limit": job["limit"],
+                "priority": job["priority"],
+                "request_delay": job["request_delay"],
+                "created_at": job["created_at"],
+                "last_run_at": job.get("last_run_at"),
+                "next_run_at": job.get("next_run_at"),
+                "run_count": job.get("run_count", 0)
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting active properties config: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/active-properties-config")
+async def update_active_properties_config(request: dict):
+    """Update the configuration for active properties re-scraping"""
+    try:
+        cron_expression = request.get("cron_expression")
+        if not cron_expression:
+            raise HTTPException(status_code=400, detail="cron_expression is required")
+        
+        # Validate cron expression
+        try:
+            import croniter
+            croniter.croniter(cron_expression, datetime.utcnow())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid cron expression: {e}")
+        
+        # Update the scheduled job
+        update_data = {
+            "cron_expression": cron_expression,
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Optional fields
+        if "limit" in request:
+            update_data["limit"] = request["limit"]
+        if "request_delay" in request:
+            update_data["request_delay"] = request["request_delay"]
+        if "priority" in request:
+            update_data["priority"] = request["priority"]
+        
+        result = await db.scheduled_jobs_collection.update_one(
+            {"scheduled_job_id": "active_properties_rescraping"},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Active properties re-scraping job not found")
+        
+        logger.info(f"Updated active properties re-scraping config: {update_data}")
+        
+        return {
+            "message": "Active properties re-scraping configuration updated successfully",
+            "updated_fields": list(update_data.keys())
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating active properties config: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/active-properties-config/toggle")
+async def toggle_active_properties_rescraping(request: dict):
+    """Enable or disable active properties re-scraping"""
+    try:
+        enabled = request.get("enabled", True)
+        new_status = ScheduledJobStatus.ACTIVE if enabled else ScheduledJobStatus.INACTIVE
+        
+        result = await db.scheduled_jobs_collection.update_one(
+            {"scheduled_job_id": "active_properties_rescraping"},
+            {
+                "$set": {
+                    "status": new_status.value,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Active properties re-scraping job not found")
+        
+        action = "enabled" if enabled else "disabled"
+        logger.info(f"Active properties re-scraping {action}")
+        
+        return {
+            "message": f"Active properties re-scraping {action} successfully",
+            "enabled": enabled
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error toggling active properties re-scraping: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# CRM Property Reference Management
+@app.post("/crm-property-reference")
+async def add_crm_property_reference(request: dict):
+    """Add a CRM property reference to an MLS property"""
+    try:
+        mls_property_id = request.get("mls_property_id")
+        crm_property_id = request.get("crm_property_id")
+        
+        if not mls_property_id or not crm_property_id:
+            raise HTTPException(status_code=400, detail="mls_property_id and crm_property_id are required")
+        
+        success = await db.add_crm_property_reference(mls_property_id, crm_property_id)
+        
+        if success:
+            return {
+                "message": "CRM property reference added successfully",
+                "mls_property_id": mls_property_id,
+                "crm_property_id": crm_property_id
+            }
+        else:
+            raise HTTPException(status_code=404, detail="MLS property not found")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding CRM property reference: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/crm-property-reference")
+async def remove_crm_property_reference(request: dict):
+    """Remove a CRM property reference from an MLS property"""
+    try:
+        mls_property_id = request.get("mls_property_id")
+        crm_property_id = request.get("crm_property_id")
+        
+        if not mls_property_id or not crm_property_id:
+            raise HTTPException(status_code=400, detail="mls_property_id and crm_property_id are required")
+        
+        success = await db.remove_crm_property_reference(mls_property_id, crm_property_id)
+        
+        if success:
+            return {
+                "message": "CRM property reference removed successfully",
+                "mls_property_id": mls_property_id,
+                "crm_property_id": crm_property_id
+            }
+        else:
+            raise HTTPException(status_code=404, detail="MLS property not found")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing CRM property reference: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/sync-property")
+async def sync_property_from_mls(request: dict):
+    """Manually sync CRM properties from MLS data"""
+    try:
+        mls_property_id = request.get("mls_property_id")
+        
+        if not mls_property_id:
+            raise HTTPException(status_code=400, detail="mls_property_id is required")
+        
+        updated_count = await db.update_crm_properties_from_mls(mls_property_id)
+        
+        return {
+            "success": True,
+            "message": f"Synced {updated_count} CRM properties from MLS property",
+            "mls_property_id": mls_property_id,
+            "crm_properties_updated": updated_count
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error syncing property from MLS: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Health check endpoint
 @app.get("/health")
