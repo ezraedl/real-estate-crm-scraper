@@ -73,6 +73,12 @@ class MLSScraper:
             
             # Process each location
             for i, location in enumerate(job.locations):
+                # Check if job has been cancelled
+                current_job_status = await db.get_job(job.job_id)
+                if current_job_status and current_job_status.status == JobStatus.CANCELLED:
+                    print(f"Job {job.job_id} was cancelled, stopping execution")
+                    return  # Exit immediately
+                
                 # Log location start
                 progress_logs.append({
                     "timestamp": datetime.utcnow().isoformat(),
@@ -240,6 +246,12 @@ class MLSScraper:
             print(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
             for listing_type in listing_types_to_scrape:
+                # Check if job was cancelled (for faster response during multi-type scraping)
+                current_job_status = await db.get_job(job.job_id)
+                if current_job_status and current_job_status.status == JobStatus.CANCELLED:
+                    print(f"   [CANCELLED] Job {job.job_id} was cancelled, stopping listing type fetch")
+                    break  # Exit the listing type loop
+                
                 try:
                     start_time = datetime.utcnow()
                     print(f"   [FETCH] Fetching {listing_type} properties...")
