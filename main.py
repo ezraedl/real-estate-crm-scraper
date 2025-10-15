@@ -983,8 +983,20 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
                 "description": scheduled_job.description,
                 "status": scheduled_job.status,
                 "cron_expression": scheduled_job.cron_expression,
+                "timezone": scheduled_job.timezone,
                 "locations": scheduled_job.locations,
-                "listing_type": scheduled_job.listing_type,
+                "listing_types": scheduled_job.listing_types,  # New multi-select field
+                "listing_type": scheduled_job.listing_type,  # Keep for backward compatibility
+                "property_types": scheduled_job.property_types,
+                "past_days": scheduled_job.past_days,
+                "date_from": scheduled_job.date_from,
+                "date_to": scheduled_job.date_to,
+                "radius": scheduled_job.radius,
+                "mls_only": scheduled_job.mls_only,
+                "foreclosure": scheduled_job.foreclosure,
+                "exclude_pending": scheduled_job.exclude_pending,
+                "limit": scheduled_job.limit,
+                "priority": scheduled_job.priority,
                 "run_count": scheduled_job.run_count,
                 "last_run_at": scheduled_job.last_run_at,
                 "last_run_status": scheduled_job.last_run_status,
@@ -1193,6 +1205,8 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
             update_data['timezone'] = job_data['timezone']
         if 'locations' in job_data:
             update_data['locations'] = job_data['locations']
+        if 'listing_types' in job_data:
+            update_data['listing_types'] = job_data['listing_types']
         if 'listing_type' in job_data:
             update_data['listing_type'] = job_data['listing_type']
         if 'property_types' in job_data:
