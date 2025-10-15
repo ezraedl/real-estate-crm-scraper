@@ -101,6 +101,16 @@ class JobScheduler:
             if scheduled_job.status != ScheduledJobStatus.ACTIVE:
                 return False
             
+            # Check if there's already a running job for this scheduled job
+            # Check dynamically instead of relying on cached field
+            running_jobs_count = await db.jobs_collection.count_documents({
+                "scheduled_job_id": scheduled_job.scheduled_job_id,
+                "status": JobStatus.RUNNING.value
+            })
+            if running_jobs_count > 0:
+                logger.debug(f"Scheduled job {scheduled_job.scheduled_job_id} already has {running_jobs_count} running job(s), skipping")
+                return False
+            
             # Determine base time: use last_run_at if available, otherwise use a recent time
             # Don't use created_at as it could be weeks/months ago
             if scheduled_job.last_run_at:

@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 import logging
 import os
+from scheduler import scheduler
 
 from models import (
     ImmediateScrapeRequest, 
@@ -261,6 +262,14 @@ async def startup_event():
         except Exception as scraper_error:
             logger.warning(f"Scraper service failed to start: {scraper_error}")
             logger.warning("Running without scraper service")
+        
+        # Start scheduler service
+        try:
+            asyncio.create_task(scheduler.start())
+            logger.info("Job scheduler started")
+        except Exception as scheduler_error:
+            logger.error(f"Scheduler service failed to start: {scheduler_error}")
+            logger.error("CRITICAL: Cron jobs will not run automatically!")
         
         logger.info("Service startup completed")
         
