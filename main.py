@@ -62,10 +62,15 @@ def get_remaining_locations(job: ScrapingJob) -> List[str]:
     # Look for location completion entries in progress logs
     for log in job.progress_logs:
         if isinstance(log, dict):
-            # A location is considered complete if it has properties_found field
-            # (meaning it finished processing and saving)
+            # A location is considered complete ONLY if it has the final summary
+            # (not the in-progress entries created after each listing type)
+            # Final summary has properties_found but NO status field or status != "in_progress"
             if "location" in log and "properties_found" in log:
-                completed_locations.add(log["location"])
+                # Check if this is a final summary (not an in-progress update)
+                status = log.get("status")
+                if status != "in_progress":
+                    # This is a final location summary
+                    completed_locations.add(log["location"])
     
     # Return locations that weren't completed
     remaining = [loc for loc in job.locations if loc not in completed_locations]
