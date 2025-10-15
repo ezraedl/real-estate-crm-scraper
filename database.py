@@ -5,7 +5,7 @@ from datetime import datetime
 import asyncio
 from urllib.parse import urlparse
 from config import settings
-from models import ScrapingJob, Property, JobStatus, JobPriority
+from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
 
 class Database:
     def __init__(self):
@@ -59,8 +59,14 @@ class Database:
             await self.properties_collection.create_index([("job_id", ASCENDING)])
             
             # Scheduled jobs collection indexes
+            await self.scheduled_jobs_collection.create_index([("scheduled_job_id", ASCENDING)], unique=True)
+            await self.scheduled_jobs_collection.create_index([("status", ASCENDING)])
             await self.scheduled_jobs_collection.create_index([("cron_expression", ASCENDING)])
-            await self.scheduled_jobs_collection.create_index([("next_run", ASCENDING)])
+            await self.scheduled_jobs_collection.create_index([("next_run_at", ASCENDING)])
+            await self.scheduled_jobs_collection.create_index([("last_run_at", DESCENDING)])
+            
+            # Jobs collection - add index for scheduled_job_id reference
+            await self.jobs_collection.create_index([("scheduled_job_id", ASCENDING)])
             
             print("Database indexes created successfully")
         except Exception as e:
@@ -100,7 +106,10 @@ class Database:
             update_data.update(kwargs)
             
             if status == JobStatus.RUNNING:
-                update_data["started_at"] = datetime.utcnow()
+                # Only set started_at if not already set (don't overwrite on progress updates)
+                existing_job = await self.jobs_collection.find_one({"job_id": job_id})
+                if existing_job and not existing_job.get("started_at"):
+                    update_data["started_at"] = datetime.utcnow()
             elif status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                 update_data["completed_at"] = datetime.utcnow()
             
@@ -174,6 +183,146 @@ class Database:
             return jobs
         except Exception as e:
             print(f"Error getting jobs by status: {e}")
+            return []
+    
+    # Scheduled Jobs Management Methods
+    async def create_scheduled_job(self, scheduled_job: ScheduledJob) -> str:
+        """Create a new scheduled job (cron job)"""
+        try:
+            result = await self.scheduled_jobs_collection.insert_one(
+                scheduled_job.dict(by_alias=True, exclude={"id"})
+            )
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"Error creating scheduled job: {e}")
+            raise
+    
+    async def get_scheduled_job(self, scheduled_job_id: str) -> Optional[ScheduledJob]:
+        """Get scheduled job by ID"""
+        try:
+            job_data = await self.scheduled_jobs_collection.find_one(
+                {"scheduled_job_id": scheduled_job_id}
+            )
+            if job_data:
+                job_data["_id"] = str(job_data["_id"])
+                return ScheduledJob(**job_data)
+            return None
+        except Exception as e:
+            print(f"Error getting scheduled job: {e}")
+            return None
+    
+    async def get_active_scheduled_jobs(self) -> List[ScheduledJob]:
+        """Get all active scheduled jobs"""
+        try:
+            cursor = self.scheduled_jobs_collection.find(
+                {"status": ScheduledJobStatus.ACTIVE.value}
+            ).sort([("next_run_at", ASCENDING)])
+            
+            jobs = []
+            async for job_data in cursor:
+                job_data["_id"] = str(job_data["_id"])
+                jobs.append(ScheduledJob(**job_data))
+            
+            return jobs
+        except Exception as e:
+            print(f"Error getting active scheduled jobs: {e}")
+            return []
+    
+    async def update_scheduled_job_status(self, scheduled_job_id: str, status: ScheduledJobStatus) -> bool:
+        """Update scheduled job status"""
+        try:
+            result = await self.scheduled_jobs_collection.update_one(
+                {"scheduled_job_id": scheduled_job_id},
+                {
+                    "$set": {
+                        "status": status.value,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating scheduled job status: {e}")
+            return False
+    
+    async def update_scheduled_job_run_history(
+        self,
+        scheduled_job_id: str,
+        run_job_id: str,
+        status: JobStatus,
+        next_run_at: Optional[datetime] = None
+    ) -> bool:
+        """Update the run history of a scheduled job after execution"""
+        try:
+            # Get current run_count
+            current_job = await self.scheduled_jobs_collection.find_one(
+                {"scheduled_job_id": scheduled_job_id}
+            )
+            if not current_job:
+                return False
+            
+            current_run_count = current_job.get("run_count", 0)
+            
+            update_data = {
+                "run_count": current_run_count + 1,
+                "last_run_at": datetime.utcnow(),
+                "last_run_status": status.value,
+                "last_run_job_id": run_job_id,
+                "updated_at": datetime.utcnow()
+            }
+            
+            if next_run_at:
+                update_data["next_run_at"] = next_run_at
+            
+            result = await self.scheduled_jobs_collection.update_one(
+                {"scheduled_job_id": scheduled_job_id},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating scheduled job run history: {e}")
+            return False
+    
+    async def update_scheduled_job(self, scheduled_job_id: str, update_data: Dict[str, Any]) -> bool:
+        """Update scheduled job fields"""
+        try:
+            update_data["updated_at"] = datetime.utcnow()
+            result = await self.scheduled_jobs_collection.update_one(
+                {"scheduled_job_id": scheduled_job_id},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error updating scheduled job: {e}")
+            return False
+    
+    async def delete_scheduled_job(self, scheduled_job_id: str) -> bool:
+        """Delete a scheduled job"""
+        try:
+            result = await self.scheduled_jobs_collection.delete_one(
+                {"scheduled_job_id": scheduled_job_id}
+            )
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"Error deleting scheduled job: {e}")
+            return False
+    
+    async def get_all_scheduled_jobs(self, limit: int = 100) -> List[ScheduledJob]:
+        """Get all scheduled jobs (active and inactive)"""
+        try:
+            cursor = self.scheduled_jobs_collection.find().sort([
+                ("status", ASCENDING),
+                ("next_run_at", ASCENDING)
+            ]).limit(limit)
+            
+            jobs = []
+            async for job_data in cursor:
+                job_data["_id"] = str(job_data["_id"])
+                jobs.append(ScheduledJob(**job_data))
+            
+            return jobs
+        except Exception as e:
+            print(f"Error getting all scheduled jobs: {e}")
             return []
     
     # Property Management Methods

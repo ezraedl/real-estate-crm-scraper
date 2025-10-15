@@ -3,6 +3,7 @@ import random
 import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pandas as pd
 import numpy as np
@@ -16,6 +17,7 @@ class MLSScraper:
     def __init__(self):
         self.is_running = False
         self.current_jobs = {}
+        self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
     
     async def start(self):
         """Start the scraper service"""
@@ -44,49 +46,114 @@ class MLSScraper:
         self.is_running = False
         print("MLS Scraper stopped")
     
+    async def check_cancellation_loop(self, job_id: str, cancel_flag: dict):
+        """Background task that checks for job cancellation every 2 seconds"""
+        try:
+            while not cancel_flag.get("cancelled", False):
+                await asyncio.sleep(2)  # Check every 2 seconds
+                current_job_status = await db.get_job(job_id)
+                if current_job_status and current_job_status.status == JobStatus.CANCELLED:
+                    print(f"[MONITOR] Cancellation detected for job {job_id}")
+                    cancel_flag["cancelled"] = True
+                    break
+        except Exception as e:
+            print(f"[MONITOR] Error in cancellation monitor: {e}")
+
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
         self.current_jobs[job.job_id] = job
         
+        # Cancellation flag shared between main task and monitor
+        cancel_flag = {"cancelled": False}
+        
+        # Start background cancellation monitor
+        monitor_task = asyncio.create_task(self.check_cancellation_loop(job.job_id, cancel_flag))
+        
         try:
-            # Update job status to running
-            await db.update_job_status(job.job_id, JobStatus.RUNNING)
+            # Initialize progress logs with job start
+            progress_logs = [{
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "job_started",
+                "message": f"Job started - Processing {len(job.locations)} location(s)",
+                "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"],
+                "total_locations": len(job.locations)
+            }]
+            
+            # Update job status to running with initial log
+            await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
             
             print(f"Processing job {job.job_id} for {len(job.locations)} locations")
             
             total_properties = 0
             saved_properties = 0
+            total_inserted = 0
+            total_updated = 0
+            total_skipped = 0
             
             # Process each location
             for i, location in enumerate(job.locations):
+                # Check if job has been cancelled (via background monitor)
+                if cancel_flag.get("cancelled", False):
+                    print(f"Job {job.job_id} was cancelled, stopping execution")
+                    return  # Exit immediately
+                
+                # Log location start
+                progress_logs.append({
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "event": "location_started",
+                    "location": location,
+                    "location_index": i + 1,
+                    "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
+                })
+                await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                 try:
                     print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
                     
                     # Get proxy configuration
                     proxy_config = await self.get_proxy_config(job)
                     
-                    # Scrape properties for this location
-                    properties = await self.scrape_location(
+                    # Scrape properties for this location (saves after each listing type)
+                    running_totals = {
+                        "total_properties": total_properties,
+                        "saved_properties": saved_properties,
+                        "total_inserted": total_inserted,
+                        "total_updated": total_updated,
+                        "total_skipped": total_skipped
+                    }
+                    
+                    location_summary = await self.scrape_location(
                         location=location,
                         job=job,
-                        proxy_config=proxy_config
+                        proxy_config=proxy_config,
+                        cancel_flag=cancel_flag,
+                        progress_logs=progress_logs,
+                        running_totals=running_totals,
+                        location_index=i + 1,
+                        total_locations=len(job.locations)
                     )
                     
-                    if properties:
-                        # Save properties to database with hash-based comparison
-                        save_results = await db.save_properties_batch(properties)
-                        saved_properties += save_results["inserted"] + save_results["updated"]
-                        total_properties += len(properties)
-                        
-                        print(f"Location {location}: {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped, {save_results['errors']} errors")
+                    # Update totals from running_totals (modified by scrape_location)
+                    total_properties = running_totals["total_properties"]
+                    saved_properties = running_totals["saved_properties"]
+                    total_inserted = running_totals["total_inserted"]
+                    total_updated = running_totals["total_updated"]
+                    total_skipped = running_totals["total_skipped"]
                     
-                    # Update job progress
+                    if location_summary:
+                        progress_logs.append(location_summary)
+                        print(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
+                    
+                    # Update job progress with detailed breakdown and logs
                     await db.update_job_status(
                         job.job_id,
                         JobStatus.RUNNING,
                         completed_locations=i + 1,
                         properties_scraped=total_properties,
-                        properties_saved=saved_properties
+                        properties_saved=saved_properties,
+                        properties_inserted=total_inserted,
+                        properties_updated=total_updated,
+                        properties_skipped=total_skipped,
+                        progress_logs=progress_logs
                     )
                     
                     # Random delay between locations
@@ -105,14 +172,31 @@ class MLSScraper:
                 properties_saved=saved_properties
             )
             
-            # Update run history for recurring jobs
-            if job.original_job_id:
+            # Update run history for scheduled jobs (new architecture)
+            if job.scheduled_job_id:
+                # Calculate next run time
+                scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                if scheduled_job and scheduled_job.cron_expression:
+                    import croniter
+                    cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+                    next_run = cron.get_next(datetime)
+                    
+                    await db.update_scheduled_job_run_history(
+                        job.scheduled_job_id,
+                        job.job_id,
+                        JobStatus.COMPLETED,
+                        next_run_at=next_run
+                    )
+                    print(f"Updated run history for scheduled job: {job.scheduled_job_id}")
+            
+            # Legacy: Update run history for old recurring jobs
+            elif job.original_job_id:
                 await db.update_recurring_job_run_history(
                     job.original_job_id,
                     job.job_id,
                     JobStatus.COMPLETED
                 )
-                print(f"Updated run history for recurring job: {job.original_job_id}")
+                print(f"Updated run history for legacy recurring job: {job.original_job_id}")
             
             print(f"Job {job.job_id} completed: {saved_properties} properties saved")
             
@@ -124,54 +208,300 @@ class MLSScraper:
                 error_message=str(e)
             )
             
-            # Update run history for recurring jobs (failed)
-            if job.original_job_id:
+            # Update run history for scheduled jobs (new architecture)
+            if job.scheduled_job_id:
+                scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                if scheduled_job and scheduled_job.cron_expression:
+                    import croniter
+                    cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+                    next_run = cron.get_next(datetime)
+                    
+                    await db.update_scheduled_job_run_history(
+                        job.scheduled_job_id,
+                        job.job_id,
+                        JobStatus.FAILED,
+                        next_run_at=next_run
+                    )
+                    print(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
+            
+            # Legacy: Update run history for old recurring jobs (failed)
+            elif job.original_job_id:
                 await db.update_recurring_job_run_history(
                     job.original_job_id,
                     job.job_id,
                     JobStatus.FAILED
                 )
-                print(f"Updated run history for recurring job (failed): {job.original_job_id}")
+                print(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
         
         finally:
+            # Stop the cancellation monitor
+            cancel_flag["cancelled"] = True  # Signal monitor to stop
+            if 'monitor_task' in locals():
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass  # Expected
+            
             # Remove from current jobs
             if job.job_id in self.current_jobs:
                 del self.current_jobs[job.job_id]
     
-    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None) -> List[Property]:
-        """Scrape ALL properties for a specific location - no filtering"""
+    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: list = None, running_totals: dict = None, location_index: int = 1, total_locations: int = 1):
+        """Scrape properties for a specific location based on job's listing_types. Saves after each type and returns summary."""
+        if cancel_flag is None:
+            cancel_flag = {"cancelled": False}
+        if progress_logs is None:
+            progress_logs = []
+        if running_totals is None:
+            running_totals = {
+                "total_properties": 0,
+                "saved_properties": 0,
+                "total_inserted": 0,
+                "total_updated": 0,
+                "total_skipped": 0
+            }
         try:
-            all_properties = []
+            listing_type_logs = []
+            location_total_found = 0
+            location_total_inserted = 0
+            location_total_updated = 0
+            location_total_skipped = 0
+            location_total_errors = 0
             
-            # Define all property types to scrape for comprehensive data
-            # Note: homeharvest doesn't support 'off_market' as a listing type
-            all_listing_types = ["for_sale", "sold", "for_rent", "pending"]
+            # Determine which listing types to scrape
+            if job.listing_types and len(job.listing_types) > 0:
+                # Use specified listing types
+                listing_types_to_scrape = job.listing_types
+                print(f"   [TARGET] Scraping specified types in {location}: {listing_types_to_scrape}")
+            elif job.listing_type:
+                # Backward compatibility: use single listing_type
+                listing_types_to_scrape = [job.listing_type]
+                print(f"   [TARGET] Scraping single type in {location}: {job.listing_type}")
+            else:
+                # Default: scrape all types for comprehensive data
+                listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent"]
+                print(f"   [TARGET] Scraping ALL property types in {location} (default)")
             
-            print(f"   [TARGET] Scraping ALL property types in {location} (no filtering)...")
-            print(f"   [DEBUG] Available listing types: {all_listing_types}")
+            # Enforce consistent order: for_sale, sold, pending, for_rent
+            preferred_order = ["for_sale", "sold", "pending", "for_rent"]
+            listing_types_to_scrape = sorted(
+                listing_types_to_scrape,
+                key=lambda x: preferred_order.index(x) if x in preferred_order else 999
+            )
+            
+            print(f"   [DEBUG] Listing types to scrape (ordered): {listing_types_to_scrape}")
             print(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
-            for listing_type in all_listing_types:
+            for listing_type in listing_types_to_scrape:
+                # Check if job was cancelled (checked every 2 seconds by background monitor)
+                if cancel_flag.get("cancelled", False):
+                    print(f"   [CANCELLED] Job was cancelled, stopping listing type fetch")
+                    break  # Exit the listing type loop
+                
                 try:
+                    start_time = datetime.utcnow()
                     print(f"   [FETCH] Fetching {listing_type} properties...")
-                    # Use higher limit to ensure we find the exact property
-                    properties = await self._scrape_listing_type(location, job, proxy_config, listing_type, limit=200, past_days=90)
-                    all_properties.extend(properties)
-                    print(f"   [OK] Found {len(properties)} {listing_type} properties")
+                    
+                    # Log API call START with "fetching" status
+                    fetching_log = {
+                        "listing_type": listing_type,
+                        "status": "fetching",
+                        "message": f"Fetching {listing_type} properties...",
+                        "timestamp": start_time.isoformat()
+                    }
+                    listing_type_logs.append(fetching_log)
+                    
+                    # Update progress logs immediately for real-time UI feedback
+                    # Create a summary log entry for this location showing what we're fetching
+                    temp_summary = {
+                        "timestamp": start_time.isoformat(),
+                        "location": location,
+                        "location_index": location_index,
+                        "total_locations": total_locations,
+                        "status": "in_progress",
+                        "message": f"Fetching {listing_type} properties from {location}...",
+                        "listing_type_breakdown": listing_type_logs.copy(),
+                        # Current running totals for this location
+                        "properties_found": location_total_found,
+                        "inserted": location_total_inserted,
+                        "updated": location_total_updated,
+                        "skipped": location_total_skipped
+                    }
+                    # Find if we already have a temp entry for this location
+                    temp_idx = None
+                    for idx, log in enumerate(progress_logs):
+                        if isinstance(log, dict) and log.get("location") == location and log.get("status") == "in_progress":
+                            temp_idx = idx
+                            break
+                    
+                    if temp_idx is not None:
+                        # Update existing temp entry
+                        progress_logs[temp_idx] = temp_summary
+                    else:
+                        # Add new temp entry
+                        progress_logs.append(temp_summary)
+                    
+                    # Push to database immediately for real-time UI update
+                    await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    
+                    # Use job's limit (or None to get all properties)
+                    properties = await self._scrape_listing_type(
+                        location, 
+                        job, 
+                        proxy_config, 
+                        listing_type, 
+                        limit=job.limit if job.limit else None,
+                        past_days=job.past_days if job.past_days else 90
+                    )
+                    
+                    end_time = datetime.utcnow()
+                    duration = (end_time - start_time).total_seconds()
+                    
+                    print(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
+                    print(f"   [DEBUG] Properties type: {type(properties)}, truthy: {bool(properties)}, len: {len(properties)}")
+                    
+                    # Initialize save_results for use later
+                    save_results = {"inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
+                    
+                    # Save properties immediately after each listing type fetch
+                    if properties:
+                        print(f"   [DEBUG] Entering save block...")
+                        save_results = await db.save_properties_batch(properties)
+                        location_total_found += len(properties)
+                        location_total_inserted += save_results["inserted"]
+                        location_total_updated += save_results["updated"]
+                        location_total_skipped += save_results["skipped"]
+                        location_total_errors += save_results["errors"]
+                        
+                        # Update running totals
+                        running_totals["total_properties"] += len(properties)
+                        running_totals["saved_properties"] += save_results["inserted"] + save_results["updated"]
+                        running_totals["total_inserted"] += save_results["inserted"]
+                        running_totals["total_updated"] += save_results["updated"]
+                        running_totals["total_skipped"] += save_results["skipped"]
+                        
+                        print(f"   [SAVED] {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
+                    
+                    # Update log with completion and save stats
+                    listing_type_logs[-1] = {
+                        "listing_type": listing_type,
+                        "status": "completed",
+                        "properties_found": len(properties),
+                        "inserted": save_results.get("inserted", 0) if properties else 0,
+                        "updated": save_results.get("updated", 0) if properties else 0,
+                        "skipped": save_results.get("skipped", 0) if properties else 0,
+                        "duration_seconds": round(duration, 2),
+                        "timestamp": start_time.isoformat()
+                    }
+                    
+                    # Update the temp summary with completed status and running totals
+                    print(f"   [DEBUG] temp_idx = {temp_idx}, will update progress logs")
+                    if temp_idx is not None:
+                        progress_logs[temp_idx] = {
+                            "timestamp": end_time.isoformat(),
+                            "location": location,
+                            "location_index": location_index,
+                            "total_locations": total_locations,
+                            "status": "in_progress",
+                            "message": f"Completed {listing_type}: {len(properties)} found, {save_results.get('inserted', 0) if properties else 0} inserted, {save_results.get('updated', 0) if properties else 0} updated",
+                            "listing_type_breakdown": listing_type_logs.copy(),
+                            # Running totals for this location so far
+                            "properties_found": location_total_found,
+                            "inserted": location_total_inserted,
+                            "updated": location_total_updated,
+                            "skipped": location_total_skipped
+                        }
+                        # Push to database immediately with updated job totals
+                        print(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
+                        await db.update_job_status(
+                            job.job_id, 
+                            JobStatus.RUNNING,
+                            properties_scraped=running_totals["total_properties"],
+                            properties_saved=running_totals["saved_properties"],
+                            properties_inserted=running_totals["total_inserted"],
+                            properties_updated=running_totals["total_updated"],
+                            properties_skipped=running_totals["total_skipped"],
+                            progress_logs=progress_logs
+                        )
+                        print(f"   [DB-UPDATE] Job status updated successfully")
+                    else:
+                        # No temp entry found, still update job counts
+                        print(f"   [WARNING] No temp_idx found, but still updating job counts")
+                        await db.update_job_status(
+                            job.job_id, 
+                            JobStatus.RUNNING,
+                            properties_scraped=running_totals["total_properties"],
+                            properties_saved=running_totals["saved_properties"],
+                            properties_inserted=running_totals["total_inserted"],
+                            properties_updated=running_totals["total_updated"],
+                            properties_skipped=running_totals["total_skipped"]
+                        )
                     
                     # Reduced delay for faster response
                     await asyncio.sleep(0.5)
                     
                 except Exception as e:
                     print(f"   [WARNING] Error scraping {listing_type} properties: {e}")
+                    # Log the error
+                    error_log = {
+                        "listing_type": listing_type,
+                        "status": "error",
+                        "properties_found": 0,
+                        "error": str(e),
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    listing_type_logs.append(error_log)
+                    
+                    # Update progress logs with error
+                    if temp_idx is not None:
+                        progress_logs[temp_idx] = {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "location": location,
+                            "location_index": location_index,
+                            "total_locations": total_locations,
+                            "status": "in_progress",
+                            "message": f"Error fetching {listing_type}: {str(e)}",
+                            "listing_type_breakdown": listing_type_logs.copy(),
+                            # Running totals for this location so far (with error)
+                            "properties_found": location_total_found,
+                            "inserted": location_total_inserted,
+                            "updated": location_total_updated,
+                            "skipped": location_total_skipped
+                        }
+                        # Push to database immediately with current totals
+                        await db.update_job_status(
+                            job.job_id, 
+                            JobStatus.RUNNING,
+                            properties_scraped=running_totals["total_properties"],
+                            properties_saved=running_totals["saved_properties"],
+                            properties_inserted=running_totals["total_inserted"],
+                            properties_updated=running_totals["total_updated"],
+                            properties_skipped=running_totals["total_skipped"],
+                            progress_logs=progress_logs
+                        )
+                    
                     continue
             
-            print(f"   [TOTAL] Total properties scraped: {len(all_properties)}")
-            return all_properties
+            print(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
+            
+            # Return final summary for this location
+            return {
+                "timestamp": datetime.utcnow().isoformat(),
+                "location": location,
+                "location_index": location_index,
+                "total_locations": total_locations,
+                "properties_found": location_total_found,
+                "inserted": location_total_inserted,
+                "updated": location_total_updated,
+                "skipped": location_total_skipped,
+                "errors": location_total_errors,
+                "listing_type_breakdown": listing_type_logs
+            }
             
         except Exception as e:
             print(f"Error scraping location {location}: {e}")
-            return []
+            return None
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
@@ -204,8 +534,12 @@ class MLSScraper:
             # Note: We're not setting foreclosure=False, exclude_pending=False, etc.
             # This allows the scraper to get off-market, foreclosures, and all other property types
             
-            # Scrape properties
-            properties_df = scrape_property(**scrape_params)
+            # Scrape properties - Run blocking call in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            properties_df = await loop.run_in_executor(
+                self.executor,
+                lambda: scrape_property(**scrape_params)
+            )
             
             # Convert DataFrame to our Property models
             properties = []

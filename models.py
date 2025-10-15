@@ -13,6 +13,12 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+class ScheduledJobStatus(str, Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    PAUSED = "paused"
+    DELETED = "deleted"
+
 class JobPriority(str, Enum):
     IMMEDIATE = "immediate"
     HIGH = "high"
@@ -39,15 +45,25 @@ class ListingType(str, Enum):
     # Note: OFF_MARKET is not supported by homeharvest library
     # OFF_MARKET = "off_market"  # Disabled - not supported by homeharvest
 
-class ScrapingJob(BaseModel):
+class ScheduledJob(BaseModel):
+    """
+    Represents a recurring scheduled job (cron job).
+    This defines WHAT and WHEN to scrape, but not individual executions.
+    """
     id: Optional[str] = Field(default=None, alias="_id")
-    job_id: str = Field(..., description="Unique job identifier")
-    priority: JobPriority = Field(default=JobPriority.NORMAL)
-    status: JobStatus = Field(default=JobStatus.PENDING)
+    scheduled_job_id: str = Field(..., description="Unique scheduled job identifier")
+    name: str = Field(..., description="Human-readable name for the scheduled job")
+    description: Optional[str] = Field(None, description="Description of what this job does")
+    status: ScheduledJobStatus = Field(default=ScheduledJobStatus.ACTIVE)
     
-    # Scraping parameters
+    # Cron configuration
+    cron_expression: str = Field(..., description="Cron expression for scheduling")
+    timezone: str = Field(default="UTC", description="Timezone for cron schedule")
+    
+    # Scraping parameters (template for job instances)
     locations: List[str] = Field(..., description="List of locations to scrape")
-    listing_type: Optional[ListingType] = None  # Make listing_type optional
+    listing_types: Optional[List[ListingType]] = Field(default=None, description="List of listing types to scrape (for_sale, sold, etc.)")
+    listing_type: Optional[ListingType] = Field(default=None, description="DEPRECATED: Use listing_types instead")
     property_types: Optional[List[PropertyType]] = None
     past_days: Optional[int] = None
     date_from: Optional[str] = None
@@ -58,33 +74,94 @@ class ScrapingJob(BaseModel):
     exclude_pending: bool = False
     limit: int = Field(default=10000, le=10000)
     
-    # Scheduling
+    # Execution tracking
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_by: Optional[str] = Field(None, description="User or system that created this scheduled job")
+    
+    # Run history
+    run_count: int = Field(default=0, description="Total number of times this job has been executed")
+    last_run_at: Optional[datetime] = Field(None, description="When this job last ran")
+    last_run_status: Optional[JobStatus] = Field(None, description="Status of the last run")
+    last_run_job_id: Optional[str] = Field(None, description="Job ID of the last execution")
+    next_run_at: Optional[datetime] = Field(None, description="Calculated next run time")
+    
+    # Anti-bot configuration (defaults for job instances)
+    proxy_config: Optional[Dict[str, Any]] = None
+    user_agent: Optional[str] = None
+    request_delay: float = Field(default=1.0, ge=0.1, le=10.0)
+    
+    # Priority for created jobs
+    priority: JobPriority = Field(default=JobPriority.NORMAL)
+    
+    class Config:
+        use_enum_values = True
+        json_encoders = {
+            ObjectId: str,
+            datetime: lambda v: v.isoformat()
+        }
+
+class ScrapingJob(BaseModel):
+    """
+    Represents a single job execution (one-time or instance of a scheduled job).
+    This tracks the actual execution and results of a scraping operation.
+    """
+    id: Optional[str] = Field(default=None, alias="_id")
+    job_id: str = Field(..., description="Unique job identifier")
+    priority: JobPriority = Field(default=JobPriority.NORMAL)
+    status: JobStatus = Field(default=JobStatus.PENDING)
+    
+    # Reference to scheduled job (if this is an instance of a recurring job)
+    scheduled_job_id: Optional[str] = Field(None, description="ID of the parent scheduled job (for recurring jobs)")
+    
+    # Scraping parameters
+    locations: List[str] = Field(..., description="List of locations to scrape")
+    listing_types: Optional[List[ListingType]] = Field(default=None, description="List of listing types to scrape (for_sale, sold, etc.)")
+    listing_type: Optional[ListingType] = Field(default=None, description="DEPRECATED: Use listing_types instead")
+    property_types: Optional[List[PropertyType]] = None
+    past_days: Optional[int] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    radius: Optional[float] = None
+    mls_only: bool = False
+    foreclosure: bool = False
+    exclude_pending: bool = False
+    limit: int = Field(default=10000, le=10000)
+    
+    # Scheduling (for one-time scheduled jobs)
     scheduled_at: Optional[datetime] = None
-    cron_expression: Optional[str] = None  # For recurring jobs
     
     # Execution tracking
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
-    
-    # Run tracking for recurring jobs
-    run_count: int = Field(default=0, description="Number of times this recurring job has been executed")
-    last_run: Optional[datetime] = Field(default=None, description="Timestamp of the last execution")
-    last_run_status: Optional[JobStatus] = Field(default=None, description="Status of the last execution")
-    last_run_job_id: Optional[str] = Field(default=None, description="Job ID of the last execution instance")
-    original_job_id: Optional[str] = Field(default=None, description="Original job ID for recurring job instances")
+    execution_time_seconds: Optional[float] = Field(None, description="How long the job took to execute")
     
     # Results
     properties_scraped: int = 0
     properties_saved: int = 0
+    properties_inserted: int = Field(default=0, description="New properties added to database")
+    properties_updated: int = Field(default=0, description="Existing properties updated")
+    properties_skipped: int = Field(default=0, description="Properties skipped (no content change)")
     total_locations: int = 0
     completed_locations: int = 0
+    
+    # Detailed progress logs
+    progress_logs: List[Dict[str, Any]] = Field(default_factory=list, description="Detailed logs per location and listing type")
     
     # Anti-bot configuration
     proxy_config: Optional[Dict[str, Any]] = None
     user_agent: Optional[str] = None
     request_delay: float = Field(default=1.0, ge=0.1, le=10.0)
+    
+    # Legacy fields for backward compatibility (deprecated)
+    cron_expression: Optional[str] = Field(None, description="DEPRECATED: Use scheduled_jobs collection instead")
+    run_count: int = Field(default=0, description="DEPRECATED: Moved to ScheduledJob")
+    last_run: Optional[datetime] = Field(None, description="DEPRECATED: Moved to ScheduledJob")
+    last_run_status: Optional[JobStatus] = Field(None, description="DEPRECATED: Moved to ScheduledJob")
+    last_run_job_id: Optional[str] = Field(None, description="DEPRECATED: Moved to ScheduledJob")
+    original_job_id: Optional[str] = Field(None, description="DEPRECATED: Use scheduled_job_id instead")
     
     class Config:
         use_enum_values = True
