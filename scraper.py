@@ -354,6 +354,9 @@ class MLSScraper:
                     print(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
                     print(f"   [DEBUG] Properties type: {type(properties)}, truthy: {bool(properties)}, len: {len(properties)}")
                     
+                    # Initialize save_results for use later
+                    save_results = {"inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
+                    
                     # Save properties immediately after each listing type fetch
                     if properties:
                         print(f"   [DEBUG] Entering save block...")
@@ -386,6 +389,7 @@ class MLSScraper:
                     }
                     
                     # Update the temp summary with completed status and running totals
+                    print(f"   [DEBUG] temp_idx = {temp_idx}, will update progress logs")
                     if temp_idx is not None:
                         progress_logs[temp_idx] = {
                             "timestamp": end_time.isoformat(),
@@ -402,6 +406,7 @@ class MLSScraper:
                             "skipped": location_total_skipped
                         }
                         # Push to database immediately with updated job totals
+                        print(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
                         await db.update_job_status(
                             job.job_id, 
                             JobStatus.RUNNING,
@@ -411,6 +416,19 @@ class MLSScraper:
                             properties_updated=running_totals["total_updated"],
                             properties_skipped=running_totals["total_skipped"],
                             progress_logs=progress_logs
+                        )
+                        print(f"   [DB-UPDATE] Job status updated successfully")
+                    else:
+                        # No temp entry found, still update job counts
+                        print(f"   [WARNING] No temp_idx found, but still updating job counts")
+                        await db.update_job_status(
+                            job.job_id, 
+                            JobStatus.RUNNING,
+                            properties_scraped=running_totals["total_properties"],
+                            properties_saved=running_totals["saved_properties"],
+                            properties_inserted=running_totals["total_inserted"],
+                            properties_updated=running_totals["total_updated"],
+                            properties_skipped=running_totals["total_skipped"]
                         )
                     
                     # Reduced delay for faster response
