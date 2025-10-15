@@ -47,6 +47,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Helper function to determine remaining work from progress logs
+def get_remaining_locations(job: ScrapingJob) -> List[str]:
+    """
+    Parse progress logs to determine which locations still need to be processed.
+    Returns list of locations that were not completed.
+    """
+    if not job.progress_logs or not job.locations:
+        # No logs or no locations, retry everything
+        return job.locations
+    
+    completed_locations = set()
+    
+    # Look for location completion entries in progress logs
+    for log in job.progress_logs:
+        if isinstance(log, dict):
+            # A location is considered complete if it has properties_found field
+            # (meaning it finished processing and saving)
+            if "location" in log and "properties_found" in log:
+                completed_locations.add(log["location"])
+    
+    # Return locations that weren't completed
+    remaining = [loc for loc in job.locations if loc not in completed_locations]
+    
+    if remaining:
+        logger.info(f"Job {job.job_id} completed {len(completed_locations)}/{len(job.locations)} locations. Remaining: {remaining}")
+    else:
+        logger.warning(f"Job {job.job_id} has no remaining locations based on logs, but was stuck. Will retry all locations.")
+        remaining = job.locations  # Safety: retry everything if something seems wrong
+    
+    return remaining
+
 # Helper function to handle stuck jobs on startup
 async def handle_stuck_jobs():
     """
@@ -125,18 +156,31 @@ async def handle_stuck_jobs():
                             JobStatus.FAILED
                         )
                 else:
-                    # Retry the job
+                    # Retry the job - smart resume from where it left off
                     logger.info(
                         f"Retrying stuck job {job.job_id} (attempt {retry_count + 2}/3)"
                     )
                     
-                    # Create a retry job
+                    # Determine which locations still need to be processed
+                    remaining_locations = get_remaining_locations(job)
+                    
+                    if not remaining_locations:
+                        logger.warning(f"No remaining locations for job {job.job_id}, marking as completed")
+                        await db.update_job_status(
+                            job.job_id,
+                            JobStatus.COMPLETED,
+                            error_message="Job was stuck but all locations were completed"
+                        )
+                        continue
+                    
+                    # Create a retry job with only remaining locations
                     retry_job_id = f"{job.job_id}_retry_{retry_count + 1}"
                     retry_job = ScrapingJob(
                         job_id=retry_job_id,
                         priority=JobPriority.HIGH,  # High priority for retries
                         scheduled_job_id=job.scheduled_job_id,
-                        locations=job.locations,
+                        locations=remaining_locations,  # Only remaining locations!
+                        listing_types=job.listing_types,  # Support multi-select
                         listing_type=job.listing_type,
                         property_types=job.property_types,
                         past_days=job.past_days,
@@ -150,8 +194,10 @@ async def handle_stuck_jobs():
                         proxy_config=job.proxy_config,
                         user_agent=job.user_agent,
                         request_delay=job.request_delay,
-                        total_locations=job.total_locations
+                        total_locations=len(remaining_locations)  # Update count
                     )
+                    
+                    logger.info(f"Smart resume: Retrying {len(remaining_locations)}/{len(job.locations)} locations")
                     
                     # Mark the stuck job as failed
                     await db.update_job_status(
