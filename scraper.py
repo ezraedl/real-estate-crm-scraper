@@ -117,7 +117,8 @@ class MLSScraper:
                         location=location,
                         job=job,
                         proxy_config=proxy_config,
-                        cancel_flag=cancel_flag
+                        cancel_flag=cancel_flag,
+                        progress_logs=progress_logs
                     )
                     
                     if properties:
@@ -250,10 +251,12 @@ class MLSScraper:
             if job.job_id in self.current_jobs:
                 del self.current_jobs[job.job_id]
     
-    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None):
+    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: list = None):
         """Scrape properties for a specific location based on job's listing_types. Returns (properties, logs)"""
         if cancel_flag is None:
             cancel_flag = {"cancelled": False}
+        if progress_logs is None:
+            progress_logs = []
         try:
             all_properties = []
             listing_type_logs = []
@@ -285,13 +288,40 @@ class MLSScraper:
                     start_time = datetime.utcnow()
                     print(f"   [FETCH] Fetching {listing_type} properties...")
                     
-                    # Log API call START
-                    listing_type_logs.append({
+                    # Log API call START with "fetching" status
+                    fetching_log = {
                         "listing_type": listing_type,
                         "status": "fetching",
                         "message": f"Fetching {listing_type} properties...",
                         "timestamp": start_time.isoformat()
-                    })
+                    }
+                    listing_type_logs.append(fetching_log)
+                    
+                    # Update progress logs immediately for real-time UI feedback
+                    # Create a summary log entry for this location showing what we're fetching
+                    temp_summary = {
+                        "timestamp": start_time.isoformat(),
+                        "location": location,
+                        "status": "in_progress",
+                        "message": f"Fetching {listing_type} properties from {location}...",
+                        "listing_type_breakdown": listing_type_logs.copy()
+                    }
+                    # Find if we already have a temp entry for this location
+                    temp_idx = None
+                    for idx, log in enumerate(progress_logs):
+                        if isinstance(log, dict) and log.get("location") == location and log.get("status") == "in_progress":
+                            temp_idx = idx
+                            break
+                    
+                    if temp_idx is not None:
+                        # Update existing temp entry
+                        progress_logs[temp_idx] = temp_summary
+                    else:
+                        # Add new temp entry
+                        progress_logs.append(temp_summary)
+                    
+                    # Push to database immediately for real-time UI update
+                    await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     
                     # Use job's limit (or None to get all properties)
                     properties = await self._scrape_listing_type(
@@ -318,18 +348,45 @@ class MLSScraper:
                         "timestamp": start_time.isoformat()
                     }
                     
+                    # Update the temp summary with completed status
+                    if temp_idx is not None:
+                        progress_logs[temp_idx] = {
+                            "timestamp": start_time.isoformat(),
+                            "location": location,
+                            "status": "in_progress",
+                            "message": f"Completed {listing_type}, found {len(properties)} properties",
+                            "listing_type_breakdown": listing_type_logs.copy()
+                        }
+                        # Push to database immediately
+                        await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    
                     # Reduced delay for faster response
                     await asyncio.sleep(0.5)
                     
                 except Exception as e:
                     print(f"   [WARNING] Error scraping {listing_type} properties: {e}")
                     # Log the error
-                    listing_type_logs.append({
+                    error_log = {
                         "listing_type": listing_type,
+                        "status": "error",
                         "properties_found": 0,
                         "error": str(e),
                         "timestamp": datetime.utcnow().isoformat()
-                    })
+                    }
+                    listing_type_logs.append(error_log)
+                    
+                    # Update progress logs with error
+                    if temp_idx is not None:
+                        progress_logs[temp_idx] = {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "location": location,
+                            "status": "in_progress",
+                            "message": f"Error fetching {listing_type}: {str(e)}",
+                            "listing_type_breakdown": listing_type_logs.copy()
+                        }
+                        # Push to database immediately
+                        await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    
                     continue
             
             print(f"   [TOTAL] Total properties scraped: {len(all_properties)}")
