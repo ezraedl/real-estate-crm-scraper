@@ -352,9 +352,11 @@ class MLSScraper:
                     duration = (end_time - start_time).total_seconds()
                     
                     print(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
+                    print(f"   [DEBUG] Properties type: {type(properties)}, truthy: {bool(properties)}, len: {len(properties)}")
                     
                     # Save properties immediately after each listing type fetch
                     if properties:
+                        print(f"   [DEBUG] Entering save block...")
                         save_results = await db.save_properties_batch(properties)
                         location_total_found += len(properties)
                         location_total_inserted += save_results["inserted"]
