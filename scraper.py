@@ -280,10 +280,17 @@ class MLSScraper:
                 print(f"   [TARGET] Scraping single type in {location}: {job.listing_type}")
             else:
                 # Default: scrape all types for comprehensive data
-                listing_types_to_scrape = ["for_sale", "sold", "for_rent", "pending"]
+                listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent"]
                 print(f"   [TARGET] Scraping ALL property types in {location} (default)")
             
-            print(f"   [DEBUG] Listing types to scrape: {listing_types_to_scrape}")
+            # Enforce consistent order: for_sale, sold, pending, for_rent
+            preferred_order = ["for_sale", "sold", "pending", "for_rent"]
+            listing_types_to_scrape = sorted(
+                listing_types_to_scrape,
+                key=lambda x: preferred_order.index(x) if x in preferred_order else 999
+            )
+            
+            print(f"   [DEBUG] Listing types to scrape (ordered): {listing_types_to_scrape}")
             print(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
             for listing_type in listing_types_to_scrape:
