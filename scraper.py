@@ -46,9 +46,28 @@ class MLSScraper:
         self.is_running = False
         print("MLS Scraper stopped")
     
+    async def check_cancellation_loop(self, job_id: str, cancel_flag: dict):
+        """Background task that checks for job cancellation every 2 seconds"""
+        try:
+            while not cancel_flag.get("cancelled", False):
+                await asyncio.sleep(2)  # Check every 2 seconds
+                current_job_status = await db.get_job(job_id)
+                if current_job_status and current_job_status.status == JobStatus.CANCELLED:
+                    print(f"[MONITOR] Cancellation detected for job {job_id}")
+                    cancel_flag["cancelled"] = True
+                    break
+        except Exception as e:
+            print(f"[MONITOR] Error in cancellation monitor: {e}")
+
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
         self.current_jobs[job.job_id] = job
+        
+        # Cancellation flag shared between main task and monitor
+        cancel_flag = {"cancelled": False}
+        
+        # Start background cancellation monitor
+        monitor_task = asyncio.create_task(self.check_cancellation_loop(job.job_id, cancel_flag))
         
         try:
             # Initialize progress logs with job start
@@ -73,9 +92,8 @@ class MLSScraper:
             
             # Process each location
             for i, location in enumerate(job.locations):
-                # Check if job has been cancelled
-                current_job_status = await db.get_job(job.job_id)
-                if current_job_status and current_job_status.status == JobStatus.CANCELLED:
+                # Check if job has been cancelled (via background monitor)
+                if cancel_flag.get("cancelled", False):
                     print(f"Job {job.job_id} was cancelled, stopping execution")
                     return  # Exit immediately
                 
@@ -98,7 +116,8 @@ class MLSScraper:
                     properties, location_logs = await self.scrape_location(
                         location=location,
                         job=job,
-                        proxy_config=proxy_config
+                        proxy_config=proxy_config,
+                        cancel_flag=cancel_flag
                     )
                     
                     if properties:
@@ -218,12 +237,23 @@ class MLSScraper:
                 print(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
         
         finally:
+            # Stop the cancellation monitor
+            cancel_flag["cancelled"] = True  # Signal monitor to stop
+            if 'monitor_task' in locals():
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass  # Expected
+            
             # Remove from current jobs
             if job.job_id in self.current_jobs:
                 del self.current_jobs[job.job_id]
     
-    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None):
+    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None):
         """Scrape properties for a specific location based on job's listing_types. Returns (properties, logs)"""
+        if cancel_flag is None:
+            cancel_flag = {"cancelled": False}
         try:
             all_properties = []
             listing_type_logs = []
@@ -246,10 +276,9 @@ class MLSScraper:
             print(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
             for listing_type in listing_types_to_scrape:
-                # Check if job was cancelled (for faster response during multi-type scraping)
-                current_job_status = await db.get_job(job.job_id)
-                if current_job_status and current_job_status.status == JobStatus.CANCELLED:
-                    print(f"   [CANCELLED] Job {job.job_id} was cancelled, stopping listing type fetch")
+                # Check if job was cancelled (checked every 2 seconds by background monitor)
+                if cancel_flag.get("cancelled", False):
+                    print(f"   [CANCELLED] Job was cancelled, stopping listing type fetch")
                     break  # Exit the listing type loop
                 
                 try:
