@@ -445,7 +445,7 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
             logger.info(f"Found {len(all_properties)} existing properties, returning immediately for fast response")
             # Calculate execution time
             end_time = datetime.utcnow()
-            execution_time = (end_time - start_time).total_seconds()
+            execution_time = round((end_time - start_time).total_seconds(), 2)
             
             # Update job status in database
             await db.update_job_status(job_id, JobStatus.COMPLETED)
@@ -586,7 +586,7 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
         
         # Calculate execution time
         end_time = datetime.utcnow()
-        execution_time = (end_time - start_time).total_seconds()
+        execution_time = round((end_time - start_time).total_seconds(), 2)
         
         # Update job status in database
         await db.update_job_status(job_id, JobStatus.COMPLETED)
