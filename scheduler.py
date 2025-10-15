@@ -187,12 +187,21 @@ class JobScheduler:
             import uuid
             new_job_id = f"scheduled_{scheduled_job.scheduled_job_id}_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
             
+            # Special handling for active properties re-scraping job
+            if scheduled_job.scheduled_job_id == "active_properties_rescraping":
+                locations = await self._get_active_properties_locations()
+                if not locations:
+                    logger.info("No active properties found, skipping active properties re-scraping job")
+                    return None
+            else:
+                locations = scheduled_job.locations
+            
             # Create new job instance from scheduled job template
             new_job = ScrapingJob(
                 job_id=new_job_id,
                 priority=scheduled_job.priority,
                 scheduled_job_id=scheduled_job.scheduled_job_id,  # Reference to parent
-                locations=scheduled_job.locations,
+                locations=locations,
                 listing_types=scheduled_job.listing_types,  # Use new multi-select field
                 listing_type=scheduled_job.listing_type,  # Keep for backward compatibility
                 property_types=scheduled_job.property_types,
@@ -207,7 +216,7 @@ class JobScheduler:
                 proxy_config=scheduled_job.proxy_config,
                 user_agent=scheduled_job.user_agent,
                 request_delay=scheduled_job.request_delay,
-                total_locations=len(scheduled_job.locations)
+                total_locations=len(locations)
             )
             
             # Save to database
@@ -220,6 +229,39 @@ class JobScheduler:
         except Exception as e:
             logger.error(f"Error creating scheduled job instance: {e}")
             raise
+    
+    async def _get_active_properties_locations(self) -> List[str]:
+        """Get unique locations from properties with crm_status='active'"""
+        try:
+            # Query for properties with crm_status='active' and get their locations
+            cursor = db.properties_collection.find(
+                {"crm_status": "active"},
+                {"address.city": 1, "address.state": 1, "address.zip_code": 1}
+            )
+            
+            locations = set()
+            async for property_doc in cursor:
+                address = property_doc.get("address", {})
+                city = address.get("city")
+                state = address.get("state")
+                zip_code = address.get("zip_code")
+                
+                # Create location string in format "City, State" or "City, State ZIP"
+                if city and state:
+                    if zip_code:
+                        location = f"{city}, {state} {zip_code}"
+                    else:
+                        location = f"{city}, {state}"
+                    locations.add(location)
+            
+            location_list = list(locations)
+            logger.info(f"Found {len(location_list)} unique locations for active properties: {location_list[:5]}{'...' if len(location_list) > 5 else ''}")
+            
+            return location_list
+            
+        except Exception as e:
+            logger.error(f"Error getting active properties locations: {e}")
+            return []
     
     async def create_recurring_job_instance(self, original_job: ScrapingJob) -> ScrapingJob:
         """

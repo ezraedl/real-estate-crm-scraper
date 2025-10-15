@@ -289,6 +289,9 @@ class Property(BaseModel):
     source: str = Field(default="homeharvest")
     is_comp: bool = Field(default=False, description="Whether this property is a comp for another property")
     
+    # CRM Integration
+    crm_property_ids: Optional[List[str]] = Field(default=None, description="List of CRM property IDs that reference this MLS property")
+    
     def generate_property_id(self) -> str:
         """Generate property_id as hash of formatted_address"""
         if not self.address or not self.address.formatted_address:

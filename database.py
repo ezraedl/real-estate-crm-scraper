@@ -57,6 +57,7 @@ class Database:
             await self.properties_collection.create_index([("status", ASCENDING)])
             await self.properties_collection.create_index([("scraped_at", DESCENDING)])
             await self.properties_collection.create_index([("job_id", ASCENDING)])
+            await self.properties_collection.create_index([("crm_property_ids", ASCENDING)])
             
             # Scheduled jobs collection indexes
             await self.scheduled_jobs_collection.create_index([("scheduled_job_id", ASCENDING)], unique=True)
@@ -363,12 +364,17 @@ class Database:
                         property_data.dict(by_alias=True, exclude={"id"}),
                         upsert=True
                     )
+                    
+                    # Update CRM properties that reference this MLS property
+                    crm_updated_count = await self.update_crm_properties_from_mls(property_data.property_id)
+                    
                     return {
                         "action": "updated",
                         "reason": "content_changed",
                         "property_id": property_data.property_id,
                         "old_hash": existing_hash,
-                        "new_hash": new_hash
+                        "new_hash": new_hash,
+                        "crm_properties_updated": crm_updated_count
                     }
             else:
                 # New property - insert it
@@ -531,6 +537,155 @@ class Database:
             return await self.properties_collection.count_documents({})
         except Exception as e:
             print(f"Error getting property count: {e}")
+            return 0
+    
+    # CRM Integration Methods
+    async def add_crm_property_reference(self, mls_property_id: str, crm_property_id: str) -> bool:
+        """Add a CRM property reference to an MLS property"""
+        try:
+            result = await self.properties_collection.update_one(
+                {"property_id": mls_property_id},
+                {
+                    "$addToSet": {"crm_property_ids": crm_property_id},
+                    "$set": {"last_content_updated": datetime.utcnow()}
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error adding CRM property reference: {e}")
+            return False
+    
+    async def remove_crm_property_reference(self, mls_property_id: str, crm_property_id: str) -> bool:
+        """Remove a CRM property reference from an MLS property"""
+        try:
+            result = await self.properties_collection.update_one(
+                {"property_id": mls_property_id},
+                {
+                    "$pull": {"crm_property_ids": crm_property_id},
+                    "$set": {"last_content_updated": datetime.utcnow()}
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"Error removing CRM property reference: {e}")
+            return False
+    
+    async def get_crm_property_references(self, mls_property_id: str) -> List[str]:
+        """Get all CRM property IDs that reference an MLS property"""
+        try:
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": mls_property_id},
+                {"crm_property_ids": 1}
+            )
+            return property_doc.get("crm_property_ids", []) if property_doc else []
+        except Exception as e:
+            print(f"Error getting CRM property references: {e}")
+            return []
+    
+    async def update_crm_properties_from_mls(self, mls_property_id: str) -> int:
+        """Update all CRM properties that reference an MLS property with the latest MLS data"""
+        try:
+            # Get the MLS property data
+            mls_property = await self.properties_collection.find_one({"property_id": mls_property_id})
+            if not mls_property:
+                print(f"MLS property not found: {mls_property_id}")
+                return 0
+            
+            # Get CRM property references
+            crm_property_ids = mls_property.get("crm_property_ids", [])
+            if not crm_property_ids:
+                return 0
+            
+            # Connect to CRM database to update properties
+            # Note: This assumes both databases are in the same MongoDB instance
+            # You may need to adjust this based on your setup
+            crm_db = self.db  # Same database instance
+            crm_properties_collection = crm_db.properties  # Same collection name
+            
+            updated_count = 0
+            
+            # Update each CRM property with MLS data
+            for crm_property_id in crm_property_ids:
+                try:
+                    # Prepare update data (exclude MLS-specific fields and preserve CRM-specific fields)
+                    update_data = {
+                        # Core property data
+                        "mls_id": mls_property.get("mls_id"),
+                        "mls": mls_property.get("mls"),
+                        "status": mls_property.get("status"),
+                        "mls_status": mls_property.get("mls_status"),
+                        "listing_type": mls_property.get("listing_type"),
+                        
+                        # Address data
+                        "address": mls_property.get("address"),
+                        
+                        # Description data
+                        "description": mls_property.get("description"),
+                        
+                        # Financial data
+                        "financial": mls_property.get("financial"),
+                        
+                        # Dates data
+                        "dates": mls_property.get("dates"),
+                        
+                        # Location data
+                        "location": mls_property.get("location"),
+                        
+                        # Contact information
+                        "agent": mls_property.get("agent"),
+                        "broker": mls_property.get("broker"),
+                        "builder": mls_property.get("builder"),
+                        "office": mls_property.get("office"),
+                        
+                        # URLs and references
+                        "property_url": mls_property.get("property_url"),
+                        "listing_id": mls_property.get("listing_id"),
+                        "permalink": mls_property.get("permalink"),
+                        
+                        # Property images
+                        "primary_photo": mls_property.get("primary_photo"),
+                        "alt_photos": mls_property.get("alt_photos"),
+                        
+                        # Additional data
+                        "days_on_mls": mls_property.get("days_on_mls"),
+                        "new_construction": mls_property.get("new_construction"),
+                        "monthly_fees": mls_property.get("monthly_fees"),
+                        "one_time_fees": mls_property.get("one_time_fees"),
+                        "tax_history": mls_property.get("tax_history"),
+                        "nearby_schools": mls_property.get("nearby_schools"),
+                        
+                        # Content tracking
+                        "content_hash": mls_property.get("content_hash"),
+                        "last_content_updated": mls_property.get("last_content_updated"),
+                        
+                        # Metadata
+                        "scraped_at": mls_property.get("scraped_at"),
+                        "job_id": mls_property.get("job_id"),
+                        "source": mls_property.get("source"),
+                        
+                        # Update timestamp
+                        "updatedAt": datetime.utcnow()
+                    }
+                    
+                    # Update the CRM property
+                    result = await crm_properties_collection.update_one(
+                        {"_id": crm_property_id},
+                        {"$set": update_data}
+                    )
+                    
+                    if result.modified_count > 0:
+                        updated_count += 1
+                        print(f"Updated CRM property {crm_property_id} with MLS data from {mls_property_id}")
+                    
+                except Exception as e:
+                    print(f"Error updating CRM property {crm_property_id}: {e}")
+                    continue
+            
+            print(f"Updated {updated_count} CRM properties from MLS property {mls_property_id}")
+            return updated_count
+            
+        except Exception as e:
+            print(f"Error updating CRM properties from MLS: {e}")
             return 0
 
 # Global database instance
