@@ -543,3 +543,6 @@ class ImmediateScrapeResponse(BaseModel):
     properties_scraped: int = 0
     properties_saved: int = 0
     properties: List[Property] = []
+
+class PropertyIdsRequest(BaseModel):
+    property_ids: List[str]

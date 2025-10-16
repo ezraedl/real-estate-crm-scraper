@@ -18,6 +18,7 @@ from models import (
     JobStatusResponse,
     ImmediateScrapeResponse,
     ScrapingJob,
+    PropertyIdsRequest,
     JobStatus,
     JobPriority,
     Property,
@@ -557,6 +558,58 @@ async def health_check():
             "version": "1.0.0",
             "warning": "Service running with limited functionality"
         }
+
+# Get properties by ID endpoint
+@app.post("/properties/by-ids")
+async def get_properties_by_ids(request: PropertyIdsRequest):
+    """
+    Get MLS properties by their property IDs.
+    This is useful for fetching specific properties that were previously scraped.
+    """
+    try:
+        property_ids = request.property_ids
+        
+        if not property_ids:
+            raise HTTPException(status_code=400, detail="At least one property ID is required")
+        
+        if len(property_ids) > 100:
+            raise HTTPException(status_code=400, detail="Maximum 100 property IDs allowed per request")
+        
+        properties = []
+        not_found_ids = []
+        
+        for property_id in property_ids:
+            try:
+                logger.info(f"Looking for property_id: '{property_id}' (type: {type(property_id)})")
+                property_data = await db.get_property(property_id)
+                if property_data:
+                    # Convert to dict for JSON serialization
+                    property_dict = property_data.dict()
+                    # Convert ObjectId to string, handle None case
+                    if property_dict.get("_id") is not None:
+                        property_dict["_id"] = str(property_dict["_id"])
+                    properties.append(property_dict)
+                    logger.info(f"Found property: {property_data.property_id}")
+                else:
+                    logger.info(f"Property not found: {property_id}")
+                    not_found_ids.append(property_id)
+            except Exception as e:
+                logger.error(f"Error fetching property {property_id}: {e}")
+                not_found_ids.append(property_id)
+        
+        return {
+            "status": "completed",
+            "properties": properties,
+            "not_found_ids": not_found_ids,
+            "found_count": len(properties),
+            "not_found_count": len(not_found_ids)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_properties_by_ids: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Immediate scraping endpoint (high priority)
 @app.post("/scrape/immediate", response_model=JobResponse)
