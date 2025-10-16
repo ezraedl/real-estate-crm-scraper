@@ -303,6 +303,54 @@ class Property(BaseModel):
     
     def generate_content_hash(self) -> str:
         """Generate hash of all content fields except days_on_mls and metadata"""
+        
+        def normalize_float(value):
+            """Normalize float values to avoid precision issues"""
+            if value is None:
+                return None
+            try:
+                # Round to 6 decimal places to avoid precision issues
+                return round(float(value), 6)
+            except (ValueError, TypeError):
+                return value
+        
+        def normalize_date(value):
+            """Normalize date values to avoid timezone/precision issues"""
+            if value is None:
+                return None
+            try:
+                # Convert to date only (no time) to avoid timezone issues
+                if hasattr(value, 'date'):
+                    return value.date().isoformat()
+                return str(value)
+            except (ValueError, TypeError):
+                return str(value) if value else None
+        
+        def normalize_list(value):
+            """Normalize list values to avoid ordering issues"""
+            if value is None:
+                return None
+            if isinstance(value, list):
+                # Sort lists to ensure consistent ordering
+                try:
+                    return sorted(value)
+                except TypeError:
+                    # If sorting fails (mixed types), convert to strings and sort
+                    return sorted([str(item) for item in value])
+            return value
+        
+        def normalize_dict_list(value):
+            """Normalize list of dicts to avoid ordering issues"""
+            if value is None:
+                return None
+            if isinstance(value, list):
+                # Sort by converting to string representation
+                try:
+                    return sorted(value, key=lambda x: str(sorted(x.items()) if isinstance(x, dict) else x))
+                except TypeError:
+                    return value
+            return value
+        
         content_data = {
             # Basic property info
             "mls_id": self.mls_id,
@@ -337,32 +385,32 @@ class Property(BaseModel):
                 "property_type": self.description.property_type if self.description else None,
             } if self.description else {},
             
-            # Financial data
+            # Financial data - normalize floats
             "financial": {
-                "list_price": self.financial.list_price if self.financial else None,
-                "list_price_min": self.financial.list_price_min if self.financial else None,
-                "list_price_max": self.financial.list_price_max if self.financial else None,
-                "sold_price": self.financial.sold_price if self.financial else None,
-                "last_sold_price": self.financial.last_sold_price if self.financial else None,
-                "price_per_sqft": self.financial.price_per_sqft if self.financial else None,
-                "estimated_value": self.financial.estimated_value if self.financial else None,
-                "tax_assessed_value": self.financial.tax_assessed_value if self.financial else None,
-                "hoa_fee": self.financial.hoa_fee if self.financial else None,
-                "tax": self.financial.tax if self.financial else None,
+                "list_price": normalize_float(self.financial.list_price if self.financial else None),
+                "list_price_min": normalize_float(self.financial.list_price_min if self.financial else None),
+                "list_price_max": normalize_float(self.financial.list_price_max if self.financial else None),
+                "sold_price": normalize_float(self.financial.sold_price if self.financial else None),
+                "last_sold_price": normalize_float(self.financial.last_sold_price if self.financial else None),
+                "price_per_sqft": normalize_float(self.financial.price_per_sqft if self.financial else None),
+                "estimated_value": normalize_float(self.financial.estimated_value if self.financial else None),
+                "tax_assessed_value": normalize_float(self.financial.tax_assessed_value if self.financial else None),
+                "hoa_fee": normalize_float(self.financial.hoa_fee if self.financial else None),
+                "tax": normalize_float(self.financial.tax if self.financial else None),
             } if self.financial else {},
             
-            # Dates data
+            # Dates data - normalize dates
             "dates": {
-                "list_date": self.dates.list_date.isoformat() if self.dates and self.dates.list_date else None,
-                "pending_date": self.dates.pending_date.isoformat() if self.dates and self.dates.pending_date else None,
-                "last_sold_date": self.dates.last_sold_date.isoformat() if self.dates and self.dates.last_sold_date else None,
+                "list_date": normalize_date(self.dates.list_date if self.dates else None),
+                "pending_date": normalize_date(self.dates.pending_date if self.dates else None),
+                "last_sold_date": normalize_date(self.dates.last_sold_date if self.dates else None),
             } if self.dates else {},
             
-            # Location data
+            # Location data - normalize floats and lists
             "location": {
-                "latitude": self.location.latitude if self.location else None,
-                "longitude": self.location.longitude if self.location else None,
-                "neighborhoods": self.location.neighborhoods if self.location else None,
+                "latitude": normalize_float(self.location.latitude if self.location else None),
+                "longitude": normalize_float(self.location.longitude if self.location else None),
+                "neighborhoods": normalize_list(self.location.neighborhoods if self.location else None),
                 "county": self.location.county if self.location else None,
                 "fips_code": self.location.fips_code if self.location else None,
                 "parcel_number": self.location.parcel_number if self.location else None,
@@ -373,16 +421,16 @@ class Property(BaseModel):
             "listing_id": self.listing_id,
             "permalink": self.permalink,
             
-            # Property images
+            # Property images - normalize lists
             "primary_photo": self.primary_photo,
-            "alt_photos": self.alt_photos,
+            "alt_photos": normalize_list(self.alt_photos),
             
-            # Contact information
+            # Contact information - normalize lists
             "agent": {
                 "agent_id": self.agent.agent_id if self.agent else None,
                 "agent_name": self.agent.agent_name if self.agent else None,
                 "agent_email": self.agent.agent_email if self.agent else None,
-                "agent_phones": self.agent.agent_phones if self.agent else None,
+                "agent_phones": normalize_dict_list(self.agent.agent_phones if self.agent else None),
                 "agent_mls_set": self.agent.agent_mls_set if self.agent else None,
                 "agent_nrds_id": self.agent.agent_nrds_id if self.agent else None,
             } if self.agent else {},
@@ -402,15 +450,15 @@ class Property(BaseModel):
                 "office_mls_set": self.office.office_mls_set if self.office else None,
                 "office_name": self.office.office_name if self.office else None,
                 "office_email": self.office.office_email if self.office else None,
-                "office_phones": self.office.office_phones if self.office else None,
+                "office_phones": normalize_dict_list(self.office.office_phones if self.office else None),
             } if self.office else {},
             
-            # Additional data (excluding days_on_mls)
+            # Additional data - normalize lists
             "new_construction": self.new_construction,
-            "monthly_fees": self.monthly_fees,
-            "one_time_fees": self.one_time_fees,
-            "tax_history": self.tax_history,
-            "nearby_schools": self.nearby_schools,
+            "monthly_fees": normalize_dict_list(self.monthly_fees),
+            "one_time_fees": normalize_dict_list(self.one_time_fees),
+            "tax_history": normalize_dict_list(self.tax_history),
+            "nearby_schools": normalize_dict_list(self.nearby_schools),
             
             # Metadata
             "is_comp": self.is_comp,
@@ -495,3 +543,6 @@ class ImmediateScrapeResponse(BaseModel):
     properties_scraped: int = 0
     properties_saved: int = 0
     properties: List[Property] = []
+
+class PropertyIdsRequest(BaseModel):
+    property_ids: List[str]

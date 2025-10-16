@@ -20,7 +20,7 @@ class Database:
         try:
             # Parse the MongoDB URI to extract database name
             parsed_uri = urlparse(settings.MONGODB_URI)
-            database_name = parsed_uri.path.lstrip('/').split('?')[0] if parsed_uri.path else 'rei-crm'
+            database_name = parsed_uri.path.lstrip('/').split('?')[0] if parsed_uri.path else 'mls_scraper'
             
             self.client = motor.motor_asyncio.AsyncIOMotorClient(settings.MONGODB_URI)
             self.db = self.client[database_name]
@@ -437,11 +437,27 @@ class Database:
     async def get_property(self, property_id: str) -> Optional[Property]:
         """Get property by property_id"""
         try:
+            print(f"[DEBUG] Searching for property_id: '{property_id}' (type: {type(property_id)})")
+            
+            # Try searching as string first
             property_data = await self.properties_collection.find_one({"property_id": property_id})
+            
+            # If not found, try searching as number
+            if not property_data:
+                try:
+                    property_id_num = int(property_id)
+                    print(f"[DEBUG] Trying as number: {property_id_num}")
+                    property_data = await self.properties_collection.find_one({"property_id": property_id_num})
+                except ValueError:
+                    print(f"[DEBUG] Cannot convert '{property_id}' to number")
+            
             if property_data:
+                print(f"[DEBUG] Found property: {property_data.get('property_id')}")
                 property_data["_id"] = str(property_data["_id"])
                 return Property(**property_data)
-            return None
+            else:
+                print(f"[DEBUG] Property not found: {property_id}")
+                return None
         except Exception as e:
             print(f"Error getting property: {e}")
             return None
