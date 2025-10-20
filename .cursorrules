@@ -1,0 +1,1079 @@
+# Real Estate CRM Scraper - Cursor Rules
+
+## Technology Stack
+- **Language**: Python 3.8+
+- **Framework**: FastAPI
+- **Database**: MongoDB with Motor (async driver)
+- **Scraping**: HomeHarvest + BeautifulSoup
+- **Scheduling**: APScheduler with Cron
+- **HTTP Client**: httpx (async)
+- **Deployment**: Railway
+- **Proxy Support**: DataImpulse integration
+
+## File Structure
+```
+├── main.py              # FastAPI application entry point
+├── scraper.py           # Core scraping logic
+├── database.py          # Database operations and models
+├── scheduler.py         # Job scheduling and cron management
+├── models.py            # Pydantic models and schemas
+├── config.py            # Configuration management
+├── proxy_manager.py     # Proxy rotation and management
+├── tests/               # Test files
+└── docs/                # Documentation
+```
+
+## Naming Conventions
+
+### Files and Directories
+- Files: `snake_case.py` (e.g., `property_service.py`, `mls_scraper.py`)
+- Directories: `snake_case` (e.g., `property_management/`)
+- Test files: `test_*.py` or `*_test.py`
+
+### Code Elements
+- Classes: `PascalCase` (e.g., `PropertyService`, `MlsScraper`)
+- Functions: `snake_case` (e.g., `get_property_by_id`, `scrape_location`)
+- Variables: `snake_case` (e.g., `property_data`, `scraping_job`)
+- Constants: `UPPER_SNAKE_CASE` (e.g., `MAX_PROPERTIES_PER_PAGE`)
+- Enums: `PascalCase` (e.g., `JobStatus`, `ListingType`)
+
+## FastAPI Application Pattern
+
+### Main Application Structure
+```python
+# main.py
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from typing import List, Optional
+import asyncio
+import uuid
+from datetime import datetime
+import logging
+import os
+
+from models import (
+    ImmediateScrapeRequest, 
+    ScheduledScrapeRequest, 
+    JobResponse, 
+    JobStatusResponse,
+    ScrapingJob,
+    JobStatus,
+    JobPriority
+)
+from database import db
+from scraper import scraper
+from scheduler import scheduler
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(
+    title="MLS Scraping Server",
+    description="High-performance MLS data scraping server with MongoDB storage",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    try:
+        await db.connect()
+        logger.info("Database connected")
+        
+        await handle_stuck_jobs()
+        await create_active_properties_rescraping_job()
+        
+        asyncio.create_task(scraper.start())
+        logger.info("Scraper service started")
+        
+        asyncio.create_task(scheduler.start())
+        logger.info("Job scheduler started")
+        
+    except Exception as e:
+        logger.error(f"Error during startup: {e}")
+        logger.warning("Service starting with limited functionality")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    try:
+        await scraper.stop()
+        await db.disconnect()
+        logger.info("Services stopped")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "service": "mls-scraper",
+            "version": "1.0.0"
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "service": "mls-scraper",
+            "version": "1.0.0",
+            "warning": "Service running with limited functionality"
+        }
+```
+
+## API Endpoint Patterns
+
+### Immediate Scraping Endpoint
+```python
+@app.post("/scrape/immediate", response_model=JobResponse)
+async def immediate_scrape(request: ImmediateScrapeRequest):
+    """
+    Immediate high-priority scraping for urgent property data updates.
+    This endpoint bypasses the normal queue and processes immediately.
+    """
+    try:
+        # Validate request
+        if len(request.locations) > 10:
+            raise HTTPException(
+                status_code=400, 
+                detail="Maximum 10 locations allowed for immediate scraping"
+            )
+        
+        if request.limit > 1000:
+            raise HTTPException(
+                status_code=400, 
+                detail="Maximum 1000 properties allowed for immediate scraping"
+            )
+        
+        # Create immediate job
+        job_id = f"immediate_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
+        
+        job = ScrapingJob(
+            job_id=job_id,
+            priority=JobPriority.IMMEDIATE,
+            locations=request.locations,
+            listing_type=request.listing_type,
+            property_types=request.property_types,
+            radius=request.radius,
+            mls_only=request.mls_only,
+            foreclosure=request.foreclosure,
+            limit=request.limit,
+            request_delay=0.5  # Faster for immediate requests
+        )
+        
+        # Save job to database
+        await db.create_job(job)
+        
+        # Process immediately
+        asyncio.create_task(scraper.process_job(job))
+        
+        logger.info(f"Created immediate scraping job: {job_id}")
+        
+        return JobResponse(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            message="Immediate scraping job created and queued",
+            created_at=job.created_at
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating immediate scrape job: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create immediate scraping job")
+```
+
+### Error Handling Pattern
+```python
+from fastapi import HTTPException
+import logging
+
+logger = logging.getLogger(__name__)
+
+def handle_api_error(error: Exception, context: str = "") -> HTTPException:
+    """Standard error handling for API endpoints"""
+    logger.error(f"API Error {context}: {error}")
+    
+    if isinstance(error, HTTPException):
+        return error
+    
+    return HTTPException(
+        status_code=500,
+        detail=f"Internal server error: {str(error)}"
+    )
+
+# Usage in endpoints
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    try:
+        job = await db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        return JobStatusResponse(
+            job_id=job.job_id,
+            status=job.status,
+            progress=job.progress,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+            error_message=job.error_message
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise handle_api_error(e, f"getting job status for {job_id}")
+```
+
+## Pydantic Models
+
+### Core Models
+```python
+# models.py
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from enum import Enum
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class JobPriority(str, Enum):
+    IMMEDIATE = "immediate"
+    HIGH = "high"
+    NORMAL = "normal"
+    LOW = "low"
+
+class ListingType(str, Enum):
+    FOR_SALE = "for_sale"
+    FOR_RENT = "for_rent"
+    SOLD = "sold"
+    PENDING = "pending"
+
+class PropertyAddress(BaseModel):
+    street: Optional[str] = None
+    unit: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+    formatted_address: Optional[str] = None
+    full_street_line: Optional[str] = None
+
+class PropertyDescription(BaseModel):
+    style: Optional[str] = None
+    beds: Optional[int] = Field(None, ge=0)
+    full_baths: Optional[int] = Field(None, ge=0)
+    half_baths: Optional[int] = Field(None, ge=0)
+    sqft: Optional[int] = Field(None, ge=0)
+    year_built: Optional[int] = Field(None, ge=1800, le=2030)
+    stories: Optional[int] = Field(None, ge=1)
+    garage: Optional[str] = None
+    lot_sqft: Optional[int] = Field(None, ge=0)
+    text: Optional[str] = None
+    property_type: Optional[str] = None
+
+class PropertyFinancial(BaseModel):
+    list_price: Optional[float] = Field(None, ge=0)
+    list_price_min: Optional[float] = Field(None, ge=0)
+    list_price_max: Optional[float] = Field(None, ge=0)
+    sold_price: Optional[float] = Field(None, ge=0)
+    last_sold_price: Optional[float] = Field(None, ge=0)
+    price_per_sqft: Optional[float] = Field(None, ge=0)
+    estimated_value: Optional[float] = Field(None, ge=0)
+    tax_assessed_value: Optional[float] = Field(None, ge=0)
+    hoa_fee: Optional[float] = Field(None, ge=0)
+    tax: Optional[float] = Field(None, ge=0)
+
+class Property(BaseModel):
+    property_id: str = Field(..., min_length=1)
+    mls_id: Optional[str] = None
+    mls: Optional[str] = None
+    status: Optional[str] = None
+    mls_status: Optional[str] = None
+    address: PropertyAddress
+    description: PropertyDescription
+    financial: PropertyFinancial
+    dates: Dict[str, Any] = {}
+    location: Dict[str, Any] = {}
+    agent: Optional[Dict[str, Any]] = None
+    broker: Optional[Dict[str, Any]] = None
+    property_url: Optional[str] = None
+    listing_id: Optional[str] = None
+    permalink: Optional[str] = None
+    primary_photo: Optional[str] = None
+    alt_photos: Optional[List[str]] = []
+    days_on_mls: Optional[int] = Field(None, ge=0)
+    new_construction: Optional[bool] = False
+    scraped_at: datetime = Field(default_factory=datetime.utcnow)
+    job_id: Optional[str] = None
+    source: str = Field(default="homeharvest")
+    is_comp: bool = Field(default=False)
+    
+    @validator('property_id')
+    def validate_property_id(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError('Property ID cannot be empty')
+        return v.strip()
+
+class ImmediateScrapeRequest(BaseModel):
+    locations: List[str] = Field(..., min_items=1, max_items=10)
+    listing_type: Optional[ListingType] = None
+    property_types: Optional[List[str]] = None
+    radius: Optional[float] = Field(None, ge=0.1, le=50)
+    mls_only: Optional[bool] = False
+    foreclosure: Optional[bool] = False
+    limit: Optional[int] = Field(1000, ge=1, le=1000)
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    message: str
+    created_at: datetime
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    progress: Dict[str, Any]
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+```
+
+## Database Operations
+
+### Database Service Pattern
+```python
+# database.py
+import motor.motor_asyncio
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+class DatabaseService:
+    def __init__(self):
+        self.client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
+        self.db: Optional[motor.motor_asyncio.AsyncIOMotorDatabase] = None
+        self.properties_collection = None
+        self.jobs_collection = None
+        self.scheduled_jobs_collection = None
+
+    async def connect(self):
+        """Connect to MongoDB"""
+        try:
+            mongodb_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/mlscraper")
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(mongodb_uri)
+            self.db = self.client.mlscraper
+            
+            # Initialize collections
+            self.properties_collection = self.db.properties
+            self.jobs_collection = self.db.jobs
+            self.scheduled_jobs_collection = self.db.scheduled_jobs
+            
+            # Test connection
+            await self.client.admin.command('ping')
+            logger.info("Connected to MongoDB")
+            
+        except Exception as e:
+            logger.error(f"MongoDB connection error: {e}")
+            raise
+
+    async def disconnect(self):
+        """Disconnect from MongoDB"""
+        if self.client:
+            self.client.close()
+            logger.info("Disconnected from MongoDB")
+
+    async def create_job(self, job: ScrapingJob) -> bool:
+        """Create a new scraping job"""
+        try:
+            job_dict = job.dict(by_alias=True, exclude={"id"})
+            await self.jobs_collection.insert_one(job_dict)
+            logger.info(f"Created job: {job.job_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating job {job.job_id}: {e}")
+            return False
+
+    async def get_job(self, job_id: str) -> Optional[ScrapingJob]:
+        """Get a job by ID"""
+        try:
+            job_data = await self.jobs_collection.find_one({"job_id": job_id})
+            if job_data:
+                job_data["_id"] = str(job_data["_id"])
+                return ScrapingJob(**job_data)
+            return None
+        except Exception as e:
+            logger.error(f"Error getting job {job_id}: {e}")
+            return None
+
+    async def update_job_status(
+        self, 
+        job_id: str, 
+        status: JobStatus, 
+        error_message: Optional[str] = None
+    ) -> bool:
+        """Update job status"""
+        try:
+            update_data = {
+                "status": status.value,
+                "updated_at": datetime.utcnow()
+            }
+            
+            if status == JobStatus.RUNNING:
+                update_data["started_at"] = datetime.utcnow()
+            elif status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                update_data["completed_at"] = datetime.utcnow()
+            
+            if error_message:
+                update_data["error_message"] = error_message
+            
+            result = await self.jobs_collection.update_one(
+                {"job_id": job_id},
+                {"$set": update_data}
+            )
+            
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating job status {job_id}: {e}")
+            return False
+
+    async def save_properties_batch(self, properties: List[Property]) -> Dict[str, int]:
+        """Save properties in batch with upsert"""
+        try:
+            inserted = 0
+            updated = 0
+            skipped = 0
+            
+            for property in properties:
+                try:
+                    # Check if property exists
+                    existing = await self.properties_collection.find_one({
+                        "property_id": property.property_id
+                    })
+                    
+                    if existing:
+                        # Update existing property
+                        await self.properties_collection.update_one(
+                            {"property_id": property.property_id},
+                            {"$set": property.dict(by_alias=True, exclude={"id"})}
+                        )
+                        updated += 1
+                    else:
+                        # Insert new property
+                        await self.properties_collection.insert_one(
+                            property.dict(by_alias=True, exclude={"id"})
+                        )
+                        inserted += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error saving property {property.property_id}: {e}")
+                    skipped += 1
+            
+            return {
+                "inserted": inserted,
+                "updated": updated,
+                "skipped": skipped
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in batch save: {e}")
+            return {"inserted": 0, "updated": 0, "skipped": len(properties)}
+
+# Global database instance
+db = DatabaseService()
+```
+
+## Scraping Service
+
+### Core Scraping Logic
+```python
+# scraper.py
+import asyncio
+import logging
+from typing import List, Dict, Any
+from datetime import datetime
+import pandas as pd
+from homeharvest import scrape_property
+
+logger = logging.getLogger(__name__)
+
+class ScrapingService:
+    def __init__(self):
+        self.is_running = False
+        self.current_jobs: Dict[str, ScrapingJob] = {}
+        self.max_concurrent_jobs = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
+
+    async def start(self):
+        """Start the scraping service"""
+        self.is_running = True
+        logger.info("Scraping service started")
+
+    async def stop(self):
+        """Stop the scraping service"""
+        self.is_running = False
+        logger.info("Scraping service stopped")
+
+    async def process_job(self, job: ScrapingJob):
+        """Process a scraping job"""
+        try:
+            self.current_jobs[job.job_id] = job
+            
+            # Update job status to running
+            await db.update_job_status(job.job_id, JobStatus.RUNNING)
+            
+            logger.info(f"Processing job: {job.job_id}")
+            
+            total_properties_scraped = 0
+            total_properties_saved = 0
+            
+            for location in job.locations:
+                try:
+                    logger.info(f"Scraping location: {location}")
+                    
+                    # Scrape properties for this location
+                    properties = await self.scrape_location(location, job)
+                    
+                    if properties:
+                        # Save properties to database
+                        save_results = await db.save_properties_batch(properties)
+                        
+                        total_properties_scraped += len(properties)
+                        total_properties_saved += save_results["inserted"] + save_results["updated"]
+                        
+                        logger.info(
+                            f"Location {location}: {save_results['inserted']} inserted, "
+                            f"{save_results['updated']} updated, {save_results['skipped']} skipped"
+                        )
+                    
+                    # Update progress
+                    await self.update_job_progress(
+                        job.job_id, 
+                        len(job.locations), 
+                        job.locations.index(location) + 1,
+                        total_properties_scraped,
+                        total_properties_saved
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error processing location {location}: {e}")
+                    continue
+            
+            # Mark job as completed
+            await db.update_job_status(job.job_id, JobStatus.COMPLETED)
+            logger.info(f"Job completed: {job.job_id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing job {job.job_id}: {e}")
+            await db.update_job_status(job.job_id, JobStatus.FAILED, str(e))
+        finally:
+            if job.job_id in self.current_jobs:
+                del self.current_jobs[job.job_id]
+
+    async def scrape_location(self, location: str, job: ScrapingJob) -> List[Property]:
+        """Scrape properties for a specific location"""
+        try:
+            properties = []
+            
+            # Determine listing types to scrape
+            listing_types = [job.listing_type] if job.listing_type else ["for_sale", "sold", "for_rent", "pending"]
+            
+            for listing_type in listing_types:
+                try:
+                    logger.info(f"Scraping {listing_type} properties for {location}")
+                    
+                    # Prepare scraping parameters
+                    scrape_params = {
+                        "location": location,
+                        "listing_type": listing_type,
+                        "mls_only": job.mls_only,
+                        "limit": job.limit or 200
+                    }
+                    
+                    # Add additional parameters
+                    if job.property_types:
+                        scrape_params["property_types"] = job.property_types
+                    if job.radius:
+                        scrape_params["radius"] = job.radius
+                    if job.past_days:
+                        scrape_params["past_days"] = job.past_days
+                    
+                    # Scrape properties
+                    properties_df = scrape_property(**scrape_params)
+                    
+                    if not properties_df.empty:
+                        logger.info(f"Found {len(properties_df)} {listing_type} properties")
+                        
+                        # Convert DataFrame to Property models
+                        for index, row in properties_df.iterrows():
+                            try:
+                                property_obj = self.convert_to_property_model(row, job.job_id, listing_type)
+                                properties.append(property_obj)
+                            except Exception as e:
+                                logger.error(f"Error converting property: {e}")
+                                continue
+                    else:
+                        logger.info(f"No {listing_type} properties found")
+                        
+                except Exception as e:
+                    logger.error(f"Error scraping {listing_type} properties: {e}")
+                    continue
+            
+            return properties
+            
+        except Exception as e:
+            logger.error(f"Error scraping location {location}: {e}")
+            return []
+
+    def convert_to_property_model(self, row: pd.Series, job_id: str, listing_type: str) -> Property:
+        """Convert pandas row to Property model"""
+        try:
+            # Extract address information
+            address = PropertyAddress(
+                street=row.get('street'),
+                unit=row.get('unit'),
+                city=row.get('city'),
+                state=row.get('state'),
+                zip_code=row.get('zip_code'),
+                formatted_address=row.get('formatted_address'),
+                full_street_line=row.get('full_street_line')
+            )
+            
+            # Extract description information
+            description = PropertyDescription(
+                style=row.get('style'),
+                beds=row.get('beds'),
+                full_baths=row.get('full_baths'),
+                half_baths=row.get('half_baths'),
+                sqft=row.get('sqft'),
+                year_built=row.get('year_built'),
+                stories=row.get('stories'),
+                garage=row.get('garage'),
+                lot_sqft=row.get('lot_sqft'),
+                text=row.get('text'),
+                property_type=row.get('property_type')
+            )
+            
+            # Extract financial information
+            financial = PropertyFinancial(
+                list_price=row.get('list_price'),
+                list_price_min=row.get('list_price_min'),
+                list_price_max=row.get('list_price_max'),
+                sold_price=row.get('sold_price'),
+                last_sold_price=row.get('last_sold_price'),
+                price_per_sqft=row.get('price_per_sqft'),
+                estimated_value=row.get('estimated_value'),
+                tax_assessed_value=row.get('tax_assessed_value'),
+                hoa_fee=row.get('hoa_fee'),
+                tax=row.get('tax')
+            )
+            
+            # Create Property model
+            property_obj = Property(
+                property_id=row.get('property_id', ''),
+                mls_id=row.get('mls_id'),
+                mls=row.get('mls'),
+                status=row.get('status'),
+                mls_status=row.get('mls_status'),
+                address=address,
+                description=description,
+                financial=financial,
+                dates=row.get('dates', {}),
+                location=row.get('location', {}),
+                agent=row.get('agent'),
+                broker=row.get('broker'),
+                property_url=row.get('property_url'),
+                listing_id=row.get('listing_id'),
+                permalink=row.get('permalink'),
+                primary_photo=row.get('primary_photo'),
+                alt_photos=row.get('alt_photos', []),
+                days_on_mls=row.get('days_on_mls'),
+                new_construction=row.get('new_construction', False),
+                scraped_at=datetime.utcnow(),
+                job_id=job_id,
+                source="homeharvest",
+                is_comp=(listing_type == "sold")
+            )
+            
+            return property_obj
+            
+        except Exception as e:
+            logger.error(f"Error converting row to Property model: {e}")
+            raise
+
+# Global scraper instance
+scraper = ScrapingService()
+```
+
+## Configuration Management
+
+### Configuration Service
+```python
+# config.py
+from pydantic import BaseSettings
+from typing import Optional
+import os
+
+class Settings(BaseSettings):
+    # Database
+    mongodb_uri: str = "mongodb://localhost:27017/mlscraper"
+    
+    # API Configuration
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    
+    # Scraping Configuration
+    max_concurrent_jobs: int = 3
+    request_delay: float = 1.0
+    max_retries: int = 3
+    
+    # Rate Limiting
+    rate_limit_per_minute: int = 60
+    
+    # DataImpulse Configuration (Optional)
+    dataimpulse_login: Optional[str] = None
+    dataimpulse_password: Optional[str] = None
+    dataimpulse_endpoint: Optional[str] = None
+    
+    # Logging
+    log_level: str = "INFO"
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+# Global settings instance
+settings = Settings()
+```
+
+## Logging Configuration
+
+### Structured Logging
+```python
+# logging_config.py
+import logging
+import sys
+from datetime import datetime
+
+def setup_logging(log_level: str = "INFO"):
+    """Setup structured logging"""
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Setup console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    
+    # Setup root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level.upper()))
+    root_logger.addHandler(console_handler)
+    
+    # Setup specific loggers
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("fastapi").setLevel(logging.INFO)
+    
+    return root_logger
+
+# Initialize logging
+logger = setup_logging()
+```
+
+## Testing Patterns
+
+### Test Structure
+```python
+# tests/test_scraper.py
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, patch
+from scraper import ScrapingService
+from models import ScrapingJob, JobStatus, JobPriority
+
+@pytest.fixture
+def scraper_service():
+    return ScrapingService()
+
+@pytest.fixture
+def sample_job():
+    return ScrapingJob(
+        job_id="test_job_123",
+        priority=JobPriority.NORMAL,
+        locations=["123 Main St, Indianapolis, IN"],
+        listing_type="for_sale",
+        limit=10
+    )
+
+@pytest.mark.asyncio
+async def test_process_job(scraper_service, sample_job):
+    """Test job processing"""
+    with patch('scraper.db') as mock_db:
+        mock_db.update_job_status = AsyncMock(return_value=True)
+        mock_db.save_properties_batch = AsyncMock(return_value={
+            "inserted": 5,
+            "updated": 0,
+            "skipped": 0
+        })
+        
+        with patch('scraper.scrape_property') as mock_scrape:
+            mock_scrape.return_value = pd.DataFrame({
+                'property_id': ['prop1', 'prop2'],
+                'address': ['123 Main St', '456 Oak Ave'],
+                'price': [200000, 250000]
+            })
+            
+            await scraper_service.process_job(sample_job)
+            
+            # Verify job status was updated
+            assert mock_db.update_job_status.call_count >= 2  # Running and completed
+            
+            # Verify properties were saved
+            mock_db.save_properties_batch.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_scrape_location(scraper_service, sample_job):
+    """Test location scraping"""
+    with patch('scraper.scrape_property') as mock_scrape:
+        mock_scrape.return_value = pd.DataFrame({
+            'property_id': ['prop1'],
+            'address': ['123 Main St'],
+            'price': [200000]
+        })
+        
+        properties = await scraper_service.scrape_location(
+            "123 Main St, Indianapolis, IN", 
+            sample_job
+        )
+        
+        assert len(properties) == 1
+        assert properties[0].property_id == "prop1"
+        assert properties[0].financial.list_price == 200000
+```
+
+## Error Handling
+
+### Custom Exceptions
+```python
+# exceptions.py
+class ScrapingError(Exception):
+    """Base exception for scraping errors"""
+    pass
+
+class DatabaseError(Exception):
+    """Database operation error"""
+    pass
+
+class ValidationError(Exception):
+    """Data validation error"""
+    pass
+
+class RateLimitError(Exception):
+    """Rate limit exceeded error"""
+    pass
+```
+
+### Error Handling Decorator
+```python
+# error_handlers.py
+import functools
+import logging
+from typing import Callable, Any
+
+logger = logging.getLogger(__name__)
+
+def handle_errors(func: Callable) -> Callable:
+    """Decorator for error handling"""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {e}")
+            raise
+    return wrapper
+```
+
+## Performance Optimization
+
+### Async Operations
+- Use `asyncio` for concurrent operations
+- Implement connection pooling for database
+- Use `httpx` for async HTTP requests
+- Batch database operations
+
+### Caching
+```python
+# cache.py
+from functools import lru_cache
+import asyncio
+from typing import Dict, Any
+
+class CacheService:
+    def __init__(self):
+        self._cache: Dict[str, Any] = {}
+        self._ttl: Dict[str, float] = {}
+    
+    async def get(self, key: str) -> Any:
+        """Get value from cache"""
+        if key in self._cache:
+            if key in self._ttl and self._ttl[key] > asyncio.get_event_loop().time():
+                return self._cache[key]
+            else:
+                del self._cache[key]
+                del self._ttl[key]
+        return None
+    
+    async def set(self, key: str, value: Any, ttl: int = 300):
+        """Set value in cache with TTL"""
+        self._cache[key] = value
+        self._ttl[key] = asyncio.get_event_loop().time() + ttl
+```
+
+## Deployment
+
+### Railway Configuration
+```toml
+# railway.toml
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+```
+
+### Docker Support
+```dockerfile
+# Dockerfile
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Expose port
+EXPOSE 8000
+
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## Monitoring and Health Checks
+
+### Health Check Implementation
+```python
+# health.py
+from fastapi import APIRouter, Depends
+from datetime import datetime
+import asyncio
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check():
+    """Comprehensive health check"""
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "mls-scraper",
+        "version": "1.0.0",
+        "checks": {}
+    }
+    
+    # Database health check
+    try:
+        await db.client.admin.command('ping')
+        health_status["checks"]["database"] = "healthy"
+    except Exception as e:
+        health_status["checks"]["database"] = f"unhealthy: {str(e)}"
+        health_status["status"] = "unhealthy"
+    
+    # Scraper service health check
+    health_status["checks"]["scraper"] = "healthy" if scraper.is_running else "unhealthy"
+    
+    # Active jobs count
+    health_status["checks"]["active_jobs"] = len(scraper.current_jobs)
+    
+    return health_status
+```
+
+## Code Quality
+
+### Pre-commit Hooks
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/psf/black
+    rev: 22.3.0
+    hooks:
+      - id: black
+        language_version: python3
+  
+  - repo: https://github.com/pycqa/isort
+    rev: 5.10.1
+    hooks:
+      - id: isort
+  
+  - repo: https://github.com/pycqa/flake8
+    rev: 4.0.1
+    hooks:
+      - id: flake8
+```
+
+### Type Checking
+```python
+# pyproject.toml
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+```
