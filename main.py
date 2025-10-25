@@ -2031,6 +2031,85 @@ def convert_markdown_to_html(markdown_content: str) -> str:
     
     return full_html
 
+# ============================================================================
+# ENRICHMENT API ENDPOINTS
+# ============================================================================
+
+@app.get("/properties/{property_id}/history")
+async def get_property_history(property_id: str, limit: int = 50):
+    """Get property history (price and status changes)"""
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        history = await db.enrichment_pipeline.get_property_history(property_id, limit)
+        return {
+            "property_id": property_id,
+            "history": history,
+            "count": len(history)
+        }
+    except Exception as e:
+        logger.error(f"Error getting property history for {property_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting property history: {str(e)}")
+
+@app.get("/properties/{property_id}/changes")
+async def get_property_change_logs(property_id: str, limit: int = 100):
+    """Get detailed change logs for a property"""
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        change_logs = await db.enrichment_pipeline.get_property_change_logs(property_id, limit)
+        return {
+            "property_id": property_id,
+            "change_logs": change_logs,
+            "count": len(change_logs)
+        }
+    except Exception as e:
+        logger.error(f"Error getting change logs for {property_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting change logs: {str(e)}")
+
+@app.get("/properties/{property_id}/enrichment")
+async def get_property_enrichment(property_id: str):
+    """Get enrichment data for a property"""
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        enrichment_data = await db.enrichment_pipeline.get_property_enrichment(property_id)
+        
+        if enrichment_data is None:
+            raise HTTPException(status_code=404, detail="Enrichment data not found for this property")
+        
+        return {
+            "property_id": property_id,
+            "enrichment": enrichment_data
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting enrichment for {property_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting enrichment data: {str(e)}")
+
+@app.get("/properties/motivated-sellers")
+async def get_motivated_sellers(min_score: int = 40, limit: int = 100):
+    """Get properties with motivated seller scores above threshold"""
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        motivated_sellers = await db.enrichment_pipeline.get_motivated_sellers(min_score, limit)
+        
+        return {
+            "motivated_sellers": motivated_sellers,
+            "count": len(motivated_sellers),
+            "min_score": min_score,
+            "limit": limit
+        }
+    except Exception as e:
+        logger.error(f"Error getting motivated sellers: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting motivated sellers: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     # Use Railway's PORT environment variable if available, otherwise use settings
