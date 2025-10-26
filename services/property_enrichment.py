@@ -217,11 +217,6 @@ class PropertyEnrichmentPipeline:
                         "is_motivated_seller": enrichment_data['quick_access_flags']['is_motivated_seller'],
                         "has_price_reduction": enrichment_data['quick_access_flags']['has_price_reduction'],
                         "has_distress_signals": enrichment_data['quick_access_flags']['has_distress_signals'],
-                        "enrichment.is_auction": enrichment_data['special_sale_types']['is_auction'],
-                        "enrichment.is_reo": enrichment_data['special_sale_types']['is_reo'],
-                        "enrichment.is_probate": enrichment_data['special_sale_types']['is_probate'],
-                        "enrichment.is_short_sale": enrichment_data['special_sale_types']['is_short_sale'],
-                        "enrichment.is_as_is": enrichment_data['special_sale_types']['is_as_is'],
                         "last_enriched_at": datetime.utcnow()
                     }
                 }

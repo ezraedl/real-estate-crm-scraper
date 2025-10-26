@@ -2110,6 +2110,37 @@ async def get_motivated_sellers(min_score: int = 40, limit: int = 100):
         logger.error(f"Error getting motivated sellers: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting motivated sellers: {str(e)}")
 
+@app.post("/properties/{property_id}/enrich")
+async def enrich_property(property_id: str):
+    """Manually trigger enrichment for a property"""
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        # Get the property from database
+        property_doc = await db.properties_collection.find_one({"property_id": property_id})
+        if not property_doc:
+            raise HTTPException(status_code=404, detail="Property not found")
+        
+        # Trigger enrichment
+        enrichment_data = await db.enrichment_pipeline.enrich_property(
+            property_id=property_id,
+            property_dict=property_doc,
+            existing_property=None,  # Could check for existing enrichment
+            job_id=None
+        )
+        
+        return {
+            "property_id": property_id,
+            "enrichment": enrichment_data,
+            "message": "Enrichment completed successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error enriching property {property_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error enriching property: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     # Use Railway's PORT environment variable if available, otherwise use settings

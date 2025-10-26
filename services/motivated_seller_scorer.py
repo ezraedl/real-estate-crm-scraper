@@ -8,54 +8,100 @@ like price reductions, days on market, keywords, and sale type indicators.
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 import logging
+import os
+import yaml
 
 logger = logging.getLogger(__name__)
 
 class MotivatedSellerScorer:
     """Calculates motivated seller scores based on multiple signals"""
     
-    def __init__(self):
+    def __init__(self, config_path: Optional[str] = None):
+        # Load configuration from YAML file or use defaults
+        self.config = self._load_config(config_path)
+        
         # Signal weights (total should be ~100)
-        self.signal_weights = {
-            'price_reductions': 30,      # Price drops are strong signals
-            'days_on_market': 25,        # Long time on market
-            'distress_keywords': 20,     # Keywords like "as-is", "must sell"
-            'special_sale_type': 15,     # Auction, REO, probate, etc.
-            'recent_activity': 10        # Recent changes/updates
-        }
+        self.signal_weights = self.config.get('signal_weights', {
+            'price_reductions': 40,
+            'days_on_market': 30,
+            'distress_keywords': 15,
+            'special_sale_type': 10,
+            'recent_activity': 5
+        })
         
         # Price reduction scoring thresholds
-        self.price_reduction_thresholds = {
-            'major': {'percent': 10, 'score': 30},      # 10%+ reduction
-            'significant': {'percent': 5, 'score': 20}, # 5-10% reduction
-            'moderate': {'percent': 2, 'score': 10},    # 2-5% reduction
-            'minor': {'percent': 0, 'score': 5}         # Any reduction
-        }
+        self.price_reduction_thresholds = self.config.get('price_reduction_thresholds', {
+            'major': {'percent': 10, 'score': 30},
+            'significant': {'percent': 5, 'score': 20},
+            'moderate': {'percent': 2, 'score': 10},
+            'minor': {'percent': 0, 'score': 5}
+        })
         
         # Days on market scoring thresholds
-        self.dom_thresholds = {
-            'very_long': {'days': 180, 'score': 25},    # 6+ months
-            'long': {'days': 90, 'score': 20},          # 3-6 months
-            'moderate': {'days': 60, 'score': 15},      # 2-3 months
-            'short': {'days': 30, 'score': 10},         # 1-2 months
-            'very_short': {'days': 0, 'score': 0}       # < 1 month
-        }
+        self.dom_thresholds = self.config.get('days_on_market_thresholds', {
+            'very_long': {'days': 270, 'score': 30},
+            'long': {'days': 180, 'score': 25},
+            'moderate': {'days': 120, 'score': 18},
+            'short': {'days': 90, 'score': 12},
+            'minimal': {'days': 60, 'score': 6},
+            'very_short': {'days': 0, 'score': 0}
+        })
         
         # Distress keyword scoring
+        distress_config = self.config.get('distress_keywords', {})
         self.distress_keyword_scores = {
-            'high': ['must sell', 'quick sale', 'urgent', 'motivated seller', 'as-is', 'cash only'],
-            'medium': ['price reduced', 'bring offers', 'handyman', 'fixer upper'],
-            'low': ['needs work', 'handy man', 'diy']
+            'high': distress_config.get('high', {}).get('keywords', ['must sell', 'quick sale', 'urgent', 'motivated seller', 'as-is', 'cash only']),
+            'medium': distress_config.get('medium', {}).get('keywords', ['price reduced', 'bring offers', 'handyman', 'fixer upper']),
+            'low': distress_config.get('low', {}).get('keywords', ['needs work', 'handy man', 'diy']),
+            'negative': distress_config.get('negative', {}).get('keywords', [])  # Anti-motivation keywords
+        }
+        
+        # Distress keyword scores per level
+        self.distress_score_per_keyword = {
+            'high': distress_config.get('high', {}).get('score_per_keyword', 8),
+            'medium': distress_config.get('medium', {}).get('score_per_keyword', 5),
+            'low': distress_config.get('low', {}).get('score_per_keyword', 2),
+            'negative': distress_config.get('negative', {}).get('score_per_keyword', -3)  # Subtracts points
         }
         
         # Special sale type scoring
-        self.special_sale_scores = {
+        self.special_sale_scores = self.config.get('special_sale_types', {
             'auction': 15,
             'reo': 15,
             'probate': 12,
             'short_sale': 10,
             'as_is': 8
-        }
+        })
+        
+        # Recent activity thresholds
+        self.recent_activity_thresholds = self.config.get('recent_activity_thresholds', {
+            'very_recent': {'days': 3, 'score': 2},
+            'recent': {'days': 7, 'score': 1}
+        })
+        self.max_activity_score = self.config.get('recent_activity_thresholds', {}).get('max_score', 5)
+    
+    def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
+        """Load configuration from YAML file or return defaults"""
+        if config_path is None:
+            # Default config path
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                'config',
+                'enrichment_scoring.yaml'
+            )
+        
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+                    logger.info(f"Loaded scoring configuration from {config_path}")
+                    return config
+            else:
+                logger.warning(f"Config file not found at {config_path}, using defaults")
+                return {}
+        except Exception as e:
+            logger.error(f"Error loading config from {config_path}: {e}")
+            return {}
     
     def calculate_motivated_score(self, property_data: Dict[str, Any], analysis_data: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -79,16 +125,33 @@ class MotivatedSellerScorer:
             }
             
             # Calculate weighted total score
-            total_score = 0
-            total_weight = 0
+            # Each component score is already out of its max_possible points
+            # We weight each component based on its importance
+            total_weighted_score = 0
+            total_max_possible_score = 0
             
             for signal, weight in self.signal_weights.items():
-                component_score = score_components[signal]['score']
-                total_score += component_score * weight
-                total_weight += weight
+                component = score_components[signal]
+                component_score = component['score']
+                component_max = component.get('max_possible', 100)
+                
+                # Calculate weighted contribution
+                # Weight represents how much of the total 100 points this component can contribute
+                # So if weight is 40, this component can contribute up to 40 points to the final score
+                contribution = (component_score / component_max) * weight if component_max > 0 else 0
+                
+                total_weighted_score += contribution
+                total_max_possible_score += weight  # Each weight contributes to max
             
-            # Normalize to 0-100 scale
-            final_score = min(100, max(0, total_score / total_weight * 100))
+            # Final score is percentage of max possible (where max is sum of all weights)
+            # Since weights are set to sum to ~100, we can divide by 100 to get percentage
+            if total_max_possible_score > 0:
+                final_score = (total_weighted_score / total_max_possible_score) * 100
+            else:
+                final_score = 0
+            
+            # Cap at 100
+            final_score = min(100, max(0, final_score))
             
             # Calculate confidence based on data availability
             confidence = self._calculate_confidence(score_components, property_data, analysis_data)
@@ -189,30 +252,38 @@ class MotivatedSellerScorer:
         distress_signals = analysis_data.get('distress_signals', [])
         motivated_keywords = analysis_data.get('motivated_keywords', [])
         
-        # Score distress signals
+        # Score distress signals (positive motivators)
         for signal in distress_signals:
             signal_lower = signal.lower()
             if any(keyword in signal_lower for keyword in self.distress_keyword_scores['high']):
-                score += 8
+                score += self.distress_score_per_keyword['high']
                 details.append(f"High distress signal: '{signal}'")
             elif any(keyword in signal_lower for keyword in self.distress_keyword_scores['medium']):
-                score += 5
+                score += self.distress_score_per_keyword['medium']
                 details.append(f"Medium distress signal: '{signal}'")
             elif any(keyword in signal_lower for keyword in self.distress_keyword_scores['low']):
-                score += 2
+                score += self.distress_score_per_keyword['low']
                 details.append(f"Low distress signal: '{signal}'")
+            # Check for negative (anti-motivation) keywords
+            elif any(keyword in signal_lower for keyword in self.distress_keyword_scores['negative']):
+                score += self.distress_score_per_keyword['negative']  # This is negative, so it subtracts
+                details.append(f"Anti-motivation signal: '{signal}'")
         
         # Score motivated keywords
         for keyword in motivated_keywords:
             keyword_lower = keyword.lower()
             if any(motivated in keyword_lower for motivated in self.distress_keyword_scores['high']):
-                score += 6
+                score += self.distress_score_per_keyword['high'] - 2  # Slightly less for motivated keywords
                 details.append(f"Motivated keyword: '{keyword}'")
             elif any(motivated in keyword_lower for motivated in self.distress_keyword_scores['medium']):
-                score += 3
+                score += self.distress_score_per_keyword['medium'] - 2
                 details.append(f"Motivated keyword: '{keyword}'")
+            # Check for negative keywords
+            elif any(keyword in keyword_lower for keyword in self.distress_keyword_scores['negative']):
+                score += self.distress_score_per_keyword['negative']
+                details.append(f"Anti-motivation keyword: '{keyword}'")
         
-        # Cap at max possible
+        # Cap at max possible (don't allow negative from this component)
         score = min(score, 20)
         
         return {
@@ -256,11 +327,17 @@ class MotivatedSellerScorer:
             
             days_since_update = (datetime.utcnow() - scraped_at).days
             
-            if days_since_update <= 7:
-                score += 5
-                details.append(f"Recently updated: {days_since_update} days ago")
-            elif days_since_update <= 14:
-                score += 3
+            # Use configured thresholds
+            very_recent_days = self.recent_activity_thresholds.get('very_recent', {}).get('days', 3)
+            very_recent_score = self.recent_activity_thresholds.get('very_recent', {}).get('score', 2)
+            recent_days = self.recent_activity_thresholds.get('recent', {}).get('days', 7)
+            recent_score = self.recent_activity_thresholds.get('recent', {}).get('score', 1)
+            
+            if days_since_update <= very_recent_days:
+                score += very_recent_score
+                details.append(f"Very recently updated: {days_since_update} days ago")
+            elif days_since_update <= recent_days:
+                score += recent_score
                 details.append(f"Recently updated: {days_since_update} days ago")
         
         # Check for recent changes in history
@@ -270,9 +347,12 @@ class MotivatedSellerScorer:
                 score += 3
                 details.append("Recent activity detected")
         
+        # Cap at configured max score
+        score = min(score, self.max_activity_score)
+        
         return {
             'score': score,
-            'max_possible': 10,
+            'max_possible': self.max_activity_score,
             'details': details,
             'data_available': history_data is not None
         }
