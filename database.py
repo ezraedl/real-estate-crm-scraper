@@ -6,6 +6,7 @@ import asyncio
 from urllib.parse import urlparse
 from config import settings
 from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
+from services import PropertyEnrichmentPipeline
 
 class Database:
     def __init__(self):
@@ -14,6 +15,7 @@ class Database:
         self.jobs_collection = None
         self.properties_collection = None
         self.scheduled_jobs_collection = None
+        self.enrichment_pipeline = None
     
     async def connect(self):
         """Connect to MongoDB"""
@@ -32,6 +34,10 @@ class Database:
             
             # Create indexes
             await self._create_indexes()
+            
+            # Initialize enrichment pipeline
+            self.enrichment_pipeline = PropertyEnrichmentPipeline(self.db)
+            await self.enrichment_pipeline.initialize()
             
             print(f"Connected to MongoDB: {database_name}")
             return True
@@ -68,6 +74,17 @@ class Database:
             
             # Jobs collection - add index for scheduled_job_id reference
             await self.jobs_collection.create_index([("scheduled_job_id", ASCENDING)])
+            
+            # Enrichment indexes
+            await self.properties_collection.create_index([("enrichment.motivated_seller.score", DESCENDING)])
+            await self.properties_collection.create_index([("is_motivated_seller", ASCENDING)])
+            await self.properties_collection.create_index([("has_price_reduction", ASCENDING)])
+            await self.properties_collection.create_index([("has_distress_signals", ASCENDING)])
+            await self.properties_collection.create_index([("enrichment.is_auction", ASCENDING)])
+            await self.properties_collection.create_index([("enrichment.is_reo", ASCENDING)])
+            await self.properties_collection.create_index([("enrichment.is_probate", ASCENDING)])
+            await self.properties_collection.create_index([("enrichment.is_short_sale", ASCENDING)])
+            await self.properties_collection.create_index([("enrichment.is_as_is", ASCENDING)])
             
             print("Database indexes created successfully")
         except Exception as e:
@@ -359,14 +376,26 @@ class Database:
                     }
                 else:
                     # Content changed - update the property
+                    property_dict = property_data.dict(by_alias=True, exclude={"id"})
                     result = await self.properties_collection.replace_one(
                         {"property_id": property_data.property_id},
-                        property_data.dict(by_alias=True, exclude={"id"}),
+                        property_dict,
                         upsert=True
                     )
                     
                     # Update CRM properties that reference this MLS property
                     crm_updated_count = await self.update_crm_properties_from_mls(property_data.property_id)
+                    
+                    # Trigger enrichment in background (non-blocking!)
+                    if self.enrichment_pipeline:
+                        asyncio.create_task(
+                            self._enrich_property_background(
+                                property_id=property_data.property_id,
+                                property_dict=property_dict,
+                                existing_property=existing_property,
+                                job_id=property_data.job_id
+                            )
+                        )
                     
                     return {
                         "action": "updated",
@@ -378,9 +407,20 @@ class Database:
                     }
             else:
                 # New property - insert it
-                result = await self.properties_collection.insert_one(
-                    property_data.dict(by_alias=True, exclude={"id"})
-                )
+                property_dict = property_data.dict(by_alias=True, exclude={"id"})
+                result = await self.properties_collection.insert_one(property_dict)
+                
+                # Trigger enrichment in background (non-blocking!)
+                if self.enrichment_pipeline:
+                    asyncio.create_task(
+                        self._enrich_property_background(
+                            property_id=property_data.property_id,
+                            property_dict=property_dict,
+                            existing_property=None,
+                            job_id=property_data.job_id
+                        )
+                    )
+                
                 return {
                     "action": "inserted",
                     "reason": "new_property",
@@ -703,6 +743,25 @@ class Database:
         except Exception as e:
             print(f"Error updating CRM properties from MLS: {e}")
             return 0
+    
+    async def _enrich_property_background(self, property_id: str, property_dict: Dict[str, Any], existing_property: Optional[Dict[str, Any]], job_id: Optional[str]):
+        """Background enrichment task - runs asynchronously without blocking scraping"""
+        try:
+            print(f"Starting background enrichment for property {property_id}")
+            
+            # Run enrichment
+            enrichment_data = await self.enrichment_pipeline.enrich_property(
+                property_id=property_id,
+                property_dict=property_dict,
+                existing_property=existing_property,
+                job_id=job_id
+            )
+            
+            print(f"Background enrichment completed for property {property_id}")
+            
+        except Exception as e:
+            print(f"Error in background enrichment for property {property_id}: {e}")
+            # Don't re-raise - this is a background task
 
 # Global database instance
 db = Database()

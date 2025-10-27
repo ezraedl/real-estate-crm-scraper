@@ -1,0 +1,177 @@
+# Motivated Seller Scoring Configuration
+# Adjust these values to fine-tune the scoring algorithm
+
+# Signal Weights (total should be ~100)
+# How important each signal type is in calculating the overall score
+signal_weights:
+  price_reductions: 50 # Strongest indicator - major price drops
+  days_on_market: 30 # Second strongest - time on market
+  distress_keywords: 15 # Keywords like "as-is", "must sell"
+  special_sale_type: 5 # Auction, REO, probate, etc.
+  recent_activity: 0 # Recent changes/updates - disabled for now
+
+# Price Reduction Scoring
+# Points awarded based on price reduction percentage
+price_reduction_thresholds:
+  major: { percent: 10, score: 30 } # 10%+ reduction = 30 points
+  significant: { percent: 5, score: 20 } # 5-10% reduction = 20 points
+  moderate: { percent: 2, score: 10 } # 2-5% reduction = 10 points
+  minor: { percent: 0, score: 5 } # Any reduction = 5 points
+
+# Days on Market Scoring
+# Points awarded based on how long property has been on market
+days_on_market_thresholds:
+  very_long: { days: 270, score: 30 } # 9+ months = 30 points
+  long: { days: 180, score: 25 } # 6-9 months = 25 points
+  moderate: { days: 120, score: 18 } # 4-6 months = 18 points
+  short: { days: 90, score: 12 } # 3-4 months = 12 points
+  minimal: { days: 60, score: 6 } # 2-3 months = 6 points
+  very_short: { days: 0, score: 0 } # < 2 months = 0 points
+
+# Distress Keywords Scoring
+# Points awarded for finding these keywords in property description
+distress_keywords:
+  high:
+    keywords:
+      [
+        "must sell",
+        "motivated seller",
+        "priced to sell",
+        "quick sale",
+        "cash only",
+        "as-is",
+        "needs work",
+        "handyman special",
+        "investor special",
+        "fixer upper",
+        "distressed property",
+        "bring all offers",
+        "any offer considered",
+        "make an offer",
+        "estate sale",
+        "foreclosure",
+        "short sale",
+        "vacant",
+        "fire damage",
+        "needs tlc",
+        "needs repairs",
+        "below market value",
+        "priced for quick sale",
+        "seller says sell",
+        "need to sell fast",
+        "seller relocating quickly",
+        "uninhabitable",
+        "probate sale",
+      ]
+    score_per_keyword: 8
+  medium:
+    keywords:
+      [
+        "price reduced",
+        "price improvement",
+        "motivated to sell",
+        "ready to negotiate",
+        "bring your offer",
+        "willing to negotiate",
+        "seller flexible",
+        "move-in ready",
+        "ready to close",
+        "below appraised value",
+        "recently lowered price",
+        "make it yours",
+        "won't last long",
+        "great investment",
+        "investment opportunity",
+        "needs updating",
+        "some repairs needed",
+        "sold as-is",
+        "great for investor",
+        "sold below market",
+        "selling fast",
+        "below comps",
+        "motivated owner",
+        "priced to move",
+      ]
+    score_per_keyword: 5
+  low:
+    keywords:
+      [
+        "relocating",
+        "downsizing",
+        "ready for new owners",
+        "open to offers",
+        "move-in condition",
+        "available immediately",
+        "flexible terms",
+        "quick closing possible",
+        "ready for next family",
+        "immediate possession",
+        "transitioning",
+        "ready to sell",
+        "owner retiring",
+        "estate situation",
+        "motivated to move",
+        "priced to sell fast",
+        "seller eager",
+        "ready to move",
+        "reduced to sell",
+      ]
+    score_per_keyword: 2
+  negative:
+    keywords:
+      [
+        "multiple offers expected",
+        "multiple offers received",
+        "firm on price",
+        "no lowball offers",
+        "seller not in a hurry",
+        "no rush to sell",
+        "owner will finance",
+        "owner financing available",
+        "new construction",
+        "brand new build",
+        "recently renovated",
+        "completely remodeled",
+        "move-in ready luxury",
+        "premium upgrades",
+        "priced accordingly",
+        "priced at appraisal",
+        "competitive offers only",
+        "do not disturb tenant",
+        "tenant occupied",
+        "under contract",
+        "pending sale",
+        "accepting backup offers only",
+      ]
+    score_per_keyword: -3 # Subtracts points from score
+
+# Special Sale Type Scoring
+# Points awarded for special sale types
+special_sale_types:
+  auction: 15
+  reo: 15
+  probate: 12
+  short_sale: 10
+  as_is: 8
+
+# Recent Activity Scoring
+# Points for recent updates/changes
+recent_activity_thresholds:
+  very_recent: { days: 3, score: 2 } # Within 3 days
+  recent: { days: 7, score: 1 } # Within 7 days
+  max_score: 5 # Max points for recent activity
+
+# Confidence Levels
+# Based on data availability
+confidence_thresholds:
+  high: 0.8 # 80%+ data availability
+  medium: 0.6 # 60-80% data availability
+  low: 0.0 # < 60% data availability
+
+# Score Interpretation
+# How to interpret the final score
+score_interpretation:
+  highly_motivated: { min: 70, label: "Highly Motivated" }
+  motivated: { min: 40, label: "Motivated" }
+  some_motivation: { min: 20, label: "Some Motivation" }
+  low_motivation: { min: 0, label: "Low Motivation" }
