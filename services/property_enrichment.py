@@ -172,7 +172,6 @@ class PropertyEnrichmentPipeline:
             'motivated_seller': motivated_seller,
             'big_ticket_items': text_analysis.get('big_ticket_items', {}),
             'distress_signals': {
-                'has_distress_signals': text_analysis.get('summary', {}).get('has_distress_signals', False),
                 'signals_found': text_analysis.get('distress_signals', []),
                 'motivated_keywords': text_analysis.get('motivated_keywords', [])
             },
@@ -237,7 +236,6 @@ class PropertyEnrichmentPipeline:
             },
             'big_ticket_items': {},
             'distress_signals': {
-                'has_distress_signals': False,
                 'signals_found': [],
                 'motivated_keywords': []
             },

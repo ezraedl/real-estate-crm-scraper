@@ -6,7 +6,7 @@ in dedicated MongoDB collections for auditing and analytics.
 """
 
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -210,8 +210,7 @@ class HistoryTracker:
     async def get_recent_changes(self, property_id: str, days: int = 30) -> Dict[str, Any]:
         """Get recent changes summary for a property"""
         try:
-            cutoff_date = datetime.utcnow()
-            cutoff_date = cutoff_date.replace(day=cutoff_date.day - days)
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
             
             # Get recent history entries
             history_cursor = self.history_collection.find(
