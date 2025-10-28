@@ -69,36 +69,8 @@ class PropertyDiffer:
             }
         }
         
-        # Compare all fields
-        all_fields = set(old_property.keys()) | set(new_property.keys())
-        
-        for field in all_fields:
-            if field in self.ignore_fields:
-                continue
-                
-            old_value = old_property.get(field)
-            new_value = new_property.get(field)
-            
-            # Skip if values are the same
-            if old_value == new_value:
-                continue
-            
-            change_entry = {
-                'field': field,
-                'old_value': old_value,
-                'new_value': new_value,
-                'timestamp': datetime.utcnow(),
-                'change_type': self._categorize_change(field, old_value, new_value)
-            }
-            
-            changes['has_changes'] = True
-            changes['field_changes'].append(change_entry)
-            
-            # Categorize specific change types
-            if field in self.price_fields:
-                changes['price_changes'].append(change_entry)
-            elif field in self.status_fields:
-                changes['status_changes'].append(change_entry)
+        # Recursively compare all fields (including nested dictionaries)
+        self._compare_fields(old_property, new_property, "", changes, self.ignore_fields)
         
         # Update summary counts
         changes['summary']['total_changes'] = len(changes['field_changes'])
@@ -107,6 +79,71 @@ class PropertyDiffer:
         changes['summary']['field_changes_count'] = len(changes['field_changes'])
         
         return changes
+    
+    def _compare_fields(self, old_dict: Dict[str, Any], new_dict: Dict[str, Any], prefix: str, changes: Dict[str, Any], ignore_fields: set):
+        """
+        Recursively compare fields in nested dictionaries
+        
+        Args:
+            old_dict: Old dictionary
+            new_dict: New dictionary
+            prefix: Current field path prefix (e.g., "financial" for nested fields)
+            changes: Changes dictionary to populate
+            ignore_fields: Fields to ignore (only checked at top level)
+        """
+        # Get all fields from both dictionaries
+        all_fields = set(old_dict.keys() if old_dict else []) | set(new_dict.keys() if new_dict else [])
+        
+        for field in all_fields:
+            # Build full field path
+            field_path = f"{prefix}.{field}" if prefix else field
+            
+            # Skip ignored fields (only at top level)
+            if not prefix and field in ignore_fields:
+                continue
+            
+            old_value = old_dict.get(field) if old_dict else None
+            new_value = new_dict.get(field) if new_dict else None
+            
+            # Handle nested dictionaries recursively
+            if isinstance(old_value, dict) or isinstance(new_value, dict):
+                old_dict_value = old_value if isinstance(old_value, dict) else {}
+                new_dict_value = new_value if isinstance(new_value, dict) else {}
+                self._compare_fields(old_dict_value, new_dict_value, field_path, changes, ignore_fields)
+                continue
+            
+            # Handle lists - compare as whole units (could be enhanced to detect list item changes)
+            if isinstance(old_value, list) or isinstance(new_value, list):
+                if old_value != new_value:
+                    change_entry = {
+                        'field': field_path,
+                        'old_value': old_value,
+                        'new_value': new_value,
+                        'timestamp': datetime.utcnow(),
+                        'change_type': self._categorize_change(field_path, old_value, new_value)
+                    }
+                    changes['has_changes'] = True
+                    changes['field_changes'].append(change_entry)
+                continue
+            
+            # Compare simple values
+            if old_value != new_value:
+                change_entry = {
+                    'field': field_path,
+                    'old_value': old_value,
+                    'new_value': new_value,
+                    'timestamp': datetime.utcnow(),
+                    'change_type': self._categorize_change(field_path, old_value, new_value)
+                }
+                
+                changes['has_changes'] = True
+                changes['field_changes'].append(change_entry)
+                
+                # Categorize specific change types
+                if field_path in self.price_fields:
+                    changes['price_changes'].append(change_entry)
+                elif field_path in self.status_fields:
+                    changes['status_changes'].append(change_entry)
     
     def _detect_new_property_changes(self, new_property: Dict[str, Any]) -> Dict[str, Any]:
         """Handle case where property is completely new"""
