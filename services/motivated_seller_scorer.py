@@ -3,6 +3,8 @@ Motivated Seller Scorer Service
 
 Calculates a motivated seller score (0-100) based on various signals
 like price reductions, days on market, keywords, and sale type indicators.
+
+V2: Separates raw signal detection from score calculation for flexible recalculation.
 """
 
 from typing import Dict, List, Any, Optional
@@ -10,6 +12,8 @@ from datetime import datetime, timedelta
 import logging
 import os
 import yaml
+import hashlib
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +23,32 @@ class MotivatedSellerScorer:
     def __init__(self, config_path: Optional[str] = None):
         # Load configuration from YAML file or use defaults
         self.config = self._load_config(config_path)
+        self.config_hash = self._generate_config_hash()
         
         # Signal weights (total should be ~100)
         self.signal_weights = self.config.get('signal_weights', {
-            'price_reductions': 40,
-            'days_on_market': 30,
-            'distress_keywords': 15,
-            'special_sale_type': 10,
-            'recent_activity': 5
+            'explicit_keywords': 50,
+            'price_reductions': 30,
+            'days_on_market': 15,
+            'distress_keywords': 10,
+            'special_sale_type': 5,
+            'recent_activity': 0
         })
+        
+        # Explicit keywords (high-confidence motivated seller declarations)
+        distress_config = self.config.get('distress_keywords', {})
+        self.explicit_keywords = [
+            "motivated seller",
+            "must sell",
+            "need to sell",
+            "have to sell",
+            "urgent sale",
+            "quick sale",
+            "desperate seller"
+        ]
+        # Also include high-level keywords from config
+        high_keywords = distress_config.get('high', {}).get('keywords', [])
+        self.explicit_keywords.extend([kw for kw in high_keywords if kw not in self.explicit_keywords])
         
         # Price reduction scoring thresholds
         self.price_reduction_thresholds = self.config.get('price_reduction_thresholds', {
@@ -39,21 +60,29 @@ class MotivatedSellerScorer:
         
         # Days on market scoring thresholds
         self.dom_thresholds = self.config.get('days_on_market_thresholds', {
-            'very_long': {'days': 270, 'score': 30},
-            'long': {'days': 180, 'score': 25},
-            'moderate': {'days': 120, 'score': 18},
-            'short': {'days': 90, 'score': 12},
-            'minimal': {'days': 60, 'score': 6},
-            'very_short': {'days': 0, 'score': 0}
+            'very_long': {'days': 180, 'score': 30},
+            'long': {'days': 120, 'score': 28},
+            'moderate': {'days': 90, 'score': 25},
+            'short': {'days': 60, 'score': 20},
+            'minimal': {'days': 30, 'score': 12},
+            'very_short': {'days': 14, 'score': 6},
+            'immediate': {'days': 0, 'score': 0}
+        })
+        
+        # Days since pending bonus multipliers
+        self.pending_bonus = self.config.get('days_since_pending_bonus', {
+            'very_recent': {'days': 7, 'score_multiplier': 1.5},
+            'recent': {'days': 14, 'score_multiplier': 1.3},
+            'moderate': {'days': 30, 'score_multiplier': 1.2},
+            'none': {'days': None, 'score_multiplier': 1.0}
         })
         
         # Distress keyword scoring
-        distress_config = self.config.get('distress_keywords', {})
         self.distress_keyword_scores = {
-            'high': distress_config.get('high', {}).get('keywords', ['must sell', 'quick sale', 'urgent', 'motivated seller', 'as-is', 'cash only']),
-            'medium': distress_config.get('medium', {}).get('keywords', ['price reduced', 'bring offers', 'handyman', 'fixer upper']),
-            'low': distress_config.get('low', {}).get('keywords', ['needs work', 'handy man', 'diy']),
-            'negative': distress_config.get('negative', {}).get('keywords', [])  # Anti-motivation keywords
+            'high': distress_config.get('high', {}).get('keywords', []),
+            'medium': distress_config.get('medium', {}).get('keywords', []),
+            'low': distress_config.get('low', {}).get('keywords', []),
+            'negative': distress_config.get('negative', {}).get('keywords', [])
         }
         
         # Distress keyword scores per level
@@ -61,7 +90,7 @@ class MotivatedSellerScorer:
             'high': distress_config.get('high', {}).get('score_per_keyword', 8),
             'medium': distress_config.get('medium', {}).get('score_per_keyword', 5),
             'low': distress_config.get('low', {}).get('score_per_keyword', 2),
-            'negative': distress_config.get('negative', {}).get('score_per_keyword', -3)  # Subtracts points
+            'negative': distress_config.get('negative', {}).get('score_per_keyword', -3)
         }
         
         # Special sale type scoring
@@ -103,9 +132,33 @@ class MotivatedSellerScorer:
             logger.error(f"Error loading config from {config_path}: {e}")
             return {}
     
-    def calculate_motivated_score(self, property_data: Dict[str, Any], analysis_data: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _generate_config_hash(self) -> str:
+        """Generate hash of current configuration to track config changes"""
+        try:
+            # Create hash from config keys that affect scoring
+            config_data = {
+                'signal_weights': self.config.get('signal_weights', {}),
+                'price_reduction_thresholds': self.config.get('price_reduction_thresholds', {}),
+                'days_on_market_thresholds': self.config.get('days_on_market_thresholds', {}),
+                'days_since_pending_bonus': self.config.get('days_since_pending_bonus', {}),
+                'distress_keywords': self.config.get('distress_keywords', {}),
+                'special_sale_types': self.config.get('special_sale_types', {}),
+                'config_version': self.config.get('config_version', '1.0')
+            }
+            
+            config_json = json.dumps(config_data, sort_keys=True, default=str)
+            return hashlib.md5(config_json.encode('utf-8')).hexdigest()[:8]
+        except Exception as e:
+            logger.error(f"Error generating config hash: {e}")
+            return "unknown"
+    
+    def get_config_hash(self) -> str:
+        """Get current config hash"""
+        return self.config_hash
+    
+    def detect_signals(self, property_data: Dict[str, Any], analysis_data: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Calculate motivated seller score for a property
+        Phase 1: Detect raw signals and store findings with absolute scores
         
         Args:
             property_data: Property data including price, status, days_on_mls
@@ -113,74 +166,298 @@ class MotivatedSellerScorer:
             history_data: Optional price/status history data
             
         Returns:
-            Dictionary containing score, confidence, and reasoning
+            Dictionary containing raw findings with absolute scores
         """
         try:
-            score_components = {
-                'price_reductions': self._score_price_reductions(property_data, history_data),
-                'days_on_market': self._score_days_on_market(property_data),
-                'distress_keywords': self._score_distress_keywords(analysis_data),
-                'special_sale_type': self._score_special_sale_type(analysis_data),
-                'recent_activity': self._score_recent_activity(property_data, history_data)
-            }
+            findings = {}
             
+            # 1. Explicit keywords detection
+            findings['explicit_keywords'] = self._detect_explicit_keywords(property_data, analysis_data)
+            
+            # 2. Days on market detection (now includes pending bonus)
+            findings['days_on_market'] = self._detect_days_on_market(property_data, history_data)
+            
+            # 3. Price reduction detection
+            findings['price_reduction'] = self._detect_price_reductions(property_data, history_data)
+            
+            # 4. Distress keywords detection
+            findings['distress_keywords'] = self._detect_distress_keywords(analysis_data)
+            
+            # 5. Special sale types detection
+            findings['special_sale_types'] = self._detect_special_sale_types(analysis_data)
+            
+            # 6. Recent activity detection
+            findings['recent_activity'] = self._detect_recent_activity(property_data, history_data)
+            
+            return findings
+            
+        except Exception as e:
+            logger.error(f"Error detecting signals: {e}")
+            return self._empty_findings()
+    
+    def calculate_score_from_findings(self, findings: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Phase 2: Calculate final score from raw findings using current config
+        
+        Args:
+            findings: Raw findings from detect_signals()
+            
+        Returns:
+            Dictionary containing score, confidence, reasoning, and metadata
+        """
+        try:
             # Calculate weighted total score
-            # Each component score is already out of its max_possible points
-            # We weight each component based on its importance
-            total_weighted_score = 0
-            total_max_possible_score = 0
+            total_score = 0.0
             
-            for signal, weight in self.signal_weights.items():
-                component = score_components[signal]
-                component_score = component['score']
-                component_max = component.get('max_possible', 100)
-                
-                # Calculate weighted contribution
-                # Weight represents how much of the total 100 points this component can contribute
-                # So if weight is 40, this component can contribute up to 40 points to the final score
-                contribution = (component_score / component_max) * weight if component_max > 0 else 0
-                
-                total_weighted_score += contribution
-                total_max_possible_score += weight  # Each weight contributes to max
+            # Explicit keywords: direct weight contribution (0-50 points)
+            explicit_finding = findings.get('explicit_keywords', {})
+            if explicit_finding.get('detected', False):
+                explicit_raw = explicit_finding.get('raw_score', 0)
+                weight = self.signal_weights.get('explicit_keywords', 50)
+                # Explicit keywords get full weight if detected
+                total_score += weight
             
-            # Final score is percentage of max possible (where max is sum of all weights)
-            # Since weights are set to sum to ~100, we can divide by 100 to get percentage
-            if total_max_possible_score > 0:
-                final_score = (total_weighted_score / total_max_possible_score) * 100
-            else:
-                final_score = 0
+            # Price reductions: weighted contribution (0-30 points)
+            price_finding = findings.get('price_reduction', {})
+            if price_finding.get('detected', False):
+                price_raw = price_finding.get('raw_score', 0)
+                price_max = self.price_reduction_thresholds['major']['score']
+                weight = self.signal_weights.get('price_reductions', 30)
+                contribution = (price_raw / price_max) * weight if price_max > 0 else 0
+                total_score += contribution
+            
+            # Days on market: weighted contribution (0-15 points) with pending bonus multiplier
+            dom_finding = findings.get('days_on_market', {})
+            dom_raw = dom_finding.get('raw_score', 0)
+            dom_max = self.dom_thresholds['very_long']['score']
+            weight = self.signal_weights.get('days_on_market', 15)
+            base_contribution = (dom_raw / dom_max) * weight if dom_max > 0 else 0
+            
+            # Apply pending multiplier (bonus for properties recently returned from pending)
+            pending_multiplier = dom_finding.get('pending_multiplier', 1.0)
+            contribution = base_contribution * pending_multiplier
+            total_score += contribution
+            
+            # Distress keywords: weighted contribution (0-10 points)
+            distress_finding = findings.get('distress_keywords', {})
+            distress_raw = distress_finding.get('raw_score', 0)
+            # Cap distress keywords raw score at reasonable max (e.g., 20)
+            distress_max = 20
+            weight = self.signal_weights.get('distress_keywords', 10)
+            contribution = (min(distress_raw, distress_max) / distress_max) * weight if distress_max > 0 else 0
+            total_score += contribution
+            
+            # Special sale types: weighted contribution (0-5 points)
+            special_finding = findings.get('special_sale_types', {})
+            special_raw = special_finding.get('raw_score', 0)
+            special_max = max(self.special_sale_scores.values()) if self.special_sale_scores else 15
+            weight = self.signal_weights.get('special_sale_type', 5)
+            contribution = (special_raw / special_max) * weight if special_max > 0 else 0
+            total_score += contribution
+            
+            # Recent activity: weighted contribution (0-5 points)
+            activity_finding = findings.get('recent_activity', {})
+            activity_raw = activity_finding.get('raw_score', 0)
+            activity_max = self.max_activity_score
+            weight = self.signal_weights.get('recent_activity', 0)
+            contribution = (activity_raw / activity_max) * weight if activity_max > 0 else 0
+            total_score += contribution
+            
+            # Store uncapped score
+            score_uncapped = total_score
             
             # Cap at 100
-            final_score = min(100, max(0, final_score))
+            score_capped = min(100, max(0, total_score))
             
-            # Calculate confidence based on data availability
-            confidence = self._calculate_confidence(score_components, property_data, analysis_data)
+            # Calculate confidence
+            confidence = self._calculate_confidence_from_findings(findings)
             
             # Generate reasoning
-            reasoning = self._generate_reasoning(score_components, final_score)
+            reasoning = self._generate_reasoning_from_findings(findings, score_capped)
             
             return {
-                'score': round(final_score, 1),
+                'score': round(score_capped, 1),
+                'score_uncapped': round(score_uncapped, 1),
                 'confidence': confidence,
                 'reasoning': reasoning,
-                'components': score_components,
-                'calculated_at': datetime.utcnow()
+                'findings': findings,
+                'score_version': 'v2',
+                'config_hash': self.config_hash,
+                'last_calculated': datetime.utcnow(),
+                # Keep legacy components for backward compatibility
+                'components': self._findings_to_components(findings)
             }
             
         except Exception as e:
-            logger.error(f"Error calculating motivated score: {e}")
+            logger.error(f"Error calculating score from findings: {e}")
             return {
                 'score': 0,
+                'score_uncapped': 0,
                 'confidence': 'low',
-                'reasoning': [f'Error calculating score'],
-                'components': {},
-                'calculated_at': datetime.utcnow()
+                'reasoning': [f'Error calculating score: {str(e)}'],
+                'findings': findings,
+                'score_version': 'v2',
+                'config_hash': self.config_hash,
+                'last_calculated': datetime.utcnow(),
+                'components': {}
             }
     
-    def _score_price_reductions(self, property_data: Dict[str, Any], history_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Score based on price reductions"""
-        score = 0
-        details = []
+    def calculate_motivated_score(self, property_data: Dict[str, Any], analysis_data: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Calculate motivated seller score (Phase 1 + Phase 2 combined)
+        
+        This is the main entry point that runs both detection and calculation.
+        For recalculation only, use calculate_score_from_findings() directly.
+        
+        Args:
+            property_data: Property data including price, status, days_on_mls
+            analysis_data: Text analysis results
+            history_data: Optional price/status history data
+            
+        Returns:
+            Dictionary containing score, confidence, reasoning, and findings
+        """
+        # Phase 1: Detect signals
+        findings = self.detect_signals(property_data, analysis_data, history_data)
+        
+        # Phase 2: Calculate score from findings
+        result = self.calculate_score_from_findings(findings)
+        
+        return result
+    
+    # Detection methods (Phase 1)
+    
+    def _detect_explicit_keywords(self, property_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect explicit motivated seller keywords"""
+        description = self._extract_description(property_data)
+        description_lower = description.lower() if description else ""
+        
+        keywords_found = []
+        detected = False
+        raw_score = 50  # Base score for explicit declaration
+        
+        for keyword in self.explicit_keywords:
+            if keyword.lower() in description_lower:
+                keywords_found.append(keyword)
+                detected = True
+        
+        return {
+            'detected': detected,
+            'keywords_found': keywords_found,
+            'count': len(keywords_found),
+            'raw_score': raw_score if detected else 0
+        }
+    
+    def _detect_days_on_market(self, property_data: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Detect days on market signal and days since last pending"""
+        days_on_market = property_data.get('days_on_mls', 0) or 0
+        raw_score = 0
+        threshold_met = None
+        
+        # Determine threshold based on DOM
+        if days_on_market >= self.dom_thresholds['very_long']['days']:
+            raw_score = self.dom_thresholds['very_long']['score']
+            threshold_met = 'very_long'
+        elif days_on_market >= self.dom_thresholds['long']['days']:
+            raw_score = self.dom_thresholds['long']['score']
+            threshold_met = 'long'
+        elif days_on_market >= self.dom_thresholds['moderate']['days']:
+            raw_score = self.dom_thresholds['moderate']['score']
+            threshold_met = 'moderate'
+        elif days_on_market >= self.dom_thresholds['short']['days']:
+            raw_score = self.dom_thresholds['short']['score']
+            threshold_met = 'short'
+        elif days_on_market >= self.dom_thresholds['minimal']['days']:
+            raw_score = self.dom_thresholds['minimal']['score']
+            threshold_met = 'minimal'
+        elif days_on_market >= self.dom_thresholds['very_short']['days']:
+            raw_score = self.dom_thresholds['very_short']['score']
+            threshold_met = 'very_short'
+        else:
+            raw_score = self.dom_thresholds['immediate']['score']
+            threshold_met = 'immediate'
+        
+        # Detect days since last pending
+        days_since_pending = self._calculate_days_since_pending(property_data, history_data)
+        pending_multiplier = self._get_pending_multiplier(days_since_pending)
+        
+        return {
+            'value': days_on_market,
+            'threshold_met': threshold_met,
+            'raw_score': raw_score,
+            'days_since_pending': days_since_pending,
+            'pending_multiplier': pending_multiplier
+        }
+    
+    def _calculate_days_since_pending(self, property_data: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Optional[int]:
+        """Calculate days since property last returned from pending status"""
+        if not history_data:
+            return None
+        
+        # Check status history for most recent PENDING -> FOR_SALE transition
+        status_history = history_data.get('status_history', [])
+        
+        # Current status
+        current_status = property_data.get('status', '').upper()
+        if current_status == 'PENDING':
+            return None  # Currently pending, can't calculate
+        
+        # Look for most recent transition from PENDING to FOR_SALE
+        for entry in status_history:
+            if entry.get('change_type') == 'status_change':
+                data = entry.get('data', {})
+                old_status = data.get('old_status', '').upper()
+                new_status = data.get('new_status', '').upper()
+                
+                # Found a transition from PENDING to FOR_SALE
+                if old_status == 'PENDING' and new_status == 'FOR_SALE':
+                    timestamp = entry.get('timestamp')
+                    if timestamp:
+                        try:
+                            if isinstance(timestamp, str):
+                                pending_end = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            else:
+                                pending_end = timestamp
+                            
+                            days_ago = (datetime.utcnow() - pending_end.replace(tzinfo=None)).days
+                            return max(0, days_ago)
+                        except Exception as e:
+                            logger.debug(f"Error parsing pending timestamp: {e}")
+                            continue
+        
+        return None  # Never was pending (or no history available)
+    
+    def _get_pending_multiplier(self, days_since_pending: Optional[int]) -> float:
+        """Get multiplier based on days since last pending"""
+        if days_since_pending is None:
+            return self.pending_bonus['none']['score_multiplier']
+        
+        # Check thresholds in order (most recent first)
+        if days_since_pending <= self.pending_bonus['very_recent']['days']:
+            return self.pending_bonus['very_recent']['score_multiplier']
+        elif days_since_pending <= self.pending_bonus['recent']['days']:
+            return self.pending_bonus['recent']['score_multiplier']
+        elif days_since_pending <= self.pending_bonus['moderate']['days']:
+            return self.pending_bonus['moderate']['score_multiplier']
+        else:
+            return self.pending_bonus['none']['score_multiplier']
+    
+    def _detect_price_reductions(self, property_data: Dict[str, Any], history_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Detect price reduction signals
+        
+        Only considers price reductions where the listing_type remained the same.
+        Filters out price changes that occurred when a property moved between listing types.
+        
+        Note: Status changes (e.g., FOR_SALE -> PENDING) within the same listing_type are OK.
+        """
+        detected = False
+        reductions = []
+        max_percent = 0
+        raw_score = 0
+        
+        # Get current listing_type for filtering (not status - status can change within same listing_type)
+        current_listing_type = property_data.get('listing_type')
         
         if history_data and 'price_history' in history_data:
             price_history = history_data['price_history']
@@ -194,188 +471,227 @@ class MotivatedSellerScorer:
                         data = change.get('data', {})
                         percent_change = data.get('percent_change', 0)
                         
+                        # Check if listing_type changed during this price change
+                        # Don't check status - status can change (FOR_SALE -> PENDING) within same listing_type
+                        old_listing_type = data.get('old_listing_type')
+                        new_listing_type = data.get('new_listing_type')
+                        
+                        # Skip if listing_type changed (e.g., for_rent -> for_sale, for_sale -> sold)
+                        listing_type_changed = old_listing_type and new_listing_type and old_listing_type != new_listing_type
+                        
+                        if listing_type_changed:
+                            logger.debug(f"Skipping price change due to listing_type change: {old_listing_type} -> {new_listing_type}")
+                            continue
+                        
+                        # Only consider reductions where new_listing_type matches current
+                        # This ensures we're looking at reductions within the same listing context
+                        # Status doesn't matter - FOR_SALE -> PENDING -> FOR_SALE is fine
+                        if new_listing_type and current_listing_type and new_listing_type != current_listing_type:
+                            continue
+                        
                         if percent_change < 0:  # Price reduction
-                            if percent_change <= -10:
-                                score = max(score, self.price_reduction_thresholds['major']['score'])
-                                details.append(f"Major price reduction: {abs(percent_change):.1f}%")
-                            elif percent_change <= -5:
-                                score = max(score, self.price_reduction_thresholds['significant']['score'])
-                                details.append(f"Significant price reduction: {abs(percent_change):.1f}%")
-                            elif percent_change <= -2:
-                                score = max(score, self.price_reduction_thresholds['moderate']['score'])
-                                details.append(f"Moderate price reduction: {abs(percent_change):.1f}%")
+                            detected = True
+                            abs_percent = abs(percent_change)
+                            max_percent = max(max_percent, abs_percent)
+                            reductions.append({
+                                'percent_change': percent_change,
+                                'old_price': data.get('old_price'),
+                                'new_price': data.get('new_price'),
+                                'timestamp': change.get('timestamp')
+                            })
+                            
+                            # Determine raw score based on reduction size
+                            if abs_percent >= 10:
+                                raw_score = max(raw_score, self.price_reduction_thresholds['major']['score'])
+                            elif abs_percent >= 5:
+                                raw_score = max(raw_score, self.price_reduction_thresholds['significant']['score'])
+                            elif abs_percent >= 2:
+                                raw_score = max(raw_score, self.price_reduction_thresholds['moderate']['score'])
                             else:
-                                score = max(score, self.price_reduction_thresholds['minor']['score'])
-                                details.append(f"Minor price reduction: {abs(percent_change):.1f}%")
+                                raw_score = max(raw_score, self.price_reduction_thresholds['minor']['score'])
         
         return {
-            'score': score,
-            'max_possible': self.price_reduction_thresholds['major']['score'],
-            'details': details,
-            'data_available': history_data is not None
+            'detected': detected,
+            'reductions': reductions,
+            'max_percent': max_percent,
+            'raw_score': raw_score
         }
     
-    def _score_days_on_market(self, property_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Score based on days on market"""
-        days_on_market = property_data.get('days_on_mls', 0)
-        score = 0
-        details = []
-        
-        if days_on_market >= self.dom_thresholds['very_long']['days']:
-            score = self.dom_thresholds['very_long']['score']
-            details.append(f"Very long time on market: {days_on_market} days")
-        elif days_on_market >= self.dom_thresholds['long']['days']:
-            score = self.dom_thresholds['long']['score']
-            details.append(f"Long time on market: {days_on_market} days")
-        elif days_on_market >= self.dom_thresholds['moderate']['days']:
-            score = self.dom_thresholds['moderate']['score']
-            details.append(f"Moderate time on market: {days_on_market} days")
-        elif days_on_market >= self.dom_thresholds['short']['days']:
-            score = self.dom_thresholds['short']['score']
-            details.append(f"Short time on market: {days_on_market} days")
-        else:
-            score = self.dom_thresholds['very_short']['score']
-            details.append(f"Recently listed: {days_on_market} days")
-        
-        return {
-            'score': score,
-            'max_possible': self.dom_thresholds['very_long']['score'],
-            'details': details,
-            'days_on_market': days_on_market
-        }
-    
-    def _score_distress_keywords(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Score based on distress keywords found in text analysis"""
-        score = 0
-        details = []
-        
+    def _detect_distress_keywords(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect distress keywords"""
         distress_signals = analysis_data.get('distress_signals', [])
         motivated_keywords = analysis_data.get('motivated_keywords', [])
         
-        # Score distress signals (positive motivators)
+        keywords_found = []
+        count_by_level = {'high': 0, 'medium': 0, 'low': 0, 'negative': 0}
+        raw_score = 0
+        
+        # Check distress signals
         for signal in distress_signals:
             signal_lower = signal.lower()
-            if any(keyword in signal_lower for keyword in self.distress_keyword_scores['high']):
-                score += self.distress_score_per_keyword['high']
-                details.append(f"High distress signal: '{signal}'")
-            elif any(keyword in signal_lower for keyword in self.distress_keyword_scores['medium']):
-                score += self.distress_score_per_keyword['medium']
-                details.append(f"Medium distress signal: '{signal}'")
-            elif any(keyword in signal_lower for keyword in self.distress_keyword_scores['low']):
-                score += self.distress_score_per_keyword['low']
-                details.append(f"Low distress signal: '{signal}'")
-            # Check for negative (anti-motivation) keywords
-            elif any(keyword in signal_lower for keyword in self.distress_keyword_scores['negative']):
-                score += self.distress_score_per_keyword['negative']  # This is negative, so it subtracts
-                details.append(f"Anti-motivation signal: '{signal}'")
+            found = False
+            
+            for level in ['high', 'medium', 'low', 'negative']:
+                if any(keyword in signal_lower for keyword in self.distress_keyword_scores[level]):
+                    keywords_found.append(signal)
+                    count_by_level[level] += 1
+                    raw_score += self.distress_score_per_keyword[level]
+                    found = True
+                    break
+            
+            if not found:
+                keywords_found.append(signal)
         
-        # Score motivated keywords
+        # Check motivated keywords
         for keyword in motivated_keywords:
             keyword_lower = keyword.lower()
-            if any(motivated in keyword_lower for motivated in self.distress_keyword_scores['high']):
-                score += self.distress_score_per_keyword['high'] - 2  # Slightly less for motivated keywords
-                details.append(f"Motivated keyword: '{keyword}'")
-            elif any(motivated in keyword_lower for motivated in self.distress_keyword_scores['medium']):
-                score += self.distress_score_per_keyword['medium'] - 2
-                details.append(f"Motivated keyword: '{keyword}'")
-            # Check for negative keywords
-            elif any(keyword in keyword_lower for keyword in self.distress_keyword_scores['negative']):
-                score += self.distress_score_per_keyword['negative']
-                details.append(f"Anti-motivation keyword: '{keyword}'")
+            found = False
+            
+            for level in ['high', 'medium', 'low', 'negative']:
+                if any(kw in keyword_lower for kw in self.distress_keyword_scores[level]):
+                    if keyword not in keywords_found:
+                        keywords_found.append(keyword)
+                        count_by_level[level] += 1
+                        # Motivated keywords get slightly less than distress signals
+                        score_adjustment = -2 if level != 'negative' else 0
+                        raw_score += self.distress_score_per_keyword[level] + score_adjustment
+                        found = True
+                        break
+            
+            if not found and keyword not in keywords_found:
+                keywords_found.append(keyword)
         
-        # Cap at max possible (don't allow negative from this component)
-        score = min(score, 20)
+        # Don't allow negative score from this component
+        raw_score = max(0, raw_score)
         
         return {
-            'score': score,
-            'max_possible': 20,
-            'details': details,
-            'signals_found': len(distress_signals),
-            'keywords_found': len(motivated_keywords)
+            'keywords_found': keywords_found,
+            'count_by_level': count_by_level,
+            'raw_score': raw_score
         }
     
-    def _score_special_sale_type(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Score based on special sale types"""
-        score = 0
-        details = []
-        
+    def _detect_special_sale_types(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect special sale types"""
         special_sale_types = analysis_data.get('special_sale_types', [])
+        raw_score = 0
         
         for sale_type in special_sale_types:
             if sale_type in self.special_sale_scores:
-                type_score = self.special_sale_scores[sale_type]
-                score = max(score, type_score)
-                details.append(f"Special sale type: {sale_type} (+{type_score} points)")
+                # Take max score (don't double-count)
+                raw_score = max(raw_score, self.special_sale_scores[sale_type])
         
         return {
-            'score': score,
-            'max_possible': max(self.special_sale_scores.values()),
-            'details': details,
-            'sale_types_found': special_sale_types
+            'types_found': special_sale_types,
+            'raw_score': raw_score
         }
     
-    def _score_recent_activity(self, property_data: Dict[str, Any], history_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Score based on recent activity/changes"""
-        score = 0
-        details = []
+    def _detect_recent_activity(self, property_data: Dict[str, Any], history_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Detect recent activity signals"""
+        detected = False
+        days_since_update = None
+        raw_score = 0
         
         # Check if property was recently updated
         scraped_at = property_data.get('scraped_at')
         if scraped_at:
             if isinstance(scraped_at, str):
-                scraped_at = datetime.fromisoformat(scraped_at.replace('Z', '+00:00'))
+                try:
+                    scraped_at = datetime.fromisoformat(scraped_at.replace('Z', '+00:00'))
+                except:
+                    scraped_at = None
             
-            days_since_update = (datetime.utcnow() - scraped_at).days
-            
-            # Use configured thresholds
-            very_recent_days = self.recent_activity_thresholds.get('very_recent', {}).get('days', 3)
-            very_recent_score = self.recent_activity_thresholds.get('very_recent', {}).get('score', 2)
-            recent_days = self.recent_activity_thresholds.get('recent', {}).get('days', 7)
-            recent_score = self.recent_activity_thresholds.get('recent', {}).get('score', 1)
-            
-            if days_since_update <= very_recent_days:
-                score += very_recent_score
-                details.append(f"Very recently updated: {days_since_update} days ago")
-            elif days_since_update <= recent_days:
-                score += recent_score
-                details.append(f"Recently updated: {days_since_update} days ago")
+            if scraped_at:
+                days_since_update = (datetime.utcnow() - scraped_at.replace(tzinfo=None)).days
+                
+                very_recent_days = self.recent_activity_thresholds.get('very_recent', {}).get('days', 3)
+                very_recent_score = self.recent_activity_thresholds.get('very_recent', {}).get('score', 2)
+                recent_days = self.recent_activity_thresholds.get('recent', {}).get('days', 7)
+                recent_score = self.recent_activity_thresholds.get('recent', {}).get('score', 1)
+                
+                if days_since_update <= very_recent_days:
+                    raw_score += very_recent_score
+                    detected = True
+                elif days_since_update <= recent_days:
+                    raw_score += recent_score
+                    detected = True
         
         # Check for recent changes in history
         if history_data and 'recent_changes' in history_data:
             recent_changes = history_data['recent_changes']
             if recent_changes.get('summary', {}).get('history_count', 0) > 0:
-                score += 3
-                details.append("Recent activity detected")
+                raw_score += 3
+                detected = True
         
-        # Cap at configured max score
-        score = min(score, self.max_activity_score)
+        # Cap at max score
+        raw_score = min(raw_score, self.max_activity_score)
         
         return {
-            'score': score,
-            'max_possible': self.max_activity_score,
-            'details': details,
-            'data_available': history_data is not None
+            'detected': detected,
+            'days_since_update': days_since_update,
+            'raw_score': raw_score
         }
     
-    def _calculate_confidence(self, score_components: Dict[str, Any], property_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> str:
-        """Calculate confidence level based on data availability"""
+    # Helper methods
+    
+    def _extract_description(self, property_data: Dict[str, Any]) -> str:
+        """Extract description text from property data"""
+        description_fields = [
+            'description.text',
+            'description.full_description',
+            'description.summary',
+            'description',
+            'remarks',
+            'public_remarks'
+        ]
+        
+        for field in description_fields:
+            if '.' in field:
+                # Nested field
+                parts = field.split('.')
+                value = property_data
+                for part in parts:
+                    if isinstance(value, dict) and part in value:
+                        value = value[part]
+                    else:
+                        value = None
+                        break
+            else:
+                # Direct field
+                value = property_data.get(field)
+            
+            if value and isinstance(value, str) and value.strip():
+                return value.strip()
+        
+        return ""
+    
+    def _empty_findings(self) -> Dict[str, Any]:
+        """Return empty findings structure"""
+        return {
+            'explicit_keywords': {'detected': False, 'keywords_found': [], 'count': 0, 'raw_score': 0},
+            'days_on_market': {'value': 0, 'threshold_met': 'immediate', 'raw_score': 0, 'days_since_pending': None, 'pending_multiplier': 1.0},
+            'price_reduction': {'detected': False, 'reductions': [], 'max_percent': 0, 'raw_score': 0},
+            'distress_keywords': {'keywords_found': [], 'count_by_level': {'high': 0, 'medium': 0, 'low': 0, 'negative': 0}, 'raw_score': 0},
+            'special_sale_types': {'types_found': [], 'raw_score': 0},
+            'recent_activity': {'detected': False, 'days_since_update': None, 'raw_score': 0}
+        }
+    
+    def _calculate_confidence_from_findings(self, findings: Dict[str, Any]) -> str:
+        """Calculate confidence level based on findings data availability"""
         data_points = 0
-        max_data_points = 5
+        max_data_points = 6
         
         # Check data availability
-        if score_components['price_reductions']['data_available']:
+        if findings.get('explicit_keywords', {}).get('detected', False):
             data_points += 1
-        
-        if property_data.get('days_on_mls') is not None:
+        if findings.get('days_on_market', {}).get('value', 0) is not None:
             data_points += 1
-        
-        if analysis_data.get('distress_signals') or analysis_data.get('motivated_keywords'):
+        if findings.get('price_reduction', {}).get('detected', False):
             data_points += 1
-        
-        if analysis_data.get('special_sale_types'):
+        if findings.get('distress_keywords', {}).get('keywords_found'):
             data_points += 1
-        
-        if score_components['recent_activity']['data_available']:
+        if findings.get('special_sale_types', {}).get('types_found'):
+            data_points += 1
+        if findings.get('recent_activity', {}).get('detected', False):
             data_points += 1
         
         confidence_ratio = data_points / max_data_points
@@ -387,24 +703,100 @@ class MotivatedSellerScorer:
         else:
             return 'low'
     
-    def _generate_reasoning(self, score_components: Dict[str, Any], final_score: float) -> List[str]:
-        """Generate human-readable reasoning for the score"""
+    def _generate_reasoning_from_findings(self, findings: Dict[str, Any], final_score: float) -> List[str]:
+        """Generate human-readable reasoning from findings"""
         reasoning = []
         
-        # Add reasoning for each component that contributed
-        for component, data in score_components.items():
-            if data['score'] > 0:
-                if data['details']:
-                    reasoning.extend(data['details'])
+        # Explicit keywords
+        explicit = findings.get('explicit_keywords', {})
+        if explicit.get('detected', False):
+            keywords = explicit.get('keywords_found', [])
+            reasoning.append(f"Explicit motivation: {', '.join(keywords)}")
         
-        # Add overall assessment
+        # Price reductions
+        price = findings.get('price_reduction', {})
+        if price.get('detected', False):
+            max_percent = price.get('max_percent', 0)
+            reductions = price.get('reductions', [])
+            reasoning.append(f"Price reduction: {max_percent:.1f}% ({len(reductions)} reduction(s))")
+        
+        # Days on market
+        dom = findings.get('days_on_market', {})
+        dom_value = dom.get('value', 0)
+        days_since_pending = dom.get('days_since_pending')
+        pending_multiplier = dom.get('pending_multiplier', 1.0)
+        
+        if dom_value > 0:
+            reasoning.append(f"Days on market: {dom_value} days")
+        
+        # Add pending bonus info if applicable
+        if days_since_pending is not None and pending_multiplier > 1.0:
+            bonus_pct = int((pending_multiplier - 1.0) * 100)
+            reasoning.append(f"Returned from pending {days_since_pending} days ago ({bonus_pct}% DOM bonus)")
+        
+        # Distress keywords
+        distress = findings.get('distress_keywords', {})
+        keywords_found = distress.get('keywords_found', [])
+        if keywords_found:
+            count_by_level = distress.get('count_by_level', {})
+            total = sum(count_by_level.values())
+            reasoning.append(f"Distress signals: {total} keyword(s) found")
+        
+        # Special sale types
+        special = findings.get('special_sale_types', {})
+        types_found = special.get('types_found', [])
+        if types_found:
+            reasoning.append(f"Special sale type: {', '.join(types_found)}")
+        
+        # Overall assessment
         if final_score >= 70:
-            reasoning.append("High motivated seller score - strong indicators present")
+            reasoning.append("High motivated seller - strong indicators present")
         elif final_score >= 40:
-            reasoning.append("Moderate motivated seller score - some indicators present")
+            reasoning.append("Moderate motivated seller - some indicators present")
         elif final_score >= 20:
-            reasoning.append("Low motivated seller score - few indicators present")
+            reasoning.append("Low motivated seller - few indicators present")
         else:
-            reasoning.append("Very low motivated seller score - minimal indicators")
+            reasoning.append("Very low motivated seller - minimal indicators")
         
-        return reasoning
+        return reasoning if reasoning else ["No motivation indicators found"]
+    
+    def _findings_to_components(self, findings: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert findings to legacy components format for backward compatibility"""
+        return {
+            'explicit_keywords': {
+                'score': 50 if findings.get('explicit_keywords', {}).get('detected', False) else 0,
+                'max_possible': 50,
+                'details': [f"Explicit: {', '.join(findings.get('explicit_keywords', {}).get('keywords_found', []))}"] if findings.get('explicit_keywords', {}).get('detected', False) else []
+            },
+            'price_reductions': {
+                'score': findings.get('price_reduction', {}).get('raw_score', 0),
+                'max_possible': self.price_reduction_thresholds['major']['score'],
+                'details': [f"Price reduction: {findings.get('price_reduction', {}).get('max_percent', 0):.1f}%"] if findings.get('price_reduction', {}).get('detected', False) else [],
+                'data_available': findings.get('price_reduction', {}).get('detected', False)
+            },
+            'days_on_market': {
+                'score': findings.get('days_on_market', {}).get('raw_score', 0),
+                'max_possible': self.dom_thresholds['very_long']['score'],
+                'details': [f"Days on market: {findings.get('days_on_market', {}).get('value', 0)} days"],
+                'days_on_market': findings.get('days_on_market', {}).get('value', 0)
+            },
+            'distress_keywords': {
+                'score': findings.get('distress_keywords', {}).get('raw_score', 0),
+                'max_possible': 20,
+                'details': [f"Distress signals: {len(findings.get('distress_keywords', {}).get('keywords_found', []))} found"],
+                'signals_found': len(findings.get('distress_keywords', {}).get('keywords_found', [])),
+                'keywords_found': len(findings.get('distress_keywords', {}).get('keywords_found', []))
+            },
+            'special_sale_type': {
+                'score': findings.get('special_sale_types', {}).get('raw_score', 0),
+                'max_possible': max(self.special_sale_scores.values()) if self.special_sale_scores else 15,
+                'details': [f"Special sale: {', '.join(findings.get('special_sale_types', {}).get('types_found', []))}"] if findings.get('special_sale_types', {}).get('types_found', []) else [],
+                'sale_types_found': findings.get('special_sale_types', {}).get('types_found', [])
+            },
+            'recent_activity': {
+                'score': findings.get('recent_activity', {}).get('raw_score', 0),
+                'max_possible': self.max_activity_score,
+                'details': [f"Recent activity: {findings.get('recent_activity', {}).get('days_since_update', 'N/A')} days ago"] if findings.get('recent_activity', {}).get('detected', False) else [],
+                'data_available': findings.get('recent_activity', {}).get('detected', False)
+            }
+        }

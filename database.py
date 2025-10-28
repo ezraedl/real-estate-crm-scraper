@@ -3,10 +3,13 @@ from pymongo import ASCENDING, DESCENDING
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import asyncio
+import logging
 from urllib.parse import urlparse
 from config import settings
 from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
 from services import PropertyEnrichmentPipeline
+
+logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self):
@@ -85,6 +88,10 @@ class Database:
             await self.properties_collection.create_index([("enrichment.is_probate", ASCENDING)])
             await self.properties_collection.create_index([("enrichment.is_short_sale", ASCENDING)])
             await self.properties_collection.create_index([("enrichment.is_as_is", ASCENDING)])
+            
+            # New indexes for v2 scoring system
+            await self.properties_collection.create_index([("enrichment.motivated_seller.score_uncapped", DESCENDING)])
+            await self.properties_collection.create_index([("enrichment.motivated_seller.config_hash", ASCENDING)])
             
             print("Database indexes created successfully")
         except Exception as e:
@@ -762,6 +769,271 @@ class Database:
         except Exception as e:
             print(f"Error in background enrichment for property {property_id}: {e}")
             # Don't re-raise - this is a background task
+    
+    # Enrichment Recalculation Methods
+    
+    async def recalculate_all_scores(self, limit: Optional[int] = None, min_score: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Recalculate scores for all properties with findings (scores_only recalculation)
+        
+        Args:
+            limit: Max properties to process (None = all)
+            min_score: Only recalc properties above this score (None = all)
+            
+        Returns:
+            Statistics about the recalculation
+        """
+        try:
+            start_time = datetime.utcnow()
+            total_processed = 0
+            total_updated = 0
+            total_errors = 0
+            errors = []
+            
+            # Build query
+            query = {
+                "enrichment.motivated_seller.findings": {"$exists": True}
+            }
+            if min_score is not None:
+                query["enrichment.motivated_seller.score"] = {"$gte": min_score}
+            
+            # Get cursor
+            cursor = self.properties_collection.find(query, {"property_id": 1})
+            if limit:
+                cursor = cursor.limit(limit)
+            
+            # Process in batches
+            batch_size = 100
+            property_ids = []
+            
+            async for doc in cursor:
+                property_ids.append(doc["property_id"])
+                total_processed += 1
+                
+                if len(property_ids) >= batch_size:
+                    # Process batch
+                    for prop_id in property_ids:
+                        try:
+                            result = await self.enrichment_pipeline.recalculate_scores_only(prop_id)
+                            if result:
+                                total_updated += 1
+                        except Exception as e:
+                            total_errors += 1
+                            errors.append(f"Property {prop_id}: {str(e)}")
+                            logger.error(f"Error recalculating score for {prop_id}: {e}")
+                    
+                    property_ids = []
+                    
+                    # Log progress
+                    print(f"Processed {total_processed} properties, updated {total_updated}, errors {total_errors}")
+            
+            # Process remaining
+            for prop_id in property_ids:
+                try:
+                    result = await self.enrichment_pipeline.recalculate_scores_only(prop_id)
+                    if result:
+                        total_updated += 1
+                except Exception as e:
+                    total_errors += 1
+                    errors.append(f"Property {prop_id}: {str(e)}")
+                    logger.error(f"Error recalculating score for {prop_id}: {e}")
+            
+            completed_at = datetime.utcnow()
+            duration = (completed_at - start_time).total_seconds()
+            
+            return {
+                "total_processed": total_processed,
+                "total_updated": total_updated,
+                "total_errors": total_errors,
+                "started_at": start_time,
+                "completed_at": completed_at,
+                "duration_seconds": duration,
+                "errors": errors[:50]  # Limit error list
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in recalculate_all_scores: {e}")
+            return {
+                "total_processed": total_processed,
+                "total_updated": total_updated,
+                "total_errors": total_errors + 1,
+                "started_at": start_time,
+                "completed_at": datetime.utcnow(),
+                "duration_seconds": (datetime.utcnow() - start_time).total_seconds(),
+                "errors": errors + [str(e)]
+            }
+    
+    async def redetect_keywords_all(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Re-detect keywords for all properties
+        
+        Args:
+            limit: Max properties to process (None = all)
+            
+        Returns:
+            Statistics about the re-detection
+        """
+        try:
+            start_time = datetime.utcnow()
+            total_processed = 0
+            total_updated = 0
+            total_errors = 0
+            errors = []
+            
+            # Build query - get all properties with descriptions
+            query = {
+                "$or": [
+                    {"description.text": {"$exists": True, "$ne": None, "$ne": ""}},
+                    {"description.full_description": {"$exists": True, "$ne": None, "$ne": ""}},
+                    {"description": {"$exists": True, "$type": "string", "$ne": ""}}
+                ]
+            }
+            
+            # Get cursor
+            cursor = self.properties_collection.find(query, {"property_id": 1})
+            if limit:
+                cursor = cursor.limit(limit)
+            
+            # Process in batches
+            batch_size = 100
+            property_ids = []
+            
+            async for doc in cursor:
+                property_ids.append(doc["property_id"])
+                total_processed += 1
+                
+                if len(property_ids) >= batch_size:
+                    # Process batch
+                    for prop_id in property_ids:
+                        try:
+                            result = await self.enrichment_pipeline.detect_keywords_only(prop_id)
+                            if result:
+                                total_updated += 1
+                        except Exception as e:
+                            total_errors += 1
+                            errors.append(f"Property {prop_id}: {str(e)}")
+                            logger.error(f"Error re-detecting keywords for {prop_id}: {e}")
+                    
+                    property_ids = []
+                    print(f"Processed {total_processed} properties, updated {total_updated}, errors {total_errors}")
+            
+            # Process remaining
+            for prop_id in property_ids:
+                try:
+                    result = await self.enrichment_pipeline.detect_keywords_only(prop_id)
+                    if result:
+                        total_updated += 1
+                except Exception as e:
+                    total_errors += 1
+                    errors.append(f"Property {prop_id}: {str(e)}")
+                    logger.error(f"Error re-detecting keywords for {prop_id}: {e}")
+            
+            completed_at = datetime.utcnow()
+            duration = (completed_at - start_time).total_seconds()
+            
+            return {
+                "total_processed": total_processed,
+                "total_updated": total_updated,
+                "total_errors": total_errors,
+                "started_at": start_time,
+                "completed_at": completed_at,
+                "duration_seconds": duration,
+                "errors": errors[:50]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in redetect_keywords_all: {e}")
+            return {
+                "total_processed": total_processed,
+                "total_updated": total_updated,
+                "total_errors": total_errors + 1,
+                "started_at": start_time,
+                "completed_at": datetime.utcnow(),
+                "duration_seconds": (datetime.utcnow() - start_time).total_seconds(),
+                "errors": errors + [str(e)]
+            }
+    
+    async def update_dom_all(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Update days on market for all properties and recalculate scores
+        
+        Args:
+            limit: Max properties to process (None = all)
+            
+        Returns:
+            Statistics about the update
+        """
+        try:
+            start_time = datetime.utcnow()
+            total_processed = 0
+            total_updated = 0
+            total_errors = 0
+            errors = []
+            
+            # Get all properties (with or without findings)
+            query = {}
+            cursor = self.properties_collection.find(query, {"property_id": 1})
+            if limit:
+                cursor = cursor.limit(limit)
+            
+            # Process in batches
+            batch_size = 100
+            property_ids = []
+            
+            async for doc in cursor:
+                property_ids.append(doc["property_id"])
+                total_processed += 1
+                
+                if len(property_ids) >= batch_size:
+                    # Process batch
+                    for prop_id in property_ids:
+                        try:
+                            result = await self.enrichment_pipeline.update_dom_only(prop_id)
+                            if result:
+                                total_updated += 1
+                        except Exception as e:
+                            total_errors += 1
+                            errors.append(f"Property {prop_id}: {str(e)}")
+                            logger.error(f"Error updating DOM for {prop_id}: {e}")
+                    
+                    property_ids = []
+                    print(f"Processed {total_processed} properties, updated {total_updated}, errors {total_errors}")
+            
+            # Process remaining
+            for prop_id in property_ids:
+                try:
+                    result = await self.enrichment_pipeline.update_dom_only(prop_id)
+                    if result:
+                        total_updated += 1
+                except Exception as e:
+                    total_errors += 1
+                    errors.append(f"Property {prop_id}: {str(e)}")
+                    logger.error(f"Error updating DOM for {prop_id}: {e}")
+            
+            completed_at = datetime.utcnow()
+            duration = (completed_at - start_time).total_seconds()
+            
+            return {
+                "total_processed": total_processed,
+                "total_updated": total_updated,
+                "total_errors": total_errors,
+                "started_at": start_time,
+                "completed_at": completed_at,
+                "duration_seconds": duration,
+                "errors": errors[:50]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in update_dom_all: {e}")
+            return {
+                "total_processed": total_processed,
+                "total_updated": total_updated,
+                "total_errors": total_errors + 1,
+                "started_at": start_time,
+                "completed_at": datetime.utcnow(),
+                "duration_seconds": (datetime.utcnow() - start_time).total_seconds(),
+                "errors": errors + [str(e)]
+            }
 
 # Global database instance
 db = Database()

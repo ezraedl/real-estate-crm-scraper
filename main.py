@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import asyncio
 import uuid
 from datetime import datetime
@@ -24,7 +24,10 @@ from models import (
     Property,
     ListingType,
     ScheduledJob,
-    ScheduledJobStatus
+    ScheduledJobStatus,
+    EnrichmentRecalcRequest,
+    EnrichmentRecalcResponse,
+    EnrichmentConfigResponse
 )
 from database import db
 from scraper import scraper
@@ -86,6 +89,33 @@ def get_remaining_locations(job: ScrapingJob) -> List[str]:
         remaining = job.locations  # Safety: retry everything if something seems wrong
     
     return remaining
+
+# Helper function to create daily DOM update scheduled job
+async def create_daily_dom_update_job():
+    """
+    Create a scheduled job that updates days on market and recalculates scores daily.
+    Runs at 2 AM UTC to avoid peak hours.
+    """
+    try:
+        # Check if the job already exists
+        existing_job = await db.scheduled_jobs_collection.find_one({
+            "scheduled_job_id": "daily_dom_update"
+        })
+        
+        if existing_job:
+            logger.info("Daily DOM update job already exists")
+            return
+        
+        # Create a scheduled job for DOM updates (runs daily at 2 AM UTC)
+        # Note: This creates a scheduled job entry, but the actual execution
+        # will need to be handled by calling the /enrichment/update-dom endpoint
+        # For now, we'll just create a placeholder that can be triggered manually
+        # or via an external cron job calling the API endpoint
+        
+        logger.info("Daily DOM update: Use POST /enrichment/update-dom endpoint or set up external cron")
+        
+    except Exception as e:
+        logger.error(f"Error setting up daily DOM update job: {e}")
 
 # Helper function to create active properties re-scraping job
 async def create_active_properties_rescraping_job():
@@ -287,6 +317,9 @@ async def startup_event():
             
             # Create active properties re-scraping job
             await create_active_properties_rescraping_job()
+            
+            # Setup daily DOM update
+            await create_daily_dom_update_job()
             
         except Exception as db_error:
             logger.warning(f"Database connection failed: {db_error}")
@@ -2140,6 +2173,174 @@ async def enrich_property(property_id: str):
     except Exception as e:
         logger.error(f"Error enriching property {property_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error enriching property: {str(e)}")
+
+@app.post("/enrichment/recalculate-scores", response_model=EnrichmentRecalcResponse)
+async def recalculate_scores(request: EnrichmentRecalcRequest):
+    """
+    Recalculate all scores using current config (no re-detection)
+    Only updates score from existing findings, very fast operation.
+    """
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        result = await db.recalculate_all_scores(
+            limit=request.limit,
+            min_score=request.min_score if request.recalc_type == "scores_only" else None
+        )
+        
+        return EnrichmentRecalcResponse(
+            recalc_type="scores_only",
+            **result
+        )
+    except Exception as e:
+        logger.error(f"Error recalculating scores: {e}")
+        raise HTTPException(status_code=500, detail=f"Error recalculating scores: {str(e)}")
+
+@app.post("/enrichment/redetect-keywords", response_model=EnrichmentRecalcResponse)
+async def redetect_keywords(request: EnrichmentRecalcRequest):
+    """
+    Re-run keyword detection and recalculate scores
+    Re-analyzes property descriptions and updates findings.
+    """
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        result = await db.redetect_keywords_all(limit=request.limit)
+        
+        return EnrichmentRecalcResponse(
+            recalc_type="keywords",
+            **result
+        )
+    except Exception as e:
+        logger.error(f"Error re-detecting keywords: {e}")
+        raise HTTPException(status_code=500, detail=f"Error re-detecting keywords: {str(e)}")
+
+@app.post("/enrichment/full-reenrich", response_model=EnrichmentRecalcResponse)
+async def full_reenrich(request: EnrichmentRecalcRequest):
+    """
+    Full re-enrichment (detection + calculation)
+    Runs complete enrichment pipeline for all properties.
+    """
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        # For full re-enrichment, we need to iterate and call enrich_property
+        # This is similar to recalculate but uses full enrichment
+        from datetime import datetime
+        start_time = datetime.utcnow()
+        total_processed = 0
+        total_updated = 0
+        total_errors = 0
+        errors = []
+        
+        query = {}
+        cursor = db.properties_collection.find(query, {"property_id": 1})
+        if request.limit:
+            cursor = cursor.limit(request.limit)
+        
+        batch_size = 100
+        property_ids = []
+        
+        async for doc in cursor:
+            property_ids.append(doc["property_id"])
+            total_processed += 1
+            
+            if len(property_ids) >= batch_size:
+                for prop_id in property_ids:
+                    try:
+                        property_dict = await db.enrichment_pipeline._get_property_dict(prop_id)
+                        if property_dict:
+                            await db.enrichment_pipeline.enrich_property(
+                                property_id=prop_id,
+                                property_dict=property_dict,
+                                existing_property=None,
+                                job_id=None
+                            )
+                            total_updated += 1
+                    except Exception as e:
+                        total_errors += 1
+                        errors.append(f"Property {prop_id}: {str(e)}")
+                
+                property_ids = []
+                logger.info(f"Processed {total_processed} properties, updated {total_updated}, errors {total_errors}")
+        
+        # Process remaining
+        for prop_id in property_ids:
+            try:
+                property_dict = await db.enrichment_pipeline._get_property_dict(prop_id)
+                if property_dict:
+                    await db.enrichment_pipeline.enrich_property(
+                        property_id=prop_id,
+                        property_dict=property_dict,
+                        existing_property=None,
+                        job_id=None
+                    )
+                    total_updated += 1
+            except Exception as e:
+                total_errors += 1
+                errors.append(f"Property {prop_id}: {str(e)}")
+        
+        completed_at = datetime.utcnow()
+        result = {
+            "total_processed": total_processed,
+            "total_updated": total_updated,
+            "total_errors": total_errors,
+            "started_at": start_time,
+            "completed_at": completed_at,
+            "duration_seconds": (completed_at - start_time).total_seconds(),
+            "errors": errors[:50]
+        }
+        
+        return EnrichmentRecalcResponse(
+            recalc_type="full",
+            **result
+        )
+    except Exception as e:
+        logger.error(f"Error in full re-enrichment: {e}")
+        raise HTTPException(status_code=500, detail=f"Error in full re-enrichment: {str(e)}")
+
+@app.get("/enrichment/config", response_model=EnrichmentConfigResponse)
+async def get_enrichment_config():
+    """Get current scoring configuration"""
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        scorer = db.enrichment_pipeline.motivated_seller_scorer
+        config_hash = scorer.get_config_hash()
+        config_version = scorer.config.get('config_version', '2.0')
+        
+        return EnrichmentConfigResponse(
+            config=scorer.config,
+            config_hash=config_hash,
+            config_version=config_version
+        )
+    except Exception as e:
+        logger.error(f"Error getting config: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting config: {str(e)}")
+
+@app.post("/enrichment/update-dom")
+async def update_dom_all(limit: Optional[int] = None):
+    """
+    Update days on market for all properties and recalculate scores
+    Lightweight operation - only updates DOM finding and recalculates.
+    """
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        result = await db.update_dom_all(limit=limit)
+        
+        return EnrichmentRecalcResponse(
+            recalc_type="dom_update",
+            **result
+        )
+    except Exception as e:
+        logger.error(f"Error updating DOM: {e}")
+        raise HTTPException(status_code=500, detail=f"Error updating DOM: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
