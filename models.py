@@ -546,3 +546,27 @@ class ImmediateScrapeResponse(BaseModel):
 
 class PropertyIdsRequest(BaseModel):
     property_ids: List[str]
+
+class EnrichmentRecalcRequest(BaseModel):
+    """Request to recalculate enrichment scores"""
+    recalc_type: str = Field(..., description="Type of recalculation: 'scores_only', 'keywords', or 'full'")
+    limit: Optional[int] = Field(None, description="Max properties to update (None = all)")
+    min_score: Optional[float] = Field(None, description="Only recalc properties above this score (for scores_only)")
+
+class EnrichmentRecalcResponse(BaseModel):
+    """Response from enrichment recalculation"""
+    recalc_type: str
+    total_processed: int
+    total_updated: int
+    total_errors: int
+    started_at: datetime
+    completed_at: datetime
+    duration_seconds: float
+    errors: List[str] = Field(default_factory=list, description="List of error messages if any")
+
+class EnrichmentConfigResponse(BaseModel):
+    """Response with current enrichment configuration"""
+    config: Dict[str, Any]
+    config_hash: str
+    config_version: str
+    last_modified: Optional[datetime] = None

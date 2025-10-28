@@ -62,7 +62,12 @@ class HistoryTracker:
                     "new_price": price_data["new_price"],
                     "price_difference": price_data["price_difference"],
                     "percent_change": price_data["percent_change"],
-                    "change_type": price_data["change_type"]
+                    "change_type": price_data["change_type"],
+                    # Store status/listing_type for filtering
+                    "old_status": price_data.get("old_status"),
+                    "new_status": price_data.get("new_status"),
+                    "old_listing_type": price_data.get("old_listing_type"),
+                    "new_listing_type": price_data.get("new_listing_type")
                 },
                 "job_id": job_id,
                 "created_at": datetime.utcnow()

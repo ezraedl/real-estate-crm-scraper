@@ -175,9 +175,36 @@ class PropertyDiffer:
         else:
             return 'modified'
     
-    def get_price_change_summary(self, changes: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extract price change summary from detected changes"""
+    def get_price_change_summary(self, changes: Dict[str, Any], old_property: Optional[Dict[str, Any]] = None, new_property: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Extract price change summary from detected changes
+        
+        Only returns a price change if the listing_type remained the same.
+        Price changes between different listing types (e.g., for_rent to for_sale, for_sale to sold) are ignored.
+        
+        Note: Status changes (e.g., FOR_SALE to PENDING) within the same listing_type are OK and will be tracked.
+        """
         if not changes.get('price_changes'):
+            return None
+        
+        # Check if listing_type changed (not status - status can change within same listing_type)
+        listing_type_changed = False
+        
+        if old_property and new_property:
+            old_listing_type = old_property.get('listing_type')
+            new_listing_type = new_property.get('listing_type')
+            
+            # Only check listing_type change, not status
+            # Status can change (FOR_SALE -> PENDING -> FOR_SALE) but listing_type stays "for_sale"
+            if old_listing_type and new_listing_type and old_listing_type != new_listing_type:
+                listing_type_changed = True
+        
+        # If listing_type changed, don't record this as a price change
+        # This prevents false positives like for_rent ($1,500) -> for_sale ($250,000)
+        if listing_type_changed:
+            old_status = old_property.get('status') if old_property else None
+            new_status = new_property.get('status') if new_property else None
+            logger.info(f"Price change ignored due to listing_type change: {old_property.get('listing_type')} -> {new_property.get('listing_type')} (status: {old_status} -> {new_status})")
             return None
         
         price_changes = changes['price_changes']
@@ -201,7 +228,8 @@ class PropertyDiffer:
         price_diff = new_price - old_price
         percent_change = (price_diff / old_price) * 100 if old_price > 0 else 0
         
-        return {
+        # Include status and listing_type in the summary for later filtering
+        result = {
             'old_price': old_price,
             'new_price': new_price,
             'price_difference': price_diff,
@@ -209,6 +237,16 @@ class PropertyDiffer:
             'change_type': 'reduction' if price_diff < 0 else 'increase',
             'timestamp': list_price_change['timestamp']
         }
+        
+        # Store status and listing_type for filtering in history
+        if old_property:
+            result['old_status'] = old_property.get('status')
+            result['old_listing_type'] = old_property.get('listing_type')
+        if new_property:
+            result['new_status'] = new_property.get('status')
+            result['new_listing_type'] = new_property.get('listing_type')
+        
+        return result
     
     def get_status_change_summary(self, changes: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Extract status change summary from detected changes"""

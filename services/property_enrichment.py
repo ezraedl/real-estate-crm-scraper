@@ -67,7 +67,7 @@ class PropertyEnrichmentPipeline:
             changes = self.property_differ.detect_changes(existing_property, property_dict)
             
             # Step 2: Record history and change logs
-            await self._record_history_and_changes(property_id, changes, job_id)
+            await self._record_history_and_changes(property_id, changes, existing_property, property_dict, job_id)
             
             # Step 3: Analyze property description
             description = self._extract_description(property_dict)
@@ -76,14 +76,14 @@ class PropertyEnrichmentPipeline:
             # Step 4: Get history data for motivated seller scoring
             history_data = await self._get_history_data(property_id)
             
-            # Step 5: Calculate motivated seller score
+            # Step 5: Calculate motivated seller score (Phase 1 + Phase 2)
             motivated_seller = self.motivated_seller_scorer.calculate_motivated_score(
                 property_dict, text_analysis, history_data
             )
             
             # Step 6: Assemble enrichment data
             enrichment_data = self._assemble_enrichment_data(
-                changes, text_analysis, motivated_seller, property_dict
+                changes, text_analysis, motivated_seller, property_dict, history_data
             )
             
             # Step 7: Update property with enrichment data
@@ -98,11 +98,11 @@ class PropertyEnrichmentPipeline:
             logger.error(f"Error enriching property {property_id}: {e}")
             return self._create_error_enrichment(str(e))
     
-    async def _record_history_and_changes(self, property_id: str, changes: Dict[str, Any], job_id: Optional[str]):
+    async def _record_history_and_changes(self, property_id: str, changes: Dict[str, Any], old_property: Optional[Dict[str, Any]], new_property: Dict[str, Any], job_id: Optional[str]):
         """Record history and change logs"""
         try:
-            # Record price changes
-            price_summary = self.property_differ.get_price_change_summary(changes)
+            # Record price changes (only if status/listing_type didn't change)
+            price_summary = self.property_differ.get_price_change_summary(changes, old_property, new_property)
             if price_summary:
                 await self.history_tracker.record_price_change(property_id, price_summary, job_id)
             
@@ -166,9 +166,159 @@ class PropertyEnrichmentPipeline:
         
         return ""
     
-    def _assemble_enrichment_data(self, changes: Dict[str, Any], text_analysis: Dict[str, Any], motivated_seller: Dict[str, Any], property_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_timestamp(self, ts: Any) -> Optional[datetime]:
+        """Parse timestamp from various formats"""
+        if ts is None:
+            return None
+        if isinstance(ts, datetime):
+            # Remove timezone info if present
+            if ts.tzinfo:
+                return ts.replace(tzinfo=None)
+            return ts
+        if isinstance(ts, str):
+            try:
+                # Try ISO format
+                ts_clean = ts.replace('Z', '+00:00')
+                dt = datetime.fromisoformat(ts_clean)
+                if dt.tzinfo:
+                    dt = dt.replace(tzinfo=None)
+                return dt
+            except (ValueError, AttributeError):
+                return None
+        return None
+    
+    def _build_price_history_summary(self, price_history: List[Dict[str, Any]], current_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Build summary of price history"""
+        if not price_history:
+            return None
+        
+        try:
+            # Sort by timestamp ascending (oldest first)
+            def get_timestamp(entry):
+                ts = entry.get('timestamp') or entry.get('data', {}).get('timestamp')
+                parsed = self._parse_timestamp(ts)
+                return parsed if parsed else datetime.min
+            
+            sorted_history = sorted(price_history, key=get_timestamp)
+            
+            if not sorted_history:
+                return None
+            
+            # Get original price (from first entry's old_price)
+            first_entry = sorted_history[0]
+            data = first_entry.get('data', {})
+            original_price = data.get('old_price') or current_price
+            
+            # Get current price (from last entry's new_price, or use provided)
+            last_entry = sorted_history[-1]
+            data = last_entry.get('data', {})
+            current = current_price or data.get('new_price')
+            
+            if original_price is None or current is None:
+                return None
+            
+            # Find all price reductions
+            reductions = []
+            for entry in sorted_history:
+                entry_data = entry.get('data', {})
+                if entry_data.get('change_type') == 'reduction':
+                    price_diff = abs(entry_data.get('price_difference', 0))
+                    if price_diff > 0:
+                        ts = entry.get('timestamp') or entry_data.get('timestamp')
+                        parsed_ts = self._parse_timestamp(ts)
+                        reductions.append({
+                            'amount': price_diff,
+                            'percent': abs(entry_data.get('percent_change', 0)),
+                            'timestamp': parsed_ts
+                        })
+            
+            # Calculate totals
+            total_reduction = sum(r['amount'] for r in reductions)
+            total_reduction_percent = round((total_reduction / original_price) * 100, 2) if original_price > 0 else 0
+            number_of_reductions = len(reductions)
+            average_reduction = total_reduction / number_of_reductions if number_of_reductions > 0 else 0
+            
+            # Calculate days since last reduction
+            days_since_last_reduction = None
+            if reductions:
+                # Filter out None timestamps and find most recent
+                valid_reductions = [r for r in reductions if r['timestamp'] is not None]
+                if valid_reductions:
+                    last_reduction = max(valid_reductions, key=lambda x: x['timestamp'])
+                    if last_reduction['timestamp']:
+                        days_since_last_reduction = (datetime.utcnow() - last_reduction['timestamp']).days
+            
+            return {
+                'original_price': original_price,
+                'current_price': current,
+                'total_reductions': total_reduction,
+                'total_reduction_percent': total_reduction_percent,
+                'number_of_reductions': number_of_reductions,
+                'days_since_last_reduction': days_since_last_reduction,
+                'average_reduction_amount': round(average_reduction, 2)
+            }
+        except Exception as e:
+            logger.error(f"Error building price history summary: {e}")
+            return None
+    
+    def _build_status_history_summary(self, status_history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Build summary of status history"""
+        if not status_history:
+            return None
+        
+        try:
+            # Count times relisted (FOR_SALE after PENDING or OFF_MARKET)
+            times_relisted = sum(
+                1 for entry in status_history
+                if entry.get('data', {}).get('new_status') == 'FOR_SALE' 
+                and entry.get('data', {}).get('old_status') in ['PENDING', 'OFF_MARKET']
+            )
+            
+            # Get most recent status change
+            most_recent = status_history[0] if status_history else None
+            last_status_change = None
+            if most_recent:
+                ts = most_recent.get('timestamp')
+                last_status_change = self._parse_timestamp(ts)
+            
+            return {
+                'times_relisted': times_relisted,
+                'last_status_change': last_status_change.isoformat() if last_status_change else None,
+                'total_status_changes': len(status_history),
+                'time_as_active': None,  # Could be calculated if needed
+                'time_as_pending': None  # Could be calculated if needed
+            }
+        except Exception as e:
+            logger.error(f"Error building status history summary: {e}")
+            return None
+    
+    def _assemble_enrichment_data(self, changes: Dict[str, Any], text_analysis: Dict[str, Any], motivated_seller: Dict[str, Any], property_dict: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Assemble all enrichment data into final structure"""
-        return {
+        # Build price and status history summaries
+        price_history_summary = None
+        status_history_summary = None
+        
+        if history_data:
+            price_history = history_data.get('price_history', [])
+            current_price = None
+            if property_dict:
+                financial = property_dict.get('financial', {})
+                current_price = financial.get('list_price') or financial.get('original_list_price')
+            
+            price_history_summary = self._build_price_history_summary(price_history, current_price)
+            
+            status_history = history_data.get('status_history', [])
+            status_history_summary = self._build_status_history_summary(status_history)
+        
+        # Update has_price_reduction flag based on summary
+        has_price_reduction = False
+        if price_history_summary and price_history_summary.get('total_reductions', 0) > 0:
+            has_price_reduction = True
+        elif changes.get('summary', {}).get('price_changes_count', 0) > 0:
+            has_price_reduction = True
+        
+        # motivated_seller already includes findings from v2 scoring system
+        enrichment_data = {
             'motivated_seller': motivated_seller,
             'big_ticket_items': text_analysis.get('big_ticket_items', {}),
             'distress_signals': {
@@ -197,12 +347,21 @@ class PropertyEnrichmentPipeline:
             },
             'quick_access_flags': {
                 'is_motivated_seller': motivated_seller.get('score', 0) >= 40,
-                'has_price_reduction': changes.get('summary', {}).get('price_changes_count', 0) > 0,
+                'has_price_reduction': has_price_reduction,
                 'has_distress_signals': text_analysis.get('summary', {}).get('has_distress_signals', False)
             },
             'enriched_at': datetime.utcnow(),
             'enrichment_version': '1.0'
         }
+        
+        # Add history summaries if available
+        if price_history_summary:
+            enrichment_data['price_history_summary'] = price_history_summary
+        
+        if status_history_summary:
+            enrichment_data['status_history_summary'] = status_history_summary
+        
+        return enrichment_data
     
     async def _update_property_enrichment(self, property_id: str, enrichment_data: Dict[str, Any]):
         """Update property document with enrichment data"""
@@ -292,6 +451,188 @@ class PropertyEnrichmentPipeline:
     async def get_property_change_logs(self, property_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get property change logs"""
         return await self.history_tracker.get_property_change_logs(property_id, limit)
+    
+    async def recalculate_scores_only(self, property_id: str) -> Dict[str, Any]:
+        """
+        Recalculate scores from existing findings (Phase 2 only, skip detection)
+        
+        Args:
+            property_id: Property identifier
+            
+        Returns:
+            Updated motivated seller score data
+        """
+        try:
+            # Get existing enrichment data
+            property_doc = await self.db.properties.find_one(
+                {"property_id": property_id},
+                {"enrichment": 1}
+            )
+            
+            if not property_doc or 'enrichment' not in property_doc:
+                logger.warning(f"No enrichment found for property {property_id}")
+                return None
+            
+            enrichment = property_doc['enrichment']
+            motivated_seller = enrichment.get('motivated_seller', {})
+            findings = motivated_seller.get('findings')
+            
+            if not findings:
+                logger.warning(f"No findings found for property {property_id}, running full detection")
+                # Fall back to full enrichment
+                property_dict = await self._get_property_dict(property_id)
+                if not property_dict:
+                    return None
+                description = self._extract_description(property_dict)
+                text_analysis = self.text_analyzer.analyze_property_description(description)
+                history_data = await self._get_history_data(property_id)
+                motivated_seller = self.motivated_seller_scorer.calculate_motivated_score(
+                    property_dict, text_analysis, history_data
+                )
+            else:
+                # Recalculate from existing findings
+                motivated_seller = self.motivated_seller_scorer.calculate_score_from_findings(findings)
+            
+            # Update only the motivated_seller part of enrichment
+            await self._update_motivated_seller_score(property_id, motivated_seller)
+            
+            return motivated_seller
+            
+        except Exception as e:
+            logger.error(f"Error recalculating scores for property {property_id}: {e}")
+            return None
+    
+    async def detect_keywords_only(self, property_id: str) -> Dict[str, Any]:
+        """
+        Re-detect keywords and recalculate scores (re-run text analysis + recalculation)
+        
+        Args:
+            property_id: Property identifier
+            
+        Returns:
+            Updated motivated seller score data
+        """
+        try:
+            # Get property data
+            property_dict = await self._get_property_dict(property_id)
+            if not property_dict:
+                return None
+            
+            # Re-run text analysis
+            description = self._extract_description(property_dict)
+            text_analysis = self.text_analyzer.analyze_property_description(description)
+            
+            # Get existing history data
+            history_data = await self._get_history_data(property_id)
+            
+            # Get property basic data
+            property_basic = {
+                'days_on_mls': property_dict.get('days_on_mls', 0),
+                'scraped_at': property_dict.get('scraped_at')
+            }
+            
+            # Re-detect signals (Phase 1)
+            findings = self.motivated_seller_scorer.detect_signals(
+                property_basic, text_analysis, history_data
+            )
+            
+            # Recalculate scores (Phase 2)
+            motivated_seller = self.motivated_seller_scorer.calculate_score_from_findings(findings)
+            
+            # Update enrichment
+            await self._update_motivated_seller_score(property_id, motivated_seller)
+            
+            return motivated_seller
+            
+        except Exception as e:
+            logger.error(f"Error re-detecting keywords for property {property_id}: {e}")
+            return None
+    
+    async def update_dom_only(self, property_id: str) -> Dict[str, Any]:
+        """
+        Update only days on market finding and recalculate scores
+        
+        Args:
+            property_id: Property identifier
+            
+        Returns:
+            Updated motivated seller score data
+        """
+        try:
+            # Get property data
+            property_dict = await self._get_property_dict(property_id)
+            if not property_dict:
+                return None
+            
+            # Get existing findings
+            property_doc = await self.db.properties.find_one(
+                {"property_id": property_id},
+                {"enrichment.motivated_seller.findings": 1}
+            )
+            
+            if not property_doc or 'enrichment' not in property_doc:
+                return None
+            
+            findings = property_doc.get('enrichment', {}).get('motivated_seller', {}).get('findings')
+            
+            if not findings:
+                # No findings, run full detection
+                description = self._extract_description(property_dict)
+                text_analysis = self.text_analyzer.analyze_property_description(description)
+                history_data = await self._get_history_data(property_id)
+                motivated_seller = self.motivated_seller_scorer.calculate_motivated_score(
+                    property_dict, text_analysis, history_data
+                )
+            else:
+                # Update only DOM finding
+                property_basic = {
+                    'days_on_mls': property_dict.get('days_on_mls', 0)
+                }
+                dom_finding = self.motivated_seller_scorer._detect_days_on_market(property_basic)
+                findings['days_on_market'] = dom_finding
+                
+                # Recalculate scores
+                motivated_seller = self.motivated_seller_scorer.calculate_score_from_findings(findings)
+            
+            # Update enrichment
+            await self._update_motivated_seller_score(property_id, motivated_seller)
+            
+            return motivated_seller
+            
+        except Exception as e:
+            logger.error(f"Error updating DOM for property {property_id}: {e}")
+            return None
+    
+    async def _get_property_dict(self, property_id: str) -> Optional[Dict[str, Any]]:
+        """Get property data as dict"""
+        try:
+            property_doc = await self.db.properties.find_one(
+                {"property_id": property_id}
+            )
+            if property_doc:
+                property_doc["_id"] = str(property_doc["_id"])
+            return property_doc
+        except Exception as e:
+            logger.error(f"Error getting property {property_id}: {e}")
+            return None
+    
+    async def _update_motivated_seller_score(self, property_id: str, motivated_seller: Dict[str, Any]):
+        """Update only the motivated_seller part of enrichment"""
+        try:
+            update_data = {
+                "enrichment.motivated_seller": motivated_seller,
+                "enrichment.enriched_at": datetime.utcnow(),
+                "is_motivated_seller": motivated_seller.get('score', 0) >= 40,
+                "last_enriched_at": datetime.utcnow()
+            }
+            
+            await self.db.properties.update_one(
+                {"property_id": property_id},
+                {"$set": update_data}
+            )
+            logger.info(f"Updated motivated seller score for property {property_id}")
+        except Exception as e:
+            logger.error(f"Error updating motivated seller score for property {property_id}: {e}")
     
     async def get_motivated_sellers(self, min_score: int = 40, limit: int = 100) -> List[Dict[str, Any]]:
         """Get properties with motivated seller scores above threshold"""

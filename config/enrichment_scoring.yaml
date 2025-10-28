@@ -1,12 +1,19 @@
 # Motivated Seller Scoring Configuration
 # Adjust these values to fine-tune the scoring algorithm
 
+# Scoring Configuration Metadata
+config_version: "2.0"
+# Note: config_hash is auto-generated on load and used to track config changes
+# Changing weights only requires score recalculation (no re-detection)
+# Changing keywords requires full re-detection + score recalculation
+
 # Signal Weights (total should be ~100)
 # How important each signal type is in calculating the overall score
 signal_weights:
-  price_reductions: 50 # Strongest indicator - major price drops
-  days_on_market: 30 # Second strongest - time on market
-  distress_keywords: 15 # Keywords like "as-is", "must sell"
+  explicit_keywords: 50 # Highest priority - explicit "motivated seller" declarations
+  price_reductions: 30 # Strong indicator - major price drops
+  days_on_market: 15 # Time on market indicator
+  distress_keywords: 10 # Keywords like "as-is", "must sell"
   special_sale_type: 5 # Auction, REO, probate, etc.
   recent_activity: 0 # Recent changes/updates - disabled for now
 
@@ -20,13 +27,24 @@ price_reduction_thresholds:
 
 # Days on Market Scoring
 # Points awarded based on how long property has been on market
+# Updated to award more points earlier, as early DOM signals are strong motivation indicators
 days_on_market_thresholds:
-  very_long: { days: 270, score: 30 } # 9+ months = 30 points
-  long: { days: 180, score: 25 } # 6-9 months = 25 points
-  moderate: { days: 120, score: 18 } # 4-6 months = 18 points
-  short: { days: 90, score: 12 } # 3-4 months = 12 points
-  minimal: { days: 60, score: 6 } # 2-3 months = 6 points
-  very_short: { days: 0, score: 0 } # < 2 months = 0 points
+  very_long: { days: 180, score: 30 } # 6+ months = 30 points (reduced from 270)
+  long: { days: 120, score: 28 } # 4-6 months = 28 points (increased from 25)
+  moderate: { days: 90, score: 25 } # 3-4 months = 25 points (increased from 18)
+  short: { days: 60, score: 20 } # 2-3 months = 20 points (increased from 12)
+  minimal: { days: 30, score: 12 } # 1-2 months = 12 points (new threshold, was 6 at 60 days)
+  very_short: { days: 14, score: 6 } # 2 weeks-1 month = 6 points (new threshold)
+  immediate: { days: 0, score: 0 } # < 2 weeks = 0 points
+
+# Days Since Last Pending Bonus
+# Properties that came back from pending are often more motivated
+# This adds a multiplier/bonus based on how recently it returned from pending
+days_since_pending_bonus:
+  very_recent: { days: 7, score_multiplier: 1.5 } # Within 1 week of pending -> 50% bonus
+  recent: { days: 14, score_multiplier: 1.3 } # Within 2 weeks -> 30% bonus
+  moderate: { days: 30, score_multiplier: 1.2 } # Within 1 month -> 20% bonus
+  none: { days: null, score_multiplier: 1.0 } # Never pending or > 30 days -> no bonus
 
 # Distress Keywords Scoring
 # Points awarded for finding these keywords in property description
