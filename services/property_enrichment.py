@@ -111,9 +111,30 @@ class PropertyEnrichmentPipeline:
             if status_summary:
                 await self.history_tracker.record_status_change(property_id, status_summary, job_id)
             
-            # Record detailed change logs
+            # Record detailed change logs - ONLY for price, status, and listing_type fields
+            # This reduces storage by not tracking every field change (e.g., description text, images, etc.)
             if changes.get('field_changes'):
-                await self.history_tracker.record_change_logs(property_id, changes['field_changes'], job_id)
+                # Fields we care about tracking in change logs
+                tracked_fields = {
+                    # Price fields
+                    'financial.list_price',
+                    'financial.original_list_price',
+                    'financial.price_per_sqft',
+                    # Status fields
+                    'status',
+                    'mls_status',
+                    # Listing type
+                    'listing_type'
+                }
+                
+                # Filter to only tracked fields
+                filtered_changes = [
+                    change for change in changes['field_changes']
+                    if change.get('field') in tracked_fields
+                ]
+                
+                if filtered_changes:
+                    await self.history_tracker.record_change_logs(property_id, filtered_changes, job_id)
                 
         except Exception as e:
             logger.error(f"Error recording history for property {property_id}: {e}")

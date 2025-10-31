@@ -33,6 +33,17 @@ class HistoryTracker:
                 ("change_type", 1)
             ])
             
+            # TTL index for automatic cleanup - delete entries older than 90 days
+            # Note: MongoDB TTL cleanup runs every 60 seconds
+            try:
+                await self.history_collection.create_index(
+                    [("timestamp", 1)],
+                    expireAfterSeconds=7776000  # 90 days in seconds (90 * 24 * 60 * 60)
+                )
+                logger.info("Created TTL index on property_history.timestamp (90 days)")
+            except Exception as e:
+                logger.warning(f"TTL index may already exist: {e}")
+            
             # Change logs indexes
             await self.change_logs_collection.create_index([
                 ("property_id", 1),
@@ -46,6 +57,16 @@ class HistoryTracker:
                 ("job_id", 1)
             ])
             
+            # TTL index for change logs - delete entries older than 90 days
+            try:
+                await self.change_logs_collection.create_index(
+                    [("timestamp", 1)],
+                    expireAfterSeconds=7776000  # 90 days in seconds
+                )
+                logger.info("Created TTL index on property_change_logs.timestamp (90 days)")
+            except Exception as e:
+                logger.warning(f"TTL index may already exist: {e}")
+            
             logger.info("History tracker indexes created successfully")
         except Exception as e:
             logger.error(f"Error creating history tracker indexes: {e}")
@@ -53,6 +74,19 @@ class HistoryTracker:
     async def record_price_change(self, property_id: str, price_data: Dict[str, Any], job_id: Optional[str] = None) -> bool:
         """Record a price change in the history"""
         try:
+            # Check for duplicate entry to prevent storage bloat
+            existing = await self.history_collection.find_one({
+                "property_id": property_id,
+                "change_type": "price_change",
+                "data.old_price": price_data["old_price"],
+                "data.new_price": price_data["new_price"],
+                "timestamp": price_data["timestamp"]
+            })
+            
+            if existing:
+                logger.debug(f"Price change already recorded for property {property_id}, skipping duplicate")
+                return True
+            
             history_entry = {
                 "property_id": property_id,
                 "change_type": "price_change",
@@ -74,6 +108,27 @@ class HistoryTracker:
             }
             
             await self.history_collection.insert_one(history_entry)
+            
+            # Limit to last 100 price changes per property to prevent unbounded growth
+            count = await self.history_collection.count_documents({
+                "property_id": property_id,
+                "change_type": "price_change"
+            })
+            
+            if count > 100:
+                # Delete oldest entries beyond limit
+                oldest_cursor = self.history_collection.find(
+                    {"property_id": property_id, "change_type": "price_change"}
+                ).sort("timestamp", 1).limit(count - 100)
+                
+                ids_to_delete = []
+                async for entry in oldest_cursor:
+                    ids_to_delete.append(entry["_id"])
+                
+                if ids_to_delete:
+                    await self.history_collection.delete_many({"_id": {"$in": ids_to_delete}})
+                    logger.debug(f"Deleted {len(ids_to_delete)} old price change entries for property {property_id}")
+            
             logger.info(f"Recorded price change for property {property_id}: {price_data['old_price']} -> {price_data['new_price']}")
             return True
             
@@ -84,6 +139,19 @@ class HistoryTracker:
     async def record_status_change(self, property_id: str, status_data: Dict[str, Any], job_id: Optional[str] = None) -> bool:
         """Record a status change in the history"""
         try:
+            # Check for duplicate entry to prevent storage bloat
+            existing = await self.history_collection.find_one({
+                "property_id": property_id,
+                "change_type": "status_change",
+                "data.old_status": status_data["old_status"],
+                "data.new_status": status_data["new_status"],
+                "timestamp": status_data["timestamp"]
+            })
+            
+            if existing:
+                logger.debug(f"Status change already recorded for property {property_id}, skipping duplicate")
+                return True
+            
             history_entry = {
                 "property_id": property_id,
                 "change_type": "status_change",
@@ -97,6 +165,27 @@ class HistoryTracker:
             }
             
             await self.history_collection.insert_one(history_entry)
+            
+            # Limit to last 50 status changes per property
+            count = await self.history_collection.count_documents({
+                "property_id": property_id,
+                "change_type": "status_change"
+            })
+            
+            if count > 50:
+                # Delete oldest entries beyond limit
+                oldest_cursor = self.history_collection.find(
+                    {"property_id": property_id, "change_type": "status_change"}
+                ).sort("timestamp", 1).limit(count - 50)
+                
+                ids_to_delete = []
+                async for entry in oldest_cursor:
+                    ids_to_delete.append(entry["_id"])
+                
+                if ids_to_delete:
+                    await self.history_collection.delete_many({"_id": {"$in": ids_to_delete}})
+                    logger.debug(f"Deleted {len(ids_to_delete)} old status change entries for property {property_id}")
+            
             logger.info(f"Recorded status change for property {property_id}: {status_data['old_status']} -> {status_data['new_status']}")
             return True
             
@@ -112,6 +201,19 @@ class HistoryTracker:
             
             change_log_entries = []
             for change in changes:
+                # Check for duplicate entry to prevent storage bloat
+                existing = await self.change_logs_collection.find_one({
+                    "property_id": property_id,
+                    "field": change["field"],
+                    "old_value": change["old_value"],
+                    "new_value": change["new_value"],
+                    "timestamp": change["timestamp"]
+                })
+                
+                if existing:
+                    logger.debug(f"Change log already exists for property {property_id}, field {change['field']}, skipping duplicate")
+                    continue
+                
                 log_entry = {
                     "property_id": property_id,
                     "field": change["field"],
@@ -126,6 +228,26 @@ class HistoryTracker:
             
             if change_log_entries:
                 await self.change_logs_collection.insert_many(change_log_entries)
+                
+                # Limit to last 200 change logs per property
+                count = await self.change_logs_collection.count_documents({
+                    "property_id": property_id
+                })
+                
+                if count > 200:
+                    # Delete oldest entries beyond limit
+                    oldest_cursor = self.change_logs_collection.find(
+                        {"property_id": property_id}
+                    ).sort("timestamp", 1).limit(count - 200)
+                    
+                    ids_to_delete = []
+                    async for entry in oldest_cursor:
+                        ids_to_delete.append(entry["_id"])
+                    
+                    if ids_to_delete:
+                        await self.change_logs_collection.delete_many({"_id": {"$in": ids_to_delete}})
+                        logger.debug(f"Deleted {len(ids_to_delete)} old change log entries for property {property_id}")
+                
                 logger.info(f"Recorded {len(change_log_entries)} change logs for property {property_id}")
             
             return True
