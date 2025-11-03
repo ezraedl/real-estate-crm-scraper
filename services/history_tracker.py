@@ -3,6 +3,9 @@ History Tracker Service
 
 Records property history (price changes, status changes) and detailed change logs
 in dedicated MongoDB collections for auditing and analytics.
+
+Change logs are now embedded in the properties collection for better efficiency.
+Only tracks price, status, and listing_type changes.
 """
 
 from typing import Dict, List, Any, Optional
@@ -12,13 +15,27 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
 
+# Fields we track in change logs (only price, status, listing_type)
+TRACKED_CHANGE_LOG_FIELDS = {
+    'financial.list_price',
+    'financial.original_list_price',
+    'financial.price_per_sqft',
+    'status',
+    'mls_status',
+    'listing_type'
+}
+
 class HistoryTracker:
     """Manages property history and change logging"""
     
     def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
-        self.history_collection = db.property_history
-        self.change_logs_collection = db.property_change_logs
+        # Note: property_history collection still exists but is no longer actively used
+        # We now use embedded change_logs in properties collection as single source of truth
+        # Keeping reference for backward compatibility and potential future cleanup
+        # Access collection using bracket notation for Motor compatibility
+        self.history_collection = db['property_history']
+        self.properties_collection = db['properties']
     
     async def initialize(self):
         """Create necessary indexes for history collections"""
@@ -44,28 +61,24 @@ class HistoryTracker:
             except Exception as e:
                 logger.warning(f"TTL index may already exist: {e}")
             
-            # Change logs indexes
-            await self.change_logs_collection.create_index([
-                ("property_id", 1),
-                ("timestamp", -1)
-            ])
-            await self.change_logs_collection.create_index([
-                ("property_id", 1),
-                ("field", 1)
-            ])
-            await self.change_logs_collection.create_index([
-                ("job_id", 1)
-            ])
-            
-            # TTL index for change logs - delete entries older than 90 days
+            # Change logs are now embedded in properties collection
+            # Create indexes on embedded change_logs array
             try:
-                await self.change_logs_collection.create_index(
-                    [("timestamp", 1)],
-                    expireAfterSeconds=7776000  # 90 days in seconds
-                )
-                logger.info("Created TTL index on property_change_logs.timestamp (90 days)")
+                await self.properties_collection.create_index([
+                    ("change_logs.field", 1),
+                    ("change_logs.change_type", 1)
+                ])
+                logger.info("Created index on properties.change_logs.field and change_type")
             except Exception as e:
-                logger.warning(f"TTL index may already exist: {e}")
+                logger.warning(f"Index may already exist: {e}")
+            
+            try:
+                await self.properties_collection.create_index([
+                    ("change_logs.timestamp", -1)
+                ])
+                logger.info("Created index on properties.change_logs.timestamp")
+            except Exception as e:
+                logger.warning(f"Index may already exist: {e}")
             
             logger.info("History tracker indexes created successfully")
         except Exception as e:
@@ -194,67 +207,191 @@ class HistoryTracker:
             return False
     
     async def record_change_logs(self, property_id: str, changes: List[Dict[str, Any]], job_id: Optional[str] = None) -> bool:
-        """Record detailed field-level changes"""
+        """
+        Record detailed field-level changes - ONLY price, status, and listing_type
+        
+        Change logs are embedded in the properties collection as an array.
+        Groups changes by timestamp (same date) into single entries for efficiency.
+        Only tracks: financial.list_price, financial.original_list_price, financial.price_per_sqft,
+                     status, mls_status, listing_type
+        """
         try:
             if not changes:
                 return True
             
-            change_log_entries = []
-            for change in changes:
-                # Check for duplicate entry to prevent storage bloat
-                existing = await self.change_logs_collection.find_one({
-                    "property_id": property_id,
-                    "field": change["field"],
-                    "old_value": change["old_value"],
-                    "new_value": change["new_value"],
-                    "timestamp": change["timestamp"]
-                })
+            # Filter to only tracked fields (should already be filtered upstream, but double-check)
+            filtered_changes = [
+                change for change in changes
+                if change.get("field") in TRACKED_CHANGE_LOG_FIELDS
+            ]
+            
+            if not filtered_changes:
+                return True
+            
+            # Get existing property to check for duplicates
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
+            
+            existing_change_logs = property_doc.get("change_logs", []) if property_doc else []
+            
+            # Normalize timestamps to date (group changes on same day)
+            def normalize_timestamp(ts):
+                """Normalize timestamp to date (remove time component)"""
+                if ts is None:
+                    return datetime.utcnow().date()
+                if isinstance(ts, datetime):
+                    return ts.date()
+                if isinstance(ts, str):
+                    try:
+                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                        if dt.tzinfo:
+                            dt = dt.replace(tzinfo=None)
+                        return dt.date()
+                    except:
+                        return datetime.utcnow().date()
+                return datetime.utcnow().date()
+            
+            # Group changes by normalized date (same date = same entry)
+            from collections import defaultdict
+            changes_by_date = defaultdict(list)
+            
+            for change in filtered_changes:
+                timestamp = change.get("timestamp")
+                normalized_date = normalize_timestamp(timestamp)
+                changes_by_date[normalized_date].append(change)
+            
+            # Create new consolidated change log entries
+            cutoff_date = datetime.utcnow() - timedelta(days=90)  # TTL: 90 days
+            new_entries = []
+            
+            for change_date, date_changes in changes_by_date.items():
+                # Create a datetime from the date for timestamp
+                change_datetime = datetime.combine(change_date, datetime.min.time())
                 
-                if existing:
-                    logger.debug(f"Change log already exists for property {property_id}, field {change['field']}, skipping duplicate")
+                # Check TTL
+                if change_datetime < cutoff_date:
+                    logger.debug(f"Change log older than 90 days, skipping TTL")
                     continue
                 
-                log_entry = {
-                    "property_id": property_id,
-                    "field": change["field"],
-                    "old_value": change["old_value"],
-                    "new_value": change["new_value"],
-                    "change_type": change["change_type"],
-                    "timestamp": change["timestamp"],
-                    "job_id": job_id,
-                    "created_at": datetime.utcnow()
+                # Build consolidated entry with all fields that changed on this date
+                # Check for duplicates - see if we already have changes with same fields/values on this date
+                existing_for_date = [
+                    log for log in existing_change_logs
+                    if log.get("timestamp") and normalize_timestamp(log.get("timestamp")) == change_date
+                ]
+                
+                # Check each field change for duplicates
+                field_changes_to_record = []
+                for change in date_changes:
+                    field = change.get("field")
+                    old_val = change.get("old_value")
+                    new_val = change.get("new_value")
+                    
+                    # Check if this exact change already exists for this date
+                    is_duplicate = any(
+                        (log.get("field") == field or 
+                         (isinstance(log.get("field_changes"), dict) and field in log.get("field_changes", {}))) and
+                        self._get_log_old_value(log, field) == old_val and
+                        self._get_log_new_value(log, field) == new_val
+                        for log in existing_for_date
+                    )
+                    
+                    if not is_duplicate:
+                        field_changes_to_record.append(change)
+                
+                if not field_changes_to_record:
+                    continue
+                
+                # Create consolidated entry - if multiple fields, group them; if single, use simple format
+                if len(field_changes_to_record) == 1:
+                    # Single field change - use simple format (backward compatible)
+                    change = field_changes_to_record[0]
+                    log_entry = {
+                        "field": change.get("field"),
+                        "old_value": change.get("old_value"),
+                        "new_value": change.get("new_value"),
+                        "change_type": change.get("change_type"),
+                        "timestamp": change_datetime,
+                        "job_id": job_id,
+                        "created_at": datetime.utcnow()
+                    }
+                else:
+                    # Multiple fields changed on same date - use consolidated format
+                    field_changes_dict = {}
+                    for change in field_changes_to_record:
+                        field = change.get("field")
+                        field_changes_dict[field] = {
+                            "old_value": change.get("old_value"),
+                            "new_value": change.get("new_value"),
+                            "change_type": change.get("change_type")
+                        }
+                    
+                    log_entry = {
+                        "field": None,  # None indicates consolidated entry
+                        "field_changes": field_changes_dict,  # All fields that changed
+                        "timestamp": change_datetime,
+                        "job_id": job_id,
+                        "created_at": datetime.utcnow(),
+                        "change_count": len(field_changes_to_record)
+                    }
+                
+                new_entries.append(log_entry)
+            
+            if not new_entries:
+                return True
+            
+            # Get current change_logs and add new ones
+            current_change_logs = existing_change_logs.copy()
+            current_change_logs.extend(new_entries)
+            
+            # Sort by timestamp (newest first) and limit to 200 most recent
+            current_change_logs.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            current_change_logs = current_change_logs[:200]  # Keep only 200 most recent
+            
+            # Also filter out entries older than 90 days
+            current_change_logs = [
+                log for log in current_change_logs
+                if not log.get("timestamp") or (isinstance(log.get("timestamp"), datetime) and log.get("timestamp") >= cutoff_date)
+            ]
+            
+            # Update property with embedded change_logs
+            await self.properties_collection.update_one(
+                {"property_id": property_id},
+                {
+                    "$set": {
+                        "change_logs": current_change_logs,
+                        "change_logs_updated_at": datetime.utcnow()
+                    }
                 }
-                change_log_entries.append(log_entry)
+            )
             
-            if change_log_entries:
-                await self.change_logs_collection.insert_many(change_log_entries)
-                
-                # Limit to last 200 change logs per property
-                count = await self.change_logs_collection.count_documents({
-                    "property_id": property_id
-                })
-                
-                if count > 200:
-                    # Delete oldest entries beyond limit
-                    oldest_cursor = self.change_logs_collection.find(
-                        {"property_id": property_id}
-                    ).sort("timestamp", 1).limit(count - 200)
-                    
-                    ids_to_delete = []
-                    async for entry in oldest_cursor:
-                        ids_to_delete.append(entry["_id"])
-                    
-                    if ids_to_delete:
-                        await self.change_logs_collection.delete_many({"_id": {"$in": ids_to_delete}})
-                        logger.debug(f"Deleted {len(ids_to_delete)} old change log entries for property {property_id}")
-                
-                logger.info(f"Recorded {len(change_log_entries)} change logs for property {property_id}")
-            
+            total_changes = sum(
+                entry.get("change_count", 1) for entry in new_entries
+            )
+            logger.info(f"Recorded {len(new_entries)} change log entry/entries ({total_changes} total field changes) for property {property_id} (total: {len(current_change_logs)})")
             return True
             
         except Exception as e:
             logger.error(f"Error recording change logs for property {property_id}: {e}")
             return False
+    
+    def _get_log_old_value(self, log_entry: Dict[str, Any], field: str) -> Any:
+        """Get old value from log entry (supports both simple and consolidated formats)"""
+        if log_entry.get("field") == field:
+            return log_entry.get("old_value")
+        elif isinstance(log_entry.get("field_changes"), dict):
+            return log_entry.get("field_changes", {}).get(field, {}).get("old_value")
+        return None
+    
+    def _get_log_new_value(self, log_entry: Dict[str, Any], field: str) -> Any:
+        """Get new value from log entry (supports both simple and consolidated formats)"""
+        if log_entry.get("field") == field:
+            return log_entry.get("new_value")
+        elif isinstance(log_entry.get("field_changes"), dict):
+            return log_entry.get("field_changes", {}).get(field, {}).get("new_value")
+        return None
     
     async def get_property_history(self, property_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Get property history (price and status changes)"""
@@ -275,36 +412,98 @@ class HistoryTracker:
             return []
     
     async def get_property_change_logs(self, property_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get detailed change logs for a property"""
+        """Get detailed change logs for a property (from embedded array)"""
         try:
-            cursor = self.change_logs_collection.find(
-                {"property_id": property_id}
-            ).sort("timestamp", -1).limit(limit)
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
-            change_logs = []
-            async for entry in cursor:
-                entry["_id"] = str(entry["_id"])
-                change_logs.append(entry)
+            if not property_doc or "change_logs" not in property_doc:
+                return []
             
-            return change_logs
+            change_logs = property_doc.get("change_logs", [])
+            
+            # Sort by timestamp (newest first) and limit
+            change_logs.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            
+            return change_logs[:limit]
             
         except Exception as e:
             logger.error(f"Error getting change logs for {property_id}: {e}")
             return []
     
     async def get_price_history(self, property_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get price history for a property"""
+        """Get price history for a property (from embedded change_logs)"""
         try:
-            cursor = self.history_collection.find(
-                {
-                    "property_id": property_id,
-                    "change_type": "price_change"
-                }
-            ).sort("timestamp", -1).limit(limit)
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
+            if not property_doc or "change_logs" not in property_doc:
+                return []
+            
+            change_logs = property_doc.get("change_logs", [])
+            
+            # Filter to price-related fields (supports both simple and consolidated formats)
+            price_fields = {'financial.list_price', 'financial.original_list_price', 'financial.price_per_sqft'}
+            price_changes = []
+            
+            for log in change_logs:
+                # Handle simple format (single field)
+                if log.get("field") and log.get("field") in price_fields:
+                    price_changes.append({
+                        "field": log.get("field"),
+                        "old_value": log.get("old_value"),
+                        "new_value": log.get("new_value"),
+                        "timestamp": log.get("timestamp"),
+                        "job_id": log.get("job_id"),
+                        "created_at": log.get("created_at")
+                    })
+                # Handle consolidated format (multiple fields in one entry)
+                elif isinstance(log.get("field_changes"), dict):
+                    field_changes = log.get("field_changes", {})
+                    for field, change_data in field_changes.items():
+                        if field in price_fields:
+                            price_changes.append({
+                                "field": field,
+                                "old_value": change_data.get("old_value"),
+                                "new_value": change_data.get("new_value"),
+                                "timestamp": log.get("timestamp"),
+                                "job_id": log.get("job_id"),
+                                "created_at": log.get("created_at")
+                            })
+            
+            # Sort by timestamp (newest first) and limit
+            price_changes.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            
+            # Convert to price_history format for backward compatibility
             price_history = []
-            async for entry in cursor:
-                entry["_id"] = str(entry["_id"])
+            for log in price_changes[:limit]:
+                old_value = log.get("old_value")
+                new_value = log.get("new_value")
+                if old_value is None or new_value is None:
+                    continue
+                
+                # Calculate price difference
+                price_diff = new_value - old_value
+                percent_change = ((price_diff / old_value) * 100) if old_value > 0 else 0
+                
+                entry = {
+                    "property_id": property_id,
+                    "change_type": "price_change",
+                    "timestamp": log.get("timestamp"),
+                    "data": {
+                        "old_price": old_value,
+                        "new_price": new_value,
+                        "price_difference": price_diff,
+                        "percent_change": percent_change,
+                        "change_type": "reduction" if price_diff < 0 else "increase"
+                    },
+                    "job_id": log.get("job_id"),
+                    "created_at": log.get("created_at")
+                }
                 price_history.append(entry)
             
             return price_history
@@ -314,18 +513,64 @@ class HistoryTracker:
             return []
     
     async def get_status_history(self, property_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get status history for a property"""
+        """Get status history for a property (from embedded change_logs)"""
         try:
-            cursor = self.history_collection.find(
-                {
-                    "property_id": property_id,
-                    "change_type": "status_change"
-                }
-            ).sort("timestamp", -1).limit(limit)
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
+            if not property_doc or "change_logs" not in property_doc:
+                return []
+            
+            change_logs = property_doc.get("change_logs", [])
+            
+            # Filter to status-related fields (supports both simple and consolidated formats)
+            status_fields = {'status', 'mls_status'}
+            status_changes = []
+            
+            for log in change_logs:
+                # Handle simple format (single field)
+                if log.get("field") and log.get("field") in status_fields:
+                    status_changes.append({
+                        "field": log.get("field"),
+                        "old_value": log.get("old_value"),
+                        "new_value": log.get("new_value"),
+                        "timestamp": log.get("timestamp"),
+                        "job_id": log.get("job_id"),
+                        "created_at": log.get("created_at")
+                    })
+                # Handle consolidated format (multiple fields in one entry)
+                elif isinstance(log.get("field_changes"), dict):
+                    field_changes = log.get("field_changes", {})
+                    for field, change_data in field_changes.items():
+                        if field in status_fields:
+                            status_changes.append({
+                                "field": field,
+                                "old_value": change_data.get("old_value"),
+                                "new_value": change_data.get("new_value"),
+                                "timestamp": log.get("timestamp"),
+                                "job_id": log.get("job_id"),
+                                "created_at": log.get("created_at")
+                            })
+            
+            # Sort by timestamp (newest first) and limit
+            status_changes.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            
+            # Convert to status_history format for backward compatibility
             status_history = []
-            async for entry in cursor:
-                entry["_id"] = str(entry["_id"])
+            for log in status_changes[:limit]:
+                entry = {
+                    "property_id": property_id,
+                    "change_type": "status_change",
+                    "timestamp": log.get("timestamp"),
+                    "data": {
+                        "old_status": log.get("old_value"),
+                        "new_status": log.get("new_value")
+                    },
+                    "job_id": log.get("job_id"),
+                    "created_at": log.get("created_at")
+                }
                 status_history.append(entry)
             
             return status_history
@@ -335,41 +580,109 @@ class HistoryTracker:
             return []
     
     async def get_recent_changes(self, property_id: str, days: int = 30) -> Dict[str, Any]:
-        """Get recent changes summary for a property"""
+        """Get recent changes summary for a property (from embedded change_logs)"""
         try:
             cutoff_date = datetime.utcnow() - timedelta(days=days)
             
-            # Get recent history entries
-            history_cursor = self.history_collection.find(
-                {
-                    "property_id": property_id,
-                    "timestamp": {"$gte": cutoff_date}
-                }
-            ).sort("timestamp", -1)
-            
-            # Get recent change logs
-            logs_cursor = self.change_logs_collection.find(
-                {
-                    "property_id": property_id,
-                    "timestamp": {"$gte": cutoff_date}
-                }
-            ).sort("timestamp", -1)
-            
-            recent_history = []
-            async for entry in history_cursor:
-                entry["_id"] = str(entry["_id"])
-                recent_history.append(entry)
+            # Get recent change logs from embedded array
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
             recent_logs = []
-            async for entry in logs_cursor:
-                entry["_id"] = str(entry["_id"])
-                recent_logs.append(entry)
+            if property_doc and "change_logs" in property_doc:
+                change_logs = property_doc.get("change_logs", [])
+                for log in change_logs:
+                    timestamp = log.get("timestamp")
+                    if timestamp and isinstance(timestamp, datetime):
+                        if timestamp >= cutoff_date:
+                            recent_logs.append(log)
+            
+            # Sort by timestamp
+            recent_logs.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            
+            # Build price_history and status_history from recent_logs for backward compatibility
+            price_history = []
+            status_history = []
+            
+            price_fields = {'financial.list_price', 'financial.original_list_price', 'financial.price_per_sqft'}
+            status_fields = {'status', 'mls_status'}
+            
+            for log in recent_logs:
+                # Handle simple format (single field)
+                if log.get("field"):
+                    field = log.get("field")
+                    old_value = log.get("old_value")
+                    new_value = log.get("new_value")
+                    
+                    if field in price_fields and old_value is not None and new_value is not None:
+                        price_diff = new_value - old_value
+                        percent_change = ((price_diff / old_value) * 100) if old_value > 0 else 0
+                        price_history.append({
+                            "property_id": property_id,
+                            "change_type": "price_change",
+                            "timestamp": log.get("timestamp"),
+                            "data": {
+                                "old_price": old_value,
+                                "new_price": new_value,
+                                "price_difference": price_diff,
+                                "percent_change": percent_change,
+                                "change_type": "reduction" if price_diff < 0 else "increase"
+                            }
+                        })
+                    elif field in status_fields:
+                        status_history.append({
+                            "property_id": property_id,
+                            "change_type": "status_change",
+                            "timestamp": log.get("timestamp"),
+                            "data": {
+                                "old_status": old_value,
+                                "new_status": new_value
+                            }
+                        })
+                # Handle consolidated format (multiple fields in one entry)
+                elif isinstance(log.get("field_changes"), dict):
+                    field_changes = log.get("field_changes", {})
+                    timestamp = log.get("timestamp")
+                    
+                    for field, change_data in field_changes.items():
+                        old_value = change_data.get("old_value")
+                        new_value = change_data.get("new_value")
+                        
+                        if field in price_fields and old_value is not None and new_value is not None:
+                            price_diff = new_value - old_value
+                            percent_change = ((price_diff / old_value) * 100) if old_value > 0 else 0
+                            price_history.append({
+                                "property_id": property_id,
+                                "change_type": "price_change",
+                                "timestamp": timestamp,
+                                "data": {
+                                    "old_price": old_value,
+                                    "new_price": new_value,
+                                    "price_difference": price_diff,
+                                    "percent_change": percent_change,
+                                    "change_type": "reduction" if price_diff < 0 else "increase"
+                                }
+                            })
+                        elif field in status_fields:
+                            status_history.append({
+                                "property_id": property_id,
+                                "change_type": "status_change",
+                                "timestamp": timestamp,
+                                "data": {
+                                    "old_status": old_value,
+                                    "new_status": new_value
+                                }
+                            })
             
             return {
-                "history": recent_history,
+                "history": price_history + status_history,  # Combined for backward compatibility
                 "change_logs": recent_logs,
+                "price_history": price_history,
+                "status_history": status_history,
                 "summary": {
-                    "history_count": len(recent_history),
+                    "history_count": len(price_history) + len(status_history),
                     "logs_count": len(recent_logs),
                     "days_analyzed": days
                 }
@@ -377,4 +690,4 @@ class HistoryTracker:
             
         except Exception as e:
             logger.error(f"Error getting recent changes for {property_id}: {e}")
-            return {"history": [], "change_logs": [], "summary": {"history_count": 0, "logs_count": 0, "days_analyzed": days}}
+            return {"history": [], "change_logs": [], "price_history": [], "status_history": [], "summary": {"history_count": 0, "logs_count": 0, "days_analyzed": days}}

@@ -99,20 +99,11 @@ class PropertyEnrichmentPipeline:
             return self._create_error_enrichment(str(e))
     
     async def _record_history_and_changes(self, property_id: str, changes: Dict[str, Any], old_property: Optional[Dict[str, Any]], new_property: Dict[str, Any], job_id: Optional[str]):
-        """Record history and change logs"""
+        """Record change logs - ONLY for price, status, and listing_type fields"""
         try:
-            # Record price changes (only if status/listing_type didn't change)
-            price_summary = self.property_differ.get_price_change_summary(changes, old_property, new_property)
-            if price_summary:
-                await self.history_tracker.record_price_change(property_id, price_summary, job_id)
-            
-            # Record status changes
-            status_summary = self.property_differ.get_status_change_summary(changes)
-            if status_summary:
-                await self.history_tracker.record_status_change(property_id, status_summary, job_id)
-            
             # Record detailed change logs - ONLY for price, status, and listing_type fields
-            # This reduces storage by not tracking every field change (e.g., description text, images, etc.)
+            # Note: We no longer use property_history collection - only embedded change_logs
+            # This reduces storage by using single source of truth
             if changes.get('field_changes'):
                 # Fields we care about tracking in change logs
                 tracked_fields = {
@@ -137,7 +128,7 @@ class PropertyEnrichmentPipeline:
                     await self.history_tracker.record_change_logs(property_id, filtered_changes, job_id)
                 
         except Exception as e:
-            logger.error(f"Error recording history for property {property_id}: {e}")
+            logger.error(f"Error recording change logs for property {property_id}: {e}")
     
     async def _get_history_data(self, property_id: str) -> Dict[str, Any]:
         """Get history data for motivated seller scoring"""
@@ -315,28 +306,19 @@ class PropertyEnrichmentPipeline:
     
     def _assemble_enrichment_data(self, changes: Dict[str, Any], text_analysis: Dict[str, Any], motivated_seller: Dict[str, Any], property_dict: Dict[str, Any], history_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Assemble all enrichment data into final structure"""
-        # Build price and status history summaries
-        price_history_summary = None
-        status_history_summary = None
-        
-        if history_data:
-            price_history = history_data.get('price_history', [])
-            current_price = None
-            if property_dict:
-                financial = property_dict.get('financial', {})
-                current_price = financial.get('list_price') or financial.get('original_list_price')
-            
-            price_history_summary = self._build_price_history_summary(price_history, current_price)
-            
-            status_history = history_data.get('status_history', [])
-            status_history_summary = self._build_status_history_summary(status_history)
-        
-        # Update has_price_reduction flag based on summary
+        # Calculate has_price_reduction flag from change_logs (dynamic calculation)
+        # No longer storing price_history_summary - calculated on-demand from change_logs
         has_price_reduction = False
-        if price_history_summary and price_history_summary.get('total_reductions', 0) > 0:
-            has_price_reduction = True
-        elif changes.get('summary', {}).get('price_changes_count', 0) > 0:
-            has_price_reduction = True
+        if changes.get('summary', {}).get('price_changes_count', 0) > 0:
+            # Check if any price change is a reduction
+            for change in changes.get('field_changes', []):
+                field = change.get('field', '')
+                if 'financial.list_price' in field or 'financial.original_list_price' in field:
+                    old_val = change.get('old_value')
+                    new_val = change.get('new_value')
+                    if old_val is not None and new_val is not None and new_val < old_val:
+                        has_price_reduction = True
+                        break
         
         # motivated_seller already includes findings from v2 scoring system
         enrichment_data = {
@@ -354,6 +336,11 @@ class PropertyEnrichmentPipeline:
                 'is_as_is': 'as_is' in text_analysis.get('special_sale_types', []),
                 'types_found': text_analysis.get('special_sale_types', [])
             },
+            'creative_financing': {
+                'categories_found': [cat for cat, data in text_analysis.get('creative_financing', {}).items() if data.get('found', False)],
+                'details': text_analysis.get('creative_financing', {}),
+                'has_creative_financing': text_analysis.get('summary', {}).get('has_creative_financing', False)
+            },
             'text_analysis': {
                 'keywords_found': text_analysis.get('keywords_found', []),
                 'total_keywords': text_analysis.get('summary', {}).get('total_keywords', 0),
@@ -366,36 +353,61 @@ class PropertyEnrichmentPipeline:
                 'status_changes_count': changes.get('summary', {}).get('status_changes_count', 0),
                 'is_new_property': changes.get('is_new_property', False)
             },
-            'quick_access_flags': {
-                'is_motivated_seller': motivated_seller.get('score', 0) >= 40,
-                'has_price_reduction': has_price_reduction,
-                'has_distress_signals': text_analysis.get('summary', {}).get('has_distress_signals', False)
-            },
+            # Removed quick_access_flags - using root-level flags only to avoid duplication
             'enriched_at': datetime.utcnow(),
-            'enrichment_version': '1.0'
+            'enrichment_version': '2.0'  # Version bump - removed price_history_summary and quick_access_flags
         }
-        
-        # Add history summaries if available
-        if price_history_summary:
-            enrichment_data['price_history_summary'] = price_history_summary
-        
-        if status_history_summary:
-            enrichment_data['status_history_summary'] = status_history_summary
         
         return enrichment_data
     
     async def _update_property_enrichment(self, property_id: str, enrichment_data: Dict[str, Any]):
         """Update property document with enrichment data"""
         try:
+            # Calculate flags from enrichment data (no longer using quick_access_flags)
+            is_motivated_seller = enrichment_data.get('motivated_seller', {}).get('score', 0) >= 40
+            has_distress_signals = enrichment_data.get('text_analysis', {}).get('summary', {}).get('has_distress_signals', False) or len(enrichment_data.get('distress_signals', {}).get('signals_found', [])) > 0
+            
+            # Calculate has_price_reduction from change_logs
+            # Check if property has price reductions in change_logs
+            # Handles both simple format (single field) and consolidated format (multiple fields same date)
+            property_doc = await self.db.properties.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
+            has_price_reduction = False
+            if property_doc and "change_logs" in property_doc:
+                change_logs = property_doc.get("change_logs", [])
+                price_fields = {'financial.list_price', 'financial.original_list_price'}
+                for log in change_logs:
+                    # Check simple format (single field change)
+                    if log.get("field") in price_fields:
+                        old_val = log.get("old_value")
+                        new_val = log.get("new_value")
+                        if old_val is not None and new_val is not None and new_val < old_val:
+                            has_price_reduction = True
+                            break
+                    # Check consolidated format (multiple fields changed on same date)
+                    elif log.get("field") is None and isinstance(log.get("field_changes"), dict):
+                        field_changes = log.get("field_changes", {})
+                        for field_name, change_data in field_changes.items():
+                            if field_name in price_fields:
+                                old_val = change_data.get("old_value")
+                                new_val = change_data.get("new_value")
+                                if old_val is not None and new_val is not None and new_val < old_val:
+                                    has_price_reduction = True
+                                    break
+                        if has_price_reduction:
+                            break
+            
             # Update the property document with enrichment data
             await self.db.properties.update_one(
                 {"property_id": property_id},
                 {
                     "$set": {
                         "enrichment": enrichment_data,
-                        "is_motivated_seller": enrichment_data['quick_access_flags']['is_motivated_seller'],
-                        "has_price_reduction": enrichment_data['quick_access_flags']['has_price_reduction'],
-                        "has_distress_signals": enrichment_data['quick_access_flags']['has_distress_signals'],
+                        "is_motivated_seller": is_motivated_seller,
+                        "has_price_reduction": has_price_reduction,
+                        "has_distress_signals": has_distress_signals,
                         "last_enriched_at": datetime.utcnow()
                     }
                 }
@@ -406,7 +418,7 @@ class PropertyEnrichmentPipeline:
     
     def _create_error_enrichment(self, error_message: str) -> Dict[str, Any]:
         """Create error enrichment data"""
-        return {
+        enrichment_data = {
             'motivated_seller': {
                 'score': 0,
                 'confidence': 'low',
@@ -427,6 +439,11 @@ class PropertyEnrichmentPipeline:
                 'is_as_is': False,
                 'types_found': []
             },
+            'creative_financing': {
+                'categories_found': [],
+                'details': {},
+                'has_creative_financing': False
+            },
             'text_analysis': {
                 'keywords_found': [],
                 'total_keywords': 0,
@@ -439,15 +456,11 @@ class PropertyEnrichmentPipeline:
                 'status_changes_count': 0,
                 'is_new_property': False
             },
-            'quick_access_flags': {
-                'is_motivated_seller': False,
-                'has_price_reduction': False,
-                'has_distress_signals': False
-            },
             'enriched_at': datetime.utcnow(),
-            'enrichment_version': '1.0',
+            'enrichment_version': '2.0',
             'error': error_message
         }
+        return enrichment_data
     
     async def get_property_enrichment(self, property_id: str) -> Optional[Dict[str, Any]]:
         """Get enrichment data for a property"""
@@ -560,8 +573,21 @@ class PropertyEnrichmentPipeline:
             # Recalculate scores (Phase 2)
             motivated_seller = self.motivated_seller_scorer.calculate_score_from_findings(findings)
             
-            # Update enrichment
-            await self._update_motivated_seller_score(property_id, motivated_seller)
+            # Get existing enrichment data to merge with new text analysis
+            property_doc = await self.db.properties.find_one(
+                {"property_id": property_id},
+                {"enrichment": 1}
+            )
+            
+            existing_enrichment = property_doc.get('enrichment', {}) if property_doc else {}
+            
+            # Update full enrichment data with new text analysis including creative financing
+            await self._update_enrichment_with_text_analysis(
+                property_id, 
+                motivated_seller, 
+                text_analysis,
+                existing_enrichment
+            )
             
             return motivated_seller
             
@@ -637,6 +663,59 @@ class PropertyEnrichmentPipeline:
             logger.error(f"Error getting property {property_id}: {e}")
             return None
     
+    async def _update_enrichment_with_text_analysis(
+        self, 
+        property_id: str, 
+        motivated_seller: Dict[str, Any],
+        text_analysis: Dict[str, Any],
+        existing_enrichment: Dict[str, Any]
+    ):
+        """Update enrichment data with new text analysis including creative financing"""
+        try:
+            # Merge existing enrichment with new text analysis
+            enrichment_updates = {
+                "enrichment.motivated_seller": motivated_seller,
+                "enrichment.big_ticket_items": text_analysis.get('big_ticket_items', {}),
+                "enrichment.distress_signals": {
+                    'signals_found': text_analysis.get('distress_signals', []),
+                    'motivated_keywords': text_analysis.get('motivated_keywords', [])
+                },
+                "enrichment.special_sale_types": {
+                    'is_auction': 'auction' in text_analysis.get('special_sale_types', []),
+                    'is_reo': 'reo' in text_analysis.get('special_sale_types', []),
+                    'is_probate': 'probate' in text_analysis.get('special_sale_types', []),
+                    'is_short_sale': 'short_sale' in text_analysis.get('special_sale_types', []),
+                    'is_as_is': 'as_is' in text_analysis.get('special_sale_types', []),
+                    'types_found': text_analysis.get('special_sale_types', [])
+                },
+                "enrichment.creative_financing": {
+                    'categories_found': [cat for cat, data in text_analysis.get('creative_financing', {}).items() if data.get('found', False)],
+                    'details': text_analysis.get('creative_financing', {}),
+                    'has_creative_financing': text_analysis.get('summary', {}).get('has_creative_financing', False)
+                },
+                "enrichment.text_analysis": {
+                    'keywords_found': text_analysis.get('keywords_found', []),
+                    'total_keywords': text_analysis.get('summary', {}).get('total_keywords', 0),
+                    'big_ticket_items_count': text_analysis.get('summary', {}).get('big_ticket_items_count', 0)
+                },
+                "enrichment.enriched_at": datetime.utcnow(),
+                "is_motivated_seller": motivated_seller.get('score', 0) >= 40,
+                "has_distress_signals": text_analysis.get('summary', {}).get('has_distress_signals', False) or len(text_analysis.get('distress_signals', [])) > 0,
+                "last_enriched_at": datetime.utcnow()
+            }
+            
+            # Preserve existing change_summary if it exists
+            if existing_enrichment.get('change_summary'):
+                enrichment_updates["enrichment.change_summary"] = existing_enrichment['change_summary']
+            
+            await self.db.properties.update_one(
+                {"property_id": property_id},
+                {"$set": enrichment_updates}
+            )
+            logger.info(f"Updated enrichment with text analysis (including creative financing) for property {property_id}")
+        except Exception as e:
+            logger.error(f"Error updating enrichment with text analysis for property {property_id}: {e}")
+    
     async def _update_motivated_seller_score(self, property_id: str, motivated_seller: Dict[str, Any]):
         """Update only the motivated_seller part of enrichment"""
         try:
@@ -670,7 +749,9 @@ class PropertyEnrichmentPipeline:
                     "address.formatted_address": 1,
                     "financial.list_price": 1,
                     "enrichment.motivated_seller": 1,
-                    "enrichment.quick_access_flags": 1,
+                    "is_motivated_seller": 1,
+                    "has_price_reduction": 1,
+                    "has_distress_signals": 1,
                     "days_on_mls": 1
                 }
             ).sort("enrichment.motivated_seller.score", -1).limit(limit)

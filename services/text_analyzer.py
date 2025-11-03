@@ -150,6 +150,46 @@ class TextAnalyzer:
             'short_sale': [r'\b(?:short sale|short sell|short sale approved)\b'],
             'as_is': [r'\b(?:as.?is|as is|sold as is)\b']
         }
+        
+        # Creative financing keywords - expanded based on database analysis
+        self.creative_financing_keywords = {
+            'owner_finance': [
+                r'\b(?:owner\s+financing|owner\s+financing\s+available|owner\s+financing\s+options?)\b',
+                r'\b(?:seller\s+will\s+carry|seller\s+carry|owner\s+carry)\b',
+                r'\b(?:contract\s+for\s+deed|land\s+contract|installment\s+contract)\b',
+                r'\b(?:no\s+bank\s+qualifying|no\s+qualifying|without\s+bank|no\s+bank\s+approval)\b',
+                r'\b(?:seller\s+(?:can|will|may)\s+offer\s+(?:owner\s+)?financing|seller\s+(?:offers?|provides?)\s+financing)\b',
+                r'\b(?:financing\s+available|owner\s+financing\s+terms?)\b'
+            ],
+            'subject_to': [
+                r'\b(?:subject\s+to\s+existing\s+mortgage|subject\s+to\s+mortgage|subject-to|sub2)\b',
+                r'\b(?:take\s+over\s+payments?|assume\s+payments?|takeover\s+payments?)\b',
+                r'\b(?:assumable\s+loan|assumable\s+mortgage|assumable)\b',
+                r'\b(?:assume\s+(?:loan|mortgage|payments?))\b'
+            ],
+            'lease_option': [
+                r'\b(?:rent\s+to\s+own|rent-to-own|rental\s+purchase)\b',
+                r'\b(?:lease\s+option|lease\s+with\s+option|lease\s+purchase\s+option)\b',
+                r'\b(?:lease\s+purchase|lease-purchase|lease\s+with\s+purchase)\b'
+            ],
+            'wrap_mortgage': [
+                r'\b(?:wrap\s+around|wraparound|wrap-around)\s+(?:mortgage|loan|note)\b',
+                r'\b(?:wrap\s+mortgage|wrap\s+loan|wrap\s+note)\b',
+                r'\b(?:wraparound\s+mortgage|wraparound\s+loan)\b'
+            ],
+            'distressed': [
+                r'\b(?:motivated\s+seller|motivated|seller\s+motivated)\b',
+                r'\b(?:must\s+sell|quick\s+sale|urgent\s+sale)\b',
+                r'\b(?:as\s+is|as-is|sold\s+as\s+is)\b',
+                r'\b(?:foreclosure|foreclosed|pre-foreclosure)\b'
+            ],
+            'partnership': [
+                r'\b(?:open\s+to\s+JV|open\s+to\s+joint\s+venture|JV\s+opportunity)\b',
+                r'\b(?:joint\s+venture|joint\s+venture\s+opportunity|JV)\b',
+                r'\b(?:partner\s+wanted|looking\s+for\s+partner|partner\s+opportunity)\b',
+                r'\b(?:investor\s+friendly|wholesale|deal\s+for\s+investor)\b'
+            ]
+        }
     
     def analyze_property_description(self, description: str) -> Dict[str, Any]:
         """
@@ -172,11 +212,13 @@ class TextAnalyzer:
             'distress_signals': self._find_distress_signals(text),
             'motivated_keywords': self._find_motivated_keywords(text),
             'special_sale_types': self._identify_special_sale_types(text),
+            'creative_financing': self._find_creative_financing_keywords(text),
             'keywords_found': self._extract_keywords(text),
             'summary': {
                 'has_distress_signals': False,
                 'has_motivated_keywords': False,
                 'has_special_sale_type': False,
+                'has_creative_financing': False,
                 'big_ticket_items_count': 0,
                 'total_keywords': 0
             }
@@ -186,6 +228,9 @@ class TextAnalyzer:
         analysis['summary']['has_distress_signals'] = len(analysis['distress_signals']) > 0
         analysis['summary']['has_motivated_keywords'] = len(analysis['motivated_keywords']) > 0
         analysis['summary']['has_special_sale_type'] = len(analysis['special_sale_types']) > 0
+        analysis['summary']['has_creative_financing'] = any(
+            category['found'] for category in analysis['creative_financing'].values()
+        )
         analysis['summary']['big_ticket_items_count'] = len([item for item in analysis['big_ticket_items'].values() if item['found']])
         analysis['summary']['total_keywords'] = len(analysis['keywords_found'])
         
@@ -262,6 +307,32 @@ class TextAnalyzer:
                     break
         return sale_types
     
+    def _find_creative_financing_keywords(self, text: str) -> Dict[str, Any]:
+        """Find creative financing keywords in the text"""
+        financing_found = {}
+        
+        for category, patterns in self.creative_financing_keywords.items():
+            keywords_matched = []
+            for pattern in patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                if matches:
+                    keywords_matched.extend(matches)
+            
+            if keywords_matched:
+                financing_found[category] = {
+                    'found': True,
+                    'keywords_found': list(set(keywords_matched)),  # Remove duplicates
+                    'count': len(keywords_matched)
+                }
+            else:
+                financing_found[category] = {
+                    'found': False,
+                    'keywords_found': [],
+                    'count': 0
+                }
+        
+        return financing_found
+    
     def _extract_keywords(self, text: str) -> List[str]:
         """Extract all relevant keywords found in the text"""
         all_keywords = []
@@ -278,6 +349,12 @@ class TextAnalyzer:
         # Extract motivated keywords
         all_keywords.extend(self._find_motivated_keywords(text))
         
+        # Extract creative financing keywords
+        creative_financing = self._find_creative_financing_keywords(text)
+        for category, data in creative_financing.items():
+            if data['found']:
+                all_keywords.extend(data['keywords_found'])
+        
         return list(set(all_keywords))  # Remove duplicates
     
     def _empty_analysis(self) -> Dict[str, Any]:
@@ -293,11 +370,20 @@ class TextAnalyzer:
             'distress_signals': [],
             'motivated_keywords': [],
             'special_sale_types': [],
+            'creative_financing': {
+                'owner_finance': {'found': False, 'keywords_found': [], 'count': 0},
+                'subject_to': {'found': False, 'keywords_found': [], 'count': 0},
+                'lease_option': {'found': False, 'keywords_found': [], 'count': 0},
+                'wrap_mortgage': {'found': False, 'keywords_found': [], 'count': 0},
+                'distressed': {'found': False, 'keywords_found': [], 'count': 0},
+                'partnership': {'found': False, 'keywords_found': [], 'count': 0}
+            },
             'keywords_found': [],
             'summary': {
                 'has_distress_signals': False,
                 'has_motivated_keywords': False,
                 'has_special_sale_type': False,
+                'has_creative_financing': False,
                 'big_ticket_items_count': 0,
                 'total_keywords': 0
             }
