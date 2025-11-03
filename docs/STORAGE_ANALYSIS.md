@@ -75,10 +75,24 @@ For 1,000 properties with enrichments:
 
 1. **Properties collection**: ~120MB (enrichment embedded)
 2. **property_history collection**: ~150MB (price/status changes)
-3. **property_change_logs collection**: ~200MB (field-level changes)
+3. **property_change_logs collection**: ~200MB (field-level changes) ⚠️ **LARGEST after properties**
 4. **Other collections** (jobs, etc.): ~42MB
 
 **Total**: ~512MB ✅ Matches your observation!
+
+**Note**: `property_change_logs` is typically the largest collection after `properties` because:
+
+- It was tracking ALL field changes (descriptions, images, contact info, etc.)
+- No cleanup mechanism existed
+- Every property update created multiple change log entries
+
+**After fixes**: This collection will be drastically reduced by:
+
+1. Field filtering (only price/status/listing_type tracked)
+2. TTL indexes (auto-delete > 90 days)
+3. Deduplication (no duplicate entries)
+4. Entry limits (max 200 per property)
+5. Cleanup script (removes existing old/duplicate/excess entries)
 
 ## Solutions (Priority Order)
 
@@ -189,6 +203,7 @@ Consider:
 **Change**: Only track price, status, and listing_type changes in `property_change_logs`.
 
 **Why**: Most field changes (description text, images, contact info, etc.) aren't needed for motivated seller scoring. We only need to track:
+
 - **Price fields**: `financial.list_price`, `financial.original_list_price`, `financial.price_per_sqft`
 - **Status fields**: `status`, `mls_status`
 - **Listing type**: `listing_type`

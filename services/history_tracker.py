@@ -3,6 +3,9 @@ History Tracker Service
 
 Records property history (price changes, status changes) and detailed change logs
 in dedicated MongoDB collections for auditing and analytics.
+
+Change logs are now embedded in the properties collection for better efficiency.
+Only tracks price, status, and listing_type changes.
 """
 
 from typing import Dict, List, Any, Optional
@@ -12,13 +15,24 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
 
+# Fields we track in change logs (only price, status, listing_type)
+TRACKED_CHANGE_LOG_FIELDS = {
+    'financial.list_price',
+    'financial.original_list_price',
+    'financial.price_per_sqft',
+    'status',
+    'mls_status',
+    'listing_type'
+}
+
 class HistoryTracker:
     """Manages property history and change logging"""
     
     def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
         self.history_collection = db.property_history
-        self.change_logs_collection = db.property_change_logs
+        self.properties_collection = db.properties
+        # Note: change_logs are now embedded in properties collection, not separate
     
     async def initialize(self):
         """Create necessary indexes for history collections"""
@@ -44,28 +58,24 @@ class HistoryTracker:
             except Exception as e:
                 logger.warning(f"TTL index may already exist: {e}")
             
-            # Change logs indexes
-            await self.change_logs_collection.create_index([
-                ("property_id", 1),
-                ("timestamp", -1)
-            ])
-            await self.change_logs_collection.create_index([
-                ("property_id", 1),
-                ("field", 1)
-            ])
-            await self.change_logs_collection.create_index([
-                ("job_id", 1)
-            ])
-            
-            # TTL index for change logs - delete entries older than 90 days
+            # Change logs are now embedded in properties collection
+            # Create indexes on embedded change_logs array
             try:
-                await self.change_logs_collection.create_index(
-                    [("timestamp", 1)],
-                    expireAfterSeconds=7776000  # 90 days in seconds
-                )
-                logger.info("Created TTL index on property_change_logs.timestamp (90 days)")
+                await self.properties_collection.create_index([
+                    ("change_logs.field", 1),
+                    ("change_logs.change_type", 1)
+                ])
+                logger.info("Created index on properties.change_logs.field and change_type")
             except Exception as e:
-                logger.warning(f"TTL index may already exist: {e}")
+                logger.warning(f"Index may already exist: {e}")
+            
+            try:
+                await self.properties_collection.create_index([
+                    ("change_logs.timestamp", -1)
+                ])
+                logger.info("Created index on properties.change_logs.timestamp")
+            except Exception as e:
+                logger.warning(f"Index may already exist: {e}")
             
             logger.info("History tracker indexes created successfully")
         except Exception as e:
@@ -194,62 +204,99 @@ class HistoryTracker:
             return False
     
     async def record_change_logs(self, property_id: str, changes: List[Dict[str, Any]], job_id: Optional[str] = None) -> bool:
-        """Record detailed field-level changes"""
+        """
+        Record detailed field-level changes - ONLY price, status, and listing_type
+        
+        Change logs are embedded in the properties collection as an array.
+        Only tracks: financial.list_price, financial.original_list_price, financial.price_per_sqft,
+                     status, mls_status, listing_type
+        """
         try:
             if not changes:
                 return True
             
-            change_log_entries = []
-            for change in changes:
-                # Check for duplicate entry to prevent storage bloat
-                existing = await self.change_logs_collection.find_one({
-                    "property_id": property_id,
-                    "field": change["field"],
-                    "old_value": change["old_value"],
-                    "new_value": change["new_value"],
-                    "timestamp": change["timestamp"]
-                })
+            # Filter to only tracked fields (should already be filtered upstream, but double-check)
+            filtered_changes = [
+                change for change in changes
+                if change.get("field") in TRACKED_CHANGE_LOG_FIELDS
+            ]
+            
+            if not filtered_changes:
+                return True
+            
+            # Get existing property to check for duplicates
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
+            
+            existing_change_logs = property_doc.get("change_logs", []) if property_doc else []
+            
+            # Create new change log entries (excluding duplicates)
+            cutoff_date = datetime.utcnow() - timedelta(days=90)  # TTL: 90 days
+            new_entries = []
+            
+            for change in filtered_changes:
+                # Check for duplicate
+                is_duplicate = any(
+                    log.get("field") == change.get("field") and
+                    log.get("old_value") == change.get("old_value") and
+                    log.get("new_value") == change.get("new_value") and
+                    log.get("timestamp") == change.get("timestamp")
+                    for log in existing_change_logs
+                )
                 
-                if existing:
+                if is_duplicate:
                     logger.debug(f"Change log already exists for property {property_id}, field {change['field']}, skipping duplicate")
                     continue
                 
+                # Check TTL (skip if older than 90 days)
+                timestamp = change.get("timestamp")
+                if timestamp and isinstance(timestamp, datetime):
+                    if timestamp < cutoff_date:
+                        logger.debug(f"Change log older than 90 days, skipping TTL")
+                        continue
+                
                 log_entry = {
-                    "property_id": property_id,
-                    "field": change["field"],
-                    "old_value": change["old_value"],
-                    "new_value": change["new_value"],
-                    "change_type": change["change_type"],
-                    "timestamp": change["timestamp"],
+                    "field": change.get("field"),
+                    "old_value": change.get("old_value"),
+                    "new_value": change.get("new_value"),
+                    "change_type": change.get("change_type"),
+                    "timestamp": change.get("timestamp"),
                     "job_id": job_id,
                     "created_at": datetime.utcnow()
                 }
-                change_log_entries.append(log_entry)
+                new_entries.append(log_entry)
             
-            if change_log_entries:
-                await self.change_logs_collection.insert_many(change_log_entries)
-                
-                # Limit to last 200 change logs per property
-                count = await self.change_logs_collection.count_documents({
-                    "property_id": property_id
-                })
-                
-                if count > 200:
-                    # Delete oldest entries beyond limit
-                    oldest_cursor = self.change_logs_collection.find(
-                        {"property_id": property_id}
-                    ).sort("timestamp", 1).limit(count - 200)
-                    
-                    ids_to_delete = []
-                    async for entry in oldest_cursor:
-                        ids_to_delete.append(entry["_id"])
-                    
-                    if ids_to_delete:
-                        await self.change_logs_collection.delete_many({"_id": {"$in": ids_to_delete}})
-                        logger.debug(f"Deleted {len(ids_to_delete)} old change log entries for property {property_id}")
-                
-                logger.info(f"Recorded {len(change_log_entries)} change logs for property {property_id}")
+            if not new_entries:
+                return True
             
+            # Get current change_logs and add new ones
+            current_change_logs = existing_change_logs.copy()
+            current_change_logs.extend(new_entries)
+            
+            # Sort by timestamp (newest first) and limit to 200 most recent
+            current_change_logs.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            current_change_logs = current_change_logs[:200]  # Keep only 200 most recent
+            
+            # Also filter out entries older than 90 days
+            current_change_logs = [
+                log for log in current_change_logs
+                if not log.get("timestamp") or (isinstance(log.get("timestamp"), datetime) and log.get("timestamp") >= cutoff_date)
+            ]
+            
+            # Update property with embedded change_logs
+            await self.properties_collection.update_one(
+                {"property_id": property_id},
+                {
+                    "$set": {
+                        "change_logs": current_change_logs,
+                        "change_logs_updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            logger.info(f"Recorded {len(new_entries)} change logs for property {property_id} (total: {len(current_change_logs)})")
             return True
             
         except Exception as e:
@@ -275,18 +322,22 @@ class HistoryTracker:
             return []
     
     async def get_property_change_logs(self, property_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get detailed change logs for a property"""
+        """Get detailed change logs for a property (from embedded array)"""
         try:
-            cursor = self.change_logs_collection.find(
-                {"property_id": property_id}
-            ).sort("timestamp", -1).limit(limit)
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
-            change_logs = []
-            async for entry in cursor:
-                entry["_id"] = str(entry["_id"])
-                change_logs.append(entry)
+            if not property_doc or "change_logs" not in property_doc:
+                return []
             
-            return change_logs
+            change_logs = property_doc.get("change_logs", [])
+            
+            # Sort by timestamp (newest first) and limit
+            change_logs.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
+            
+            return change_logs[:limit]
             
         except Exception as e:
             logger.error(f"Error getting change logs for {property_id}: {e}")
@@ -347,13 +398,11 @@ class HistoryTracker:
                 }
             ).sort("timestamp", -1)
             
-            # Get recent change logs
-            logs_cursor = self.change_logs_collection.find(
-                {
-                    "property_id": property_id,
-                    "timestamp": {"$gte": cutoff_date}
-                }
-            ).sort("timestamp", -1)
+            # Get recent change logs from embedded array
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
             recent_history = []
             async for entry in history_cursor:
@@ -361,9 +410,16 @@ class HistoryTracker:
                 recent_history.append(entry)
             
             recent_logs = []
-            async for entry in logs_cursor:
-                entry["_id"] = str(entry["_id"])
-                recent_logs.append(entry)
+            if property_doc and "change_logs" in property_doc:
+                change_logs = property_doc.get("change_logs", [])
+                for log in change_logs:
+                    timestamp = log.get("timestamp")
+                    if timestamp and isinstance(timestamp, datetime):
+                        if timestamp >= cutoff_date:
+                            recent_logs.append(log)
+            
+            # Sort by timestamp
+            recent_logs.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
             
             return {
                 "history": recent_history,

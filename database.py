@@ -93,6 +93,24 @@ class Database:
             await self.properties_collection.create_index([("enrichment.motivated_seller.score_uncapped", DESCENDING)])
             await self.properties_collection.create_index([("enrichment.motivated_seller.config_hash", ASCENDING)])
             
+            # Indexes for embedded change_logs array (only price, status, listing_type)
+            try:
+                await self.properties_collection.create_index([
+                    ("change_logs.field", ASCENDING),
+                    ("change_logs.change_type", ASCENDING)
+                ])
+                print("Created index on properties.change_logs.field and change_type")
+            except Exception as e:
+                print(f"Index may already exist: {e}")
+            
+            try:
+                await self.properties_collection.create_index([
+                    ("change_logs.timestamp", DESCENDING)
+                ])
+                print("Created index on properties.change_logs.timestamp")
+            except Exception as e:
+                print(f"Index may already exist: {e}")
+            
             print("Database indexes created successfully")
         except Exception as e:
             print(f"Error creating indexes: {e}")
