@@ -425,33 +425,13 @@ class Property(BaseModel):
             "primary_photo": self.primary_photo,
             "alt_photos": normalize_list(self.alt_photos),
             
-            # Contact information - normalize lists
-            "agent": {
-                "agent_id": self.agent.agent_id if self.agent else None,
-                "agent_name": self.agent.agent_name if self.agent else None,
-                "agent_email": self.agent.agent_email if self.agent else None,
-                "agent_phones": normalize_dict_list(self.agent.agent_phones if self.agent else None),
-                "agent_mls_set": self.agent.agent_mls_set if self.agent else None,
-                "agent_nrds_id": self.agent.agent_nrds_id if self.agent else None,
-            } if self.agent else {},
-            
-            "broker": {
-                "broker_id": self.broker.broker_id if self.broker else None,
-                "broker_name": self.broker.broker_name if self.broker else None,
-            } if self.broker else {},
-            
-            "builder": {
-                "builder_id": self.builder.builder_id if self.builder else None,
-                "builder_name": self.builder.builder_name if self.builder else None,
-            } if self.builder else {},
-            
-            "office": {
-                "office_id": self.office.office_id if self.office else None,
-                "office_mls_set": self.office.office_mls_set if self.office else None,
-                "office_name": self.office.office_name if self.office else None,
-                "office_email": self.office.office_email if self.office else None,
-                "office_phones": normalize_dict_list(self.office.office_phones if self.office else None),
-            } if self.office else {},
+            # Contact information - use IDs only (not full contact data)
+            # This ensures content_hash doesn't change when contact info changes
+            # Full contact data is stored in separate Contact collection
+            "agent_id": self.agent.agent_id if self.agent else None,
+            "broker_id": self.broker.broker_id if self.broker else None,
+            "builder_id": self.builder.builder_id if self.builder else None,
+            "office_id": self.office.office_id if self.office else None,
             
             # Additional data - normalize lists
             "new_construction": self.new_construction,
