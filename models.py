@@ -256,11 +256,17 @@ class Property(BaseModel):
     dates: PropertyDates
     location: PropertyLocation
     
-    # Contact information
+    # Contact information (nested - kept for backward compatibility)
     agent: Optional[PropertyAgent] = None
     broker: Optional[PropertyBroker] = None
     builder: Optional[PropertyBuilder] = None
     office: Optional[PropertyOffice] = None
+    
+    # Contact references (new - references to Contact collection in mls_scraper DB)
+    agent_id: Optional[str] = None  # Reference to Contact._id
+    broker_id: Optional[str] = None  # Reference to Contact._id
+    builder_id: Optional[str] = None  # Reference to Contact._id
+    office_id: Optional[str] = None  # Reference to Contact._id
     
     # URLs and references
     property_url: Optional[str] = None
