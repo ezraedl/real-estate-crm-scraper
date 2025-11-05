@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from config import settings
 from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
 from services import PropertyEnrichmentPipeline
+from services.contact_service import ContactService
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class Database:
         self.properties_collection = None
         self.scheduled_jobs_collection = None
         self.enrichment_pipeline = None
+        self.contact_service = ContactService()
     
     async def connect(self):
         """Connect to MongoDB"""
@@ -384,14 +386,45 @@ class Database:
                 
                 if existing_hash == new_hash:
                     # Content unchanged - only update days_on_mls and scraped_at
+                    # But also ensure contact IDs are preserved/updated if contacts exist
+                    update_fields = {
+                        "days_on_mls": property_data.days_on_mls,
+                        "scraped_at": property_data.scraped_at,
+                        "job_id": property_data.job_id
+                    }
+                    
+                    # Check if we need to create/update contacts (in case contacts weren't created before)
+                    if (property_data.agent and property_data.agent.agent_name and not existing_property.get("agent_id")) or \
+                       (property_data.broker and property_data.broker.broker_name and not existing_property.get("broker_id")) or \
+                       (property_data.builder and property_data.builder.builder_name and not existing_property.get("builder_id")) or \
+                       (property_data.office and property_data.office.office_name and not existing_property.get("office_id")):
+                        # Create/update contacts if they don't exist
+                        contact_ids = await self.contact_service.process_property_contacts(property_data)
+                        
+                        # Preserve existing contact IDs if they exist
+                        if existing_property.get("agent_id"):
+                            contact_ids["agent_id"] = existing_property.get("agent_id")
+                        if existing_property.get("broker_id"):
+                            contact_ids["broker_id"] = existing_property.get("broker_id")
+                        if existing_property.get("builder_id"):
+                            contact_ids["builder_id"] = existing_property.get("builder_id")
+                        if existing_property.get("office_id"):
+                            contact_ids["office_id"] = existing_property.get("office_id")
+                        
+                        # Add contact IDs to update
+                        if contact_ids.get("agent_id"):
+                            update_fields["agent_id"] = contact_ids["agent_id"]
+                        if contact_ids.get("broker_id"):
+                            update_fields["broker_id"] = contact_ids["broker_id"]
+                        if contact_ids.get("builder_id"):
+                            update_fields["builder_id"] = contact_ids["builder_id"]
+                        if contact_ids.get("office_id"):
+                            update_fields["office_id"] = contact_ids["office_id"]
+                    
                     result = await self.properties_collection.update_one(
                         {"property_id": property_data.property_id},
                         {
-                            "$set": {
-                                "days_on_mls": property_data.days_on_mls,
-                                "scraped_at": property_data.scraped_at,
-                                "job_id": property_data.job_id
-                            }
+                            "$set": update_fields
                         }
                     )
                     return {
@@ -401,6 +434,25 @@ class Database:
                     }
                 else:
                     # Content changed - update the property
+                    # First, create/update contacts and get contact IDs
+                    contact_ids = await self.contact_service.process_property_contacts(property_data)
+                    
+                    # Preserve existing contact IDs if they exist and new ones weren't created
+                    if existing_property.get("agent_id") and not contact_ids.get("agent_id"):
+                        contact_ids["agent_id"] = existing_property.get("agent_id")
+                    if existing_property.get("broker_id") and not contact_ids.get("broker_id"):
+                        contact_ids["broker_id"] = existing_property.get("broker_id")
+                    if existing_property.get("builder_id") and not contact_ids.get("builder_id"):
+                        contact_ids["builder_id"] = existing_property.get("builder_id")
+                    if existing_property.get("office_id") and not contact_ids.get("office_id"):
+                        contact_ids["office_id"] = existing_property.get("office_id")
+                    
+                    # Update property data with contact IDs
+                    property_data.agent_id = contact_ids.get("agent_id")
+                    property_data.broker_id = contact_ids.get("broker_id")
+                    property_data.builder_id = contact_ids.get("builder_id")
+                    property_data.office_id = contact_ids.get("office_id")
+                    
                     property_dict = property_data.dict(by_alias=True, exclude={"id"})
                     result = await self.properties_collection.replace_one(
                         {"property_id": property_data.property_id},
@@ -431,7 +483,15 @@ class Database:
                         "crm_properties_updated": crm_updated_count
                     }
             else:
-                # New property - insert it
+                # New property - create contacts and get contact IDs
+                contact_ids = await self.contact_service.process_property_contacts(property_data)
+                
+                # Update property data with contact IDs
+                property_data.agent_id = contact_ids.get("agent_id")
+                property_data.broker_id = contact_ids.get("broker_id")
+                property_data.builder_id = contact_ids.get("builder_id")
+                property_data.office_id = contact_ids.get("office_id")
+                
                 property_dict = property_data.dict(by_alias=True, exclude={"id"})
                 result = await self.properties_collection.insert_one(property_dict)
                 
