@@ -296,7 +296,7 @@ class Property(BaseModel):
     is_comp: bool = Field(default=False, description="Whether this property is a comp for another property")
     
     # CRM Integration
-    crm_property_ids: Optional[List[str]] = Field(default=None, description="List of CRM property IDs that reference this MLS property")
+    crm_property_ids: Optional[Dict[str, List[str]]] = Field(default=None, description="Nested dictionary of CRM property IDs per platform: { 'platform_name': ['id1', 'id2'] }")
     
     def generate_property_id(self) -> str:
         """Generate property_id as hash of formatted_address"""

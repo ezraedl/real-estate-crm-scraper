@@ -461,7 +461,12 @@ class Database:
                     )
                     
                     # Update CRM properties that reference this MLS property
-                    crm_updated_count = await self.update_crm_properties_from_mls(property_data.property_id)
+                    # Note: For internal scraper updates, we update all platforms
+                    # In production, you may want to specify which platform to update
+                    # For now, we'll skip platform-specific updates during scraping
+                    # as the CRM system will handle syncing when it queries MLS properties
+                    # crm_updated_count = await self.update_crm_properties_from_mls(property_data.property_id, platform)
+                    crm_updated_count = 0  # Disabled for now - CRM systems handle their own syncing
                     
                     # Trigger enrichment in background (non-blocking!)
                     if self.enrichment_pipeline:
@@ -681,13 +686,36 @@ class Database:
             return 0
     
     # CRM Integration Methods
-    async def add_crm_property_reference(self, mls_property_id: str, crm_property_id: str) -> bool:
-        """Add a CRM property reference to an MLS property"""
+    async def add_crm_property_reference(self, mls_property_id: str, crm_property_id: str, platform: str) -> bool:
+        """Add a CRM property reference to an MLS property for a specific platform"""
         try:
+            # First, initialize crm_property_ids as an object if it doesn't exist or is a legacy array
+            init_result = await self.properties_collection.update_one(
+                {
+                    "property_id": mls_property_id,
+                    "$or": [
+                        {"crm_property_ids": None},
+                        {"crm_property_ids": {"$exists": False}},
+                        {"crm_property_ids": {"$type": "array"}}  # Legacy array format
+                    ]
+                },
+                {"$set": {"crm_property_ids": {}}}
+            )
+            
+            # Initialize platform array if it doesn't exist
+            init_platform_result = await self.properties_collection.update_one(
+                {
+                    "property_id": mls_property_id,
+                    f"crm_property_ids.{platform}": {"$exists": False}
+                },
+                {"$set": {f"crm_property_ids.{platform}": []}}
+            )
+            
+            # Add the CRM property ID to the platform-specific array
             result = await self.properties_collection.update_one(
                 {"property_id": mls_property_id},
                 {
-                    "$addToSet": {"crm_property_ids": crm_property_id},
+                    "$addToSet": {f"crm_property_ids.{platform}": crm_property_id},
                     "$set": {"last_content_updated": datetime.utcnow()}
                 }
             )
@@ -696,13 +724,13 @@ class Database:
             print(f"Error adding CRM property reference: {e}")
             return False
     
-    async def remove_crm_property_reference(self, mls_property_id: str, crm_property_id: str) -> bool:
-        """Remove a CRM property reference from an MLS property"""
+    async def remove_crm_property_reference(self, mls_property_id: str, crm_property_id: str, platform: str) -> bool:
+        """Remove a CRM property reference from an MLS property for a specific platform"""
         try:
             result = await self.properties_collection.update_one(
                 {"property_id": mls_property_id},
                 {
-                    "$pull": {"crm_property_ids": crm_property_id},
+                    "$pull": {f"crm_property_ids.{platform}": crm_property_id},
                     "$set": {"last_content_updated": datetime.utcnow()}
                 }
             )
@@ -711,20 +739,33 @@ class Database:
             print(f"Error removing CRM property reference: {e}")
             return False
     
-    async def get_crm_property_references(self, mls_property_id: str) -> List[str]:
-        """Get all CRM property IDs that reference an MLS property"""
+    async def get_crm_property_references(self, mls_property_id: str, platform: str) -> List[str]:
+        """Get all CRM property IDs that reference an MLS property for a specific platform"""
         try:
             property_doc = await self.properties_collection.find_one(
                 {"property_id": mls_property_id},
                 {"crm_property_ids": 1}
             )
-            return property_doc.get("crm_property_ids", []) if property_doc else []
+            if not property_doc:
+                return []
+            
+            crm_property_ids = property_doc.get("crm_property_ids", {})
+            
+            # Handle both nested structure (new) and legacy array format (for backward compatibility)
+            if isinstance(crm_property_ids, dict):
+                # New nested structure: crm_property_ids: { "platform": [...] }
+                return crm_property_ids.get(platform, [])
+            elif isinstance(crm_property_ids, list):
+                # Legacy array format: crm_property_ids: [...]
+                return crm_property_ids
+            else:
+                return []
         except Exception as e:
             print(f"Error getting CRM property references: {e}")
             return []
     
-    async def update_crm_properties_from_mls(self, mls_property_id: str) -> int:
-        """Update all CRM properties that reference an MLS property with the latest MLS data"""
+    async def update_crm_properties_from_mls(self, mls_property_id: str, platform: str) -> int:
+        """Update all CRM properties that reference an MLS property with the latest MLS data for a specific platform"""
         try:
             # Get the MLS property data
             mls_property = await self.properties_collection.find_one({"property_id": mls_property_id})
@@ -732,8 +773,19 @@ class Database:
                 print(f"MLS property not found: {mls_property_id}")
                 return 0
             
-            # Get CRM property references
-            crm_property_ids = mls_property.get("crm_property_ids", [])
+            # Get CRM property references for the specified platform
+            crm_property_ids_obj = mls_property.get("crm_property_ids", {})
+            
+            # Handle both nested structure (new) and legacy array format (for backward compatibility)
+            if isinstance(crm_property_ids_obj, dict):
+                # New nested structure: crm_property_ids: { "platform": [...] }
+                crm_property_ids = crm_property_ids_obj.get(platform, [])
+            elif isinstance(crm_property_ids_obj, list):
+                # Legacy array format: crm_property_ids: [...]
+                crm_property_ids = crm_property_ids_obj
+            else:
+                crm_property_ids = []
+            
             if not crm_property_ids:
                 return 0
             
