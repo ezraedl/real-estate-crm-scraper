@@ -1,7 +1,7 @@
 import asyncio
 import croniter
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 from models import ScrapingJob, JobPriority, JobStatus, ScheduledJob, ScheduledJobStatus
 from database import db
@@ -80,6 +80,11 @@ class JobScheduler:
                     if await self.should_run_scheduled_job(scheduled_job, now):
                         # Create a new job instance for this run
                         new_job = await self.create_scheduled_job_instance(scheduled_job)
+                        
+                        # Check if job was created (may be None if no locations found)
+                        if new_job is None:
+                            logger.info(f"Skipping scheduled job {scheduled_job.scheduled_job_id} - no job instance created (likely no locations)")
+                            continue
                         
                         logger.info(f"Running scheduled job: {new_job.job_id} (from {scheduled_job.scheduled_job_id})")
                         asyncio.create_task(scraper.process_job(new_job))
@@ -180,7 +185,7 @@ class JobScheduler:
             logger.error(f"Error checking cron expression for legacy job {job.job_id}: {e}")
             return False
     
-    async def create_scheduled_job_instance(self, scheduled_job: ScheduledJob) -> ScrapingJob:
+    async def create_scheduled_job_instance(self, scheduled_job: ScheduledJob) -> Optional[ScrapingJob]:
         """Create a new job instance from a scheduled job"""
         try:
             # Generate new job ID
