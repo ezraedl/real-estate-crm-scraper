@@ -84,6 +84,8 @@ class JobScheduler:
                         # Check if job was created (may be None if no locations found)
                         if new_job is None:
                             logger.info(f"Skipping scheduled job {scheduled_job.scheduled_job_id} - no job instance created (likely no locations)")
+                            # Update last_run_at even when skipped to prevent repeated overdue checks
+                            await db.update_scheduled_job(scheduled_job.scheduled_job_id, {"last_run_at": now})
                             continue
                         
                         logger.info(f"Running scheduled job: {new_job.job_id} (from {scheduled_job.scheduled_job_id})")
