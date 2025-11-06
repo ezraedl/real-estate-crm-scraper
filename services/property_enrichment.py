@@ -334,6 +334,7 @@ class PropertyEnrichmentPipeline:
                 'is_probate': 'probate' in text_analysis.get('special_sale_types', []),
                 'is_short_sale': 'short_sale' in text_analysis.get('special_sale_types', []),
                 'is_as_is': 'as_is' in text_analysis.get('special_sale_types', []),
+                'is_portfolio': 'portfolio' in text_analysis.get('special_sale_types', []),
                 'types_found': text_analysis.get('special_sale_types', [])
             },
             'creative_financing': {
@@ -686,6 +687,7 @@ class PropertyEnrichmentPipeline:
                     'is_probate': 'probate' in text_analysis.get('special_sale_types', []),
                     'is_short_sale': 'short_sale' in text_analysis.get('special_sale_types', []),
                     'is_as_is': 'as_is' in text_analysis.get('special_sale_types', []),
+                    'is_portfolio': 'portfolio' in text_analysis.get('special_sale_types', []),
                     'types_found': text_analysis.get('special_sale_types', [])
                 },
                 "enrichment.creative_financing": {
