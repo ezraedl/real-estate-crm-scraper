@@ -169,6 +169,7 @@ special_sale_types:
   auction: 15
   reo: 15
   probate: 12
+  portfolio: 12
   short_sale: 10
   as_is: 8
 

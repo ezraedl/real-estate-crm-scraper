@@ -148,7 +148,18 @@ class TextAnalyzer:
             'reo': [r'\b(?:reo|bank owned|foreclosure|foreclosed)\b'],
             'probate': [r'\b(?:probate|estate sale|inherited|deceased)\b'],
             'short_sale': [r'\b(?:short sale|short sell|short sale approved)\b'],
-            'as_is': [r'\b(?:as.?is|as is|sold as is)\b']
+            'as_is': [r'\b(?:as.?is|as is|sold as is)\b'],
+            'portfolio': [
+                r'\b(?:portfolio|property portfolio|real estate portfolio|investment portfolio|rental portfolio)\b',
+                r'\b(?:portfolio sale|portfolio of properties|entire portfolio|full portfolio|complete portfolio)\b',
+                r'\b(?:package deal|package sale|sold as package|property package|real estate package)\b',
+                r'\b(?:bulk sale|bulk purchase|bulk opportunity|sold in bulk)\b',
+                r'\b(?:multiple properties|several properties|collection of properties|group of properties)\b',
+                r'\b(?:bundle|bundled|sold as bundle|property bundle|real estate bundle)\b',
+                r'\b(?:sold together|properties included|additional properties|included in package)\b',
+                r'\b(?:investment package|wholesale package|investor package|developer package)\b',
+                r'\b(?:part of a larger sale|sold with other properties|package opportunity|portfolio opportunity)\b'
+            ]
         }
         
         # Creative financing keywords - expanded based on database analysis
