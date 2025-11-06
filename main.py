@@ -497,17 +497,22 @@ async def add_crm_property_reference(request: dict):
     try:
         mls_property_id = request.get("mls_property_id")
         crm_property_id = request.get("crm_property_id")
+        platform = request.get("platform")
         
         if not mls_property_id or not crm_property_id:
             raise HTTPException(status_code=400, detail="mls_property_id and crm_property_id are required")
         
-        success = await db.add_crm_property_reference(mls_property_id, crm_property_id)
+        if not platform:
+            raise HTTPException(status_code=400, detail="platform is required")
+        
+        success = await db.add_crm_property_reference(mls_property_id, crm_property_id, platform)
         
         if success:
             return {
                 "message": "CRM property reference added successfully",
                 "mls_property_id": mls_property_id,
-                "crm_property_id": crm_property_id
+                "crm_property_id": crm_property_id,
+                "platform": platform
             }
         else:
             raise HTTPException(status_code=404, detail="MLS property not found")
@@ -524,17 +529,22 @@ async def remove_crm_property_reference(request: dict):
     try:
         mls_property_id = request.get("mls_property_id")
         crm_property_id = request.get("crm_property_id")
+        platform = request.get("platform")
         
         if not mls_property_id or not crm_property_id:
             raise HTTPException(status_code=400, detail="mls_property_id and crm_property_id are required")
         
-        success = await db.remove_crm_property_reference(mls_property_id, crm_property_id)
+        if not platform:
+            raise HTTPException(status_code=400, detail="platform is required")
+        
+        success = await db.remove_crm_property_reference(mls_property_id, crm_property_id, platform)
         
         if success:
             return {
                 "message": "CRM property reference removed successfully",
                 "mls_property_id": mls_property_id,
-                "crm_property_id": crm_property_id
+                "crm_property_id": crm_property_id,
+                "platform": platform
             }
         else:
             raise HTTPException(status_code=404, detail="MLS property not found")
@@ -550,16 +560,21 @@ async def sync_property_from_mls(request: dict):
     """Manually sync CRM properties from MLS data"""
     try:
         mls_property_id = request.get("mls_property_id")
+        platform = request.get("platform")
         
         if not mls_property_id:
             raise HTTPException(status_code=400, detail="mls_property_id is required")
         
-        updated_count = await db.update_crm_properties_from_mls(mls_property_id)
+        if not platform:
+            raise HTTPException(status_code=400, detail="platform is required")
+        
+        updated_count = await db.update_crm_properties_from_mls(mls_property_id, platform)
         
         return {
             "success": True,
             "message": f"Synced {updated_count} CRM properties from MLS property",
             "mls_property_id": mls_property_id,
+            "platform": platform,
             "crm_properties_updated": updated_count
         }
         
