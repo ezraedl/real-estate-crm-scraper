@@ -20,7 +20,7 @@
 ├── config.py            # Configuration management
 ├── proxy_manager.py     # Proxy rotation and management
 ├── tests/               # Test files
-└── docs/                # Documentation
+└── docs/                # Documentation (all Markdown lives here; keep repo root free of extra `.md` files beyond `README.md`)
 ```
 
 ## Naming Conventions
