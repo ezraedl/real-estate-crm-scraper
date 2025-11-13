@@ -73,6 +73,8 @@ class ScheduledJob(BaseModel):
     foreclosure: bool = False
     exclude_pending: bool = False
     limit: int = Field(default=10000, le=10000)
+    split_by_zip: bool = Field(default=False, description="Automatically split broad locations into ZIP-code chunks")
+    zip_batch_size: Optional[int] = Field(default=None, gt=0, description="Number of ZIP codes per chunk when splitting (None = one ZIP per chunk)")
     
     # Execution tracking
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -127,6 +129,11 @@ class ScrapingJob(BaseModel):
     foreclosure: bool = False
     exclude_pending: bool = False
     limit: int = Field(default=10000, le=10000)
+    split_by_zip: bool = Field(default=False, description="Whether this job originated from ZIP-code splitting")
+    chunk_sequence: Optional[int] = Field(default=None, ge=1, description="Sequence number of this chunk within its batch")
+    chunk_total: Optional[int] = Field(default=None, ge=1, description="Total number of chunks in the batch")
+    chunk_label: Optional[str] = Field(default=None, description="Human-readable description of the chunk (e.g., ZIP code)")
+    zip_batch_size: Optional[int] = Field(default=None, gt=0, description="Number of ZIP codes bundled into this chunk")
     
     # Scheduling (for one-time scheduled jobs)
     scheduled_at: Optional[datetime] = None
@@ -146,6 +153,7 @@ class ScrapingJob(BaseModel):
     properties_skipped: int = Field(default=0, description="Properties skipped (no content change)")
     total_locations: int = 0
     completed_locations: int = 0
+    failed_locations: List[Dict[str, Any]] = Field(default_factory=list, description="Locations that failed during scraping, saved for retry")
     
     # Detailed progress logs
     progress_logs: List[Dict[str, Any]] = Field(default_factory=list, description="Detailed logs per location and listing type")
