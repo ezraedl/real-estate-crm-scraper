@@ -33,6 +33,7 @@ from database import db
 from scraper import scraper
 from proxy_manager import proxy_manager
 from config import settings
+from services.zip_code_service import zip_code_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -490,6 +491,34 @@ async def toggle_active_properties_rescraping(request: dict):
         logger.error(f"Error toggling active properties re-scraping: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/locations/suggestions")
+async def get_location_suggestions(q: str, state: Optional[str] = None, limit: int = 10):
+    """Provide city/state suggestions backed by the ZIP code directory."""
+    query = (q or "").strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+
+    try:
+        safe_limit = max(1, min(limit, 25))
+        suggestions = []
+        for location in zip_code_service.search_locations(query, state=state, limit=safe_limit):
+            suggestions.append(
+                {
+                    "city": location.city,
+                    "state": location.state,
+                    "label": location.label,
+                    "zip_count": len(location.zip_codes),
+                    "example_zip_codes": location.zip_codes[:5],
+                }
+            )
+
+        return {"suggestions": suggestions}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error generating location suggestions: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to load location suggestions")
 # CRM Property Reference Management
 @app.post("/crm-property-reference")
 async def add_crm_property_reference(request: dict):
@@ -1035,11 +1064,8 @@ async def trigger_existing_job(request: TriggerJobRequest):
         scheduled_job = await db.get_scheduled_job(request.job_id)
         
         if scheduled_job:
-            # This is a scheduled job (cron job) - create instance linked to it
+            # This is a scheduled job (cron job) - create instances using scheduler's chunking logic
             logger.info(f"Triggering scheduled job: {request.job_id} ({scheduled_job.name})")
-            
-            # Create immediate job ID
-            immediate_job_id = f"triggered_{scheduled_job.scheduled_job_id}_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
             
             # Determine past_days based on listing type for triggered jobs
             # SOLD properties should always go back 1 year (365 days) for comprehensive comp analysis
@@ -1050,46 +1076,40 @@ async def trigger_existing_job(request: TriggerJobRequest):
             else:
                 past_days = scheduled_job.past_days  # Keep original for other types
             
-            # Create new immediate job based on scheduled job
-            immediate_job = ScrapingJob(
-                job_id=immediate_job_id,
-                priority=request.priority,
-                scheduled_job_id=scheduled_job.scheduled_job_id,  # Link to parent scheduled job
-                locations=scheduled_job.locations,
-                listing_types=scheduled_job.listing_types,  # Use multi-select field
-                listing_type=scheduled_job.listing_type,  # Keep for backward compatibility
-                property_types=scheduled_job.property_types,
-                past_days=past_days,  # Use the calculated past_days
-                date_from=scheduled_job.date_from,
-                date_to=scheduled_job.date_to,
-                radius=scheduled_job.radius,
-                mls_only=scheduled_job.mls_only,
-                foreclosure=scheduled_job.foreclosure,
-                exclude_pending=scheduled_job.exclude_pending,
-                limit=scheduled_job.limit,
-                proxy_config=scheduled_job.proxy_config,
-                user_agent=scheduled_job.user_agent,
-                request_delay=scheduled_job.request_delay,
-                total_locations=len(scheduled_job.locations)
-            )
+            # Temporarily update past_days for this trigger
+            original_past_days = scheduled_job.past_days
+            scheduled_job.past_days = past_days
             
-            # Save immediate job to database
-            await db.create_job(immediate_job)
+            # Override priority if provided in request
+            if request.priority:
+                scheduled_job.priority = request.priority
+            
+            # Use scheduler's create_scheduled_job_instances to properly handle split_by_zip
+            job_instances = await scheduler.create_scheduled_job_instances(scheduled_job)
+            
+            # Restore original past_days
+            scheduled_job.past_days = original_past_days
+            
+            if not job_instances:
+                raise HTTPException(status_code=400, detail="No job instances created. Check location configuration.")
             
             # Start the scraper service if not already running
             if not scraper.is_running:
                 asyncio.create_task(scraper.start())
             
-            # Process the job immediately
-            asyncio.create_task(scraper.process_job(immediate_job))
+            # Process all job instances immediately
+            for job_instance in job_instances:
+                asyncio.create_task(scraper.process_job(job_instance))
             
-            logger.info(f"Triggered scheduled job {request.job_id} as immediate job {immediate_job_id}")
+            # Return the first job ID as the primary response
+            primary_job = job_instances[0]
+            logger.info(f"Triggered scheduled job {request.job_id} as {len(job_instances)} job instance(s), starting with {primary_job.job_id}")
             
             return JobResponse(
-                job_id=immediate_job_id,
+                job_id=primary_job.job_id,
                 status=JobStatus.PENDING,
-                message=f"Triggered scheduled job '{scheduled_job.name}' to run immediately",
-                created_at=immediate_job.created_at
+                message=f"Triggered scheduled job '{scheduled_job.name}' to run immediately ({len(job_instances)} job instance(s) created)",
+                created_at=primary_job.created_at
             )
         
         # If not found in scheduled_jobs, try legacy jobs collection
@@ -1456,6 +1476,8 @@ async def list_scheduled_jobs(
                 "locations": job_data.get("locations"),
                 "listing_types": job_data.get("listing_types", ["for_sale", "sold", "for_rent", "pending"]),  # New multi-select field
                 "listing_type": job_data.get("listing_type"),  # Backward compatibility
+                "split_by_zip": job_data.get("split_by_zip", False),
+                "zip_batch_size": job_data.get("zip_batch_size"),
                 "run_count": actual_run_count,  # Use actual count from jobs collection
                 "has_running_job": has_running_job,  # Indicator if a job is currently running
                 "last_run_at": job_data.get("last_run_at"),
@@ -1492,6 +1514,29 @@ async def create_scheduled_job(job_data: dict):
         if not listing_types or len(listing_types) == 0:
             listing_types = ["for_sale", "sold", "for_rent", "pending"]
         
+        # Get locations - ensure it's a list
+        locations = job_data.get('locations', [])
+        if not isinstance(locations, list):
+            locations = [locations] if locations else []
+        
+        # Expand locations if split_by_zip is enabled
+        split_by_zip = job_data.get('split_by_zip', False)
+        zip_batch_size = job_data.get('zip_batch_size')
+        
+        if split_by_zip and locations:
+            expanded_locations = []
+            for location in locations:
+                # Expand each location into individual ZIP codes (ignore zip_batch_size for expansion)
+                # zip_batch_size is kept for reference but all ZIPs go into one job
+                chunks = zip_code_service.expand_location(location, None)  # None = individual ZIP codes
+                for chunk in chunks:
+                    # Add all locations from this chunk
+                    expanded_locations.extend(list(chunk["locations"]))
+            
+            if expanded_locations:
+                locations = expanded_locations
+                logger.info(f"Expanded {len(job_data.get('locations', []))} location(s) into {len(locations)} ZIP code location(s)")
+        
         scheduled_job = ScheduledJob(
             scheduled_job_id=scheduled_job_id,
             name=job_data.get('name'),
@@ -1499,7 +1544,7 @@ async def create_scheduled_job(job_data: dict):
             status=job_data.get('status', 'active'),
             cron_expression=job_data.get('cron_expression'),
             timezone=job_data.get('timezone', 'UTC'),
-            locations=job_data.get('locations'),
+            locations=locations,  # Use expanded locations
             listing_types=listing_types,  # Use multi-select field
             listing_type=job_data.get('listing_type'),  # Keep for backward compatibility
             property_types=job_data.get('property_types'),
@@ -1511,6 +1556,8 @@ async def create_scheduled_job(job_data: dict):
             foreclosure=job_data.get('foreclosure', False),
             exclude_pending=job_data.get('exclude_pending', False),
             limit=job_data.get('limit', 10000),
+            split_by_zip=split_by_zip,  # Keep the flag for reference, but locations are already expanded
+            zip_batch_size=zip_batch_size,
             proxy_config=job_data.get('proxy_config'),
             user_agent=job_data.get('user_agent'),
             request_delay=job_data.get('request_delay', 1.0),
@@ -1566,7 +1613,30 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
         if 'timezone' in job_data:
             update_data['timezone'] = job_data['timezone']
         if 'locations' in job_data:
-            update_data['locations'] = job_data['locations']
+            # Get locations - ensure it's a list
+            locations = job_data['locations']
+            if not isinstance(locations, list):
+                locations = [locations] if locations else []
+            
+            # Expand locations if split_by_zip is enabled
+            split_by_zip = job_data.get('split_by_zip', existing_job.split_by_zip if hasattr(existing_job, 'split_by_zip') else False)
+            zip_batch_size = job_data.get('zip_batch_size', existing_job.zip_batch_size if hasattr(existing_job, 'zip_batch_size') else None)
+            
+            if split_by_zip and locations:
+                expanded_locations = []
+                for location in locations:
+                    # Expand each location into individual ZIP codes (ignore zip_batch_size for expansion)
+                    # zip_batch_size is kept for reference but all ZIPs go into one job
+                    chunks = zip_code_service.expand_location(location, None)  # None = individual ZIP codes
+                    for chunk in chunks:
+                        # Add all locations from this chunk
+                        expanded_locations.extend(list(chunk["locations"]))
+                
+                if expanded_locations:
+                    locations = expanded_locations
+                    logger.info(f"Expanded {len(job_data['locations'])} location(s) into {len(locations)} ZIP code location(s) during update")
+            
+            update_data['locations'] = locations
         if 'listing_types' in job_data:
             update_data['listing_types'] = job_data['listing_types']
         if 'listing_type' in job_data:
@@ -1589,6 +1659,10 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
             update_data['exclude_pending'] = job_data['exclude_pending']
         if 'limit' in job_data:
             update_data['limit'] = job_data['limit']
+        if 'split_by_zip' in job_data:
+            update_data['split_by_zip'] = job_data['split_by_zip']
+        if 'zip_batch_size' in job_data:
+            update_data['zip_batch_size'] = job_data['zip_batch_size']
         if 'proxy_config' in job_data:
             update_data['proxy_config'] = job_data['proxy_config']
         if 'user_agent' in job_data:
@@ -1723,6 +1797,71 @@ async def cancel_job(job_id: str):
     except Exception as e:
         logger.error(f"Error cancelling job: {e}")
         raise HTTPException(status_code=500, detail="Failed to cancel job")
+
+# Retry failed locations from a job
+@app.post("/jobs/{job_id}/retry-failed")
+async def retry_failed_locations(job_id: str):
+    """Retry failed locations from a completed job"""
+    try:
+        job = await db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        if not job.failed_locations or len(job.failed_locations) == 0:
+            raise HTTPException(status_code=400, detail="No failed locations to retry")
+        
+        # Extract failed location strings
+        failed_location_strings = [fl.get("location") for fl in job.failed_locations if fl.get("location")]
+        
+        if not failed_location_strings:
+            raise HTTPException(status_code=400, detail="No valid failed locations found")
+        
+        # Create a new retry job with only the failed locations
+        import time
+        import random
+        retry_job_id = f"{job_id}_retry_failed_{int(time.time())}_{random.randint(1000, 9999)}"
+        
+        retry_job = ScrapingJob(
+            job_id=retry_job_id,
+            priority=JobPriority.HIGH,  # High priority for retries
+            locations=failed_location_strings,
+            listing_types=job.listing_types,
+            listing_type=job.listing_type,
+            property_types=job.property_types,
+            past_days=job.past_days,
+            date_from=job.date_from,
+            date_to=job.date_to,
+            radius=job.radius,
+            mls_only=job.mls_only,
+            foreclosure=job.foreclosure,
+            exclude_pending=job.exclude_pending,
+            limit=job.limit,
+            proxy_config=job.proxy_config,
+            user_agent=job.user_agent,
+            request_delay=job.request_delay,
+            scheduled_job_id=job.scheduled_job_id  # Preserve reference to scheduled job if exists
+        )
+        
+        # Create the retry job
+        await db.create_job(retry_job)
+        
+        # Start processing immediately
+        asyncio.create_task(scraper.process_job(retry_job))
+        
+        logger.info(f"Created retry job {retry_job_id} for {len(failed_location_strings)} failed locations from job {job_id}")
+        
+        return {
+            "message": f"Retry job created for {len(failed_location_strings)} failed location(s)",
+            "retry_job_id": retry_job_id,
+            "failed_locations_count": len(failed_location_strings),
+            "failed_locations": failed_location_strings
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating retry job: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create retry job: {str(e)}")
 
 # Get statistics
 @app.get("/stats")

@@ -89,6 +89,8 @@ class MLSScraper:
             total_inserted = 0
             total_updated = 0
             total_skipped = 0
+            failed_locations = []
+            successful_locations = 0
             
             # Process each location
             for i, location in enumerate(job.locations):
@@ -106,6 +108,10 @@ class MLSScraper:
                     "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
                 })
                 await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                
+                location_failed = False
+                location_error = None
+                
                 try:
                     print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
                     
@@ -132,44 +138,104 @@ class MLSScraper:
                         total_locations=len(job.locations)
                     )
                     
-                    # Update totals from running_totals (modified by scrape_location)
-                    total_properties = running_totals["total_properties"]
-                    saved_properties = running_totals["saved_properties"]
-                    total_inserted = running_totals["total_inserted"]
-                    total_updated = running_totals["total_updated"]
-                    total_skipped = running_totals["total_skipped"]
-                    
-                    if location_summary:
-                        progress_logs.append(location_summary)
-                        print(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
-                    
-                    # Update job progress with detailed breakdown and logs
-                    await db.update_job_status(
-                        job.job_id,
-                        JobStatus.RUNNING,
-                        completed_locations=i + 1,
-                        properties_scraped=total_properties,
-                        properties_saved=saved_properties,
-                        properties_inserted=total_inserted,
-                        properties_updated=total_updated,
-                        properties_skipped=total_skipped,
-                        progress_logs=progress_logs
-                    )
-                    
-                    # Random delay between locations
-                    delay = job.request_delay + random.uniform(0, 1)
-                    await asyncio.sleep(delay)
+                    # Check if location scraping failed (returns None or has error status)
+                    if location_summary is None or location_summary.get("status") == "failed":
+                        location_failed = True
+                        location_error = location_summary.get("error", "Unknown error") if location_summary else "Scraping returned None"
+                        print(f"Location {location} failed: {location_error}")
+                    else:
+                        # Update totals from running_totals (modified by scrape_location)
+                        total_properties = running_totals["total_properties"]
+                        saved_properties = running_totals["saved_properties"]
+                        total_inserted = running_totals["total_inserted"]
+                        total_updated = running_totals["total_updated"]
+                        total_skipped = running_totals["total_skipped"]
+                        
+                        # Location summary is already in progress_logs (replaced temp entry in scrape_location)
+                        # So we don't need to append it again here
+                        if location_summary:
+                            print(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
+                        
+                        successful_locations += 1
                     
                 except Exception as e:
+                    location_failed = True
+                    location_error = str(e)
                     print(f"Error scraping location {location}: {e}")
-                    continue
+                    import traceback
+                    error_traceback = traceback.format_exc()
+                    print(f"Traceback: {error_traceback}")
+                
+                # Handle failed location
+                if location_failed:
+                    failed_location_entry = {
+                        "location": location,
+                        "location_index": i + 1,
+                        "error": location_error,
+                        "failed_at": datetime.utcnow().isoformat(),
+                        "retry_count": 0
+                    }
+                    failed_locations.append(failed_location_entry)
+                    
+                    # Log the failure
+                    failure_log = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "event": "location_failed",
+                        "location": location,
+                        "location_index": i + 1,
+                        "error": location_error,
+                        "message": f"Location {i+1}/{len(job.locations)} ({location}) failed: {location_error}. Skipping and continuing with next location."
+                    }
+                    progress_logs.append(failure_log)
+                    print(f"[SKIP] Location {location} failed, continuing with next location...")
+                
+                # Update job progress with detailed breakdown and logs (including failed locations)
+                await db.update_job_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    completed_locations=successful_locations,
+                    properties_scraped=total_properties,
+                    properties_saved=saved_properties,
+                    properties_inserted=total_inserted,
+                    properties_updated=total_updated,
+                    properties_skipped=total_skipped,
+                    failed_locations=failed_locations,
+                    progress_logs=progress_logs
+                )
+                
+                # Random delay between locations (even failed ones to avoid hammering)
+                if not location_failed:
+                    delay = job.request_delay + random.uniform(0, 1)
+                    await asyncio.sleep(delay)
+                else:
+                    # Shorter delay after failures
+                    await asyncio.sleep(0.5)
             
-            # Mark job as completed
+            # Mark job as completed (even if some locations failed)
+            final_status = JobStatus.COMPLETED
+            completion_message = f"Job completed successfully. {successful_locations}/{len(job.locations)} locations processed."
+            
+            if failed_locations:
+                completion_message += f" {len(failed_locations)} location(s) failed and saved for retry."
+                print(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
+            
+            # Add completion log
+            progress_logs.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "job_completed",
+                "message": completion_message,
+                "successful_locations": successful_locations,
+                "failed_locations": len(failed_locations),
+                "total_locations": len(job.locations)
+            })
+            
             await db.update_job_status(
                 job.job_id,
-                JobStatus.COMPLETED,
+                final_status,
                 properties_scraped=total_properties,
-                properties_saved=saved_properties
+                properties_saved=saved_properties,
+                failed_locations=failed_locations,
+                progress_logs=progress_logs
             )
             
             # Update run history for scheduled jobs (new architecture)
@@ -268,6 +334,7 @@ class MLSScraper:
             location_total_updated = 0
             location_total_skipped = 0
             location_total_errors = 0
+            temp_idx = None  # Track temp entry index for this location
             
             # Determine which listing types to scrape
             if job.listing_types and len(job.listing_types) > 0:
@@ -485,8 +552,8 @@ class MLSScraper:
             
             print(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
             
-            # Return final summary for this location
-            return {
+            # Create final summary for this location
+            final_summary = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "location": location,
                 "location_index": location_index,
@@ -499,9 +566,47 @@ class MLSScraper:
                 "listing_type_breakdown": listing_type_logs
             }
             
+            # Replace temp entry with final summary if it exists
+            # temp_idx was set when the first listing type started processing
+            if progress_logs is not None and temp_idx is not None:
+                # Replace temp entry with final summary
+                progress_logs[temp_idx] = final_summary
+                # Update database with final summary
+                await db.update_job_status(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    properties_scraped=running_totals["total_properties"],
+                    properties_saved=running_totals["saved_properties"],
+                    properties_inserted=running_totals["total_inserted"],
+                    properties_updated=running_totals["total_updated"],
+                    properties_skipped=running_totals["total_skipped"],
+                    progress_logs=progress_logs
+                )
+            
+            # Return final summary for this location
+            return final_summary
+            
         except Exception as e:
             print(f"Error scraping location {location}: {e}")
-            return None
+            import traceback
+            error_traceback = traceback.format_exc()
+            print(f"Traceback: {error_traceback}")
+            
+            # Return failure information instead of None
+            return {
+                "timestamp": datetime.utcnow().isoformat(),
+                "location": location,
+                "location_index": location_index,
+                "total_locations": total_locations,
+                "status": "failed",
+                "error": str(e),
+                "properties_found": 0,
+                "inserted": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 1,
+                "message": f"Location scraping failed: {str(e)}"
+            }
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
@@ -535,11 +640,22 @@ class MLSScraper:
             # This allows the scraper to get off-market, foreclosures, and all other property types
             
             # Scrape properties - Run blocking call in thread pool to avoid blocking event loop
+            # Add timeout to prevent locations from getting stuck (default 5 minutes per listing type)
+            timeout_seconds = 300  # 5 minutes timeout per listing type
             loop = asyncio.get_event_loop()
-            properties_df = await loop.run_in_executor(
-                self.executor,
-                lambda: scrape_property(**scrape_params)
-            )
+            
+            try:
+                properties_df = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self.executor,
+                        lambda: scrape_property(**scrape_params)
+                    ),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                error_msg = f"Scraping {listing_type} properties in {location} timed out after {timeout_seconds} seconds"
+                print(f"   [TIMEOUT] {error_msg}")
+                raise TimeoutError(error_msg)
             
             # Convert DataFrame to our Property models
             properties = []

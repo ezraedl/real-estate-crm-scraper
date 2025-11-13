@@ -1,11 +1,12 @@
 import asyncio
 import croniter
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, Iterable, List, Optional
 import logging
 from models import ScrapingJob, JobPriority, JobStatus, ScheduledJob, ScheduledJobStatus
 from database import db
 from scraper import scraper
+from services.zip_code_service import zip_code_service
 
 logger = logging.getLogger(__name__)
 
@@ -78,18 +79,25 @@ class JobScheduler:
                 try:
                     # Check if it's time to run this scheduled job
                     if await self.should_run_scheduled_job(scheduled_job, now):
-                        # Create a new job instance for this run
-                        new_job = await self.create_scheduled_job_instance(scheduled_job)
-                        
-                        # Check if job was created (may be None if no locations found)
-                        if new_job is None:
-                            logger.info(f"Skipping scheduled job {scheduled_job.scheduled_job_id} - no job instance created (likely no locations)")
-                            # Update last_run_at even when skipped to prevent repeated overdue checks
+                        job_instances = await self.create_scheduled_job_instances(scheduled_job)
+
+                        if not job_instances:
+                            logger.info(
+                                f"Skipping scheduled job {scheduled_job.scheduled_job_id} - no job instances created (likely no locations)"
+                            )
                             await db.update_scheduled_job(scheduled_job.scheduled_job_id, {"last_run_at": now})
                             continue
-                        
-                        logger.info(f"Running scheduled job: {new_job.job_id} (from {scheduled_job.scheduled_job_id})")
-                        asyncio.create_task(scraper.process_job(new_job))
+
+                        for job_instance in job_instances:
+                            chunk_suffix = (
+                                f" chunk {job_instance.chunk_sequence}/{job_instance.chunk_total}"
+                                if job_instance.chunk_sequence and job_instance.chunk_total
+                                else ""
+                            )
+                            logger.info(
+                                f"Running scheduled job: {job_instance.job_id}{chunk_suffix} (from {scheduled_job.scheduled_job_id})"
+                            )
+                            asyncio.create_task(scraper.process_job(job_instance))
                         
                 except Exception as e:
                     logger.error(f"Error processing scheduled job {scheduled_job.scheduled_job_id}: {e}")
@@ -187,30 +195,65 @@ class JobScheduler:
             logger.error(f"Error checking cron expression for legacy job {job.job_id}: {e}")
             return False
     
-    async def create_scheduled_job_instance(self, scheduled_job: ScheduledJob) -> Optional[ScrapingJob]:
-        """Create a new job instance from a scheduled job"""
+    async def create_scheduled_job_instances(self, scheduled_job: ScheduledJob) -> List[ScrapingJob]:
+        """Create job instance(s) from a scheduled job, optionally splitting by ZIP code."""
         try:
-            # Generate new job ID
             import uuid
-            new_job_id = f"scheduled_{scheduled_job.scheduled_job_id}_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
-            
-            # Special handling for active properties re-scraping job
+
             if scheduled_job.scheduled_job_id == "active_properties_rescraping":
                 locations = await self._get_active_properties_locations()
                 if not locations:
                     logger.info("No active properties found, skipping active properties re-scraping job")
-                    return None
+                    return []
             else:
-                locations = scheduled_job.locations
-            
-            # Create new job instance from scheduled job template
+                locations = scheduled_job.locations or []
+
+            if not locations:
+                return []
+
+            # If split_by_zip is enabled, locations should already be expanded when the scheduled job was created
+            # So we just create ONE job with all locations (they will be processed sequentially as batches)
+            # Only expand if locations haven't been expanded yet (for backward compatibility)
+            all_locations = []
+            if getattr(scheduled_job, "split_by_zip", False) and locations:
+                # Check if locations are already expanded (contain ZIP codes)
+                # If not, expand them now (for backward compatibility with old jobs)
+                needs_expansion = any(
+                    not zip_code_service.parse_location(loc) or 
+                    not zip_code_service.parse_location(loc)[2]  # No ZIP code in location
+                    for loc in locations
+                )
+                
+                if needs_expansion:
+                    # Expand locations into ZIP codes
+                    chunk_definitions = self._build_location_chunks(
+                        locations,
+                        split_by_zip=True,
+                        zip_batch_size=getattr(scheduled_job, "zip_batch_size", None),
+                    )
+                    for chunk in chunk_definitions:
+                        all_locations.extend(list(chunk["locations"]))
+                else:
+                    # Locations are already expanded
+                    all_locations = locations
+            else:
+                # No splitting, use locations as-is
+                all_locations = locations
+
+            if not all_locations:
+                return []
+
+            # Create ONE job with all locations (they will be processed sequentially)
+            timestamp = int(datetime.utcnow().timestamp())
+            new_job_id = f"scheduled_{scheduled_job.scheduled_job_id}_{timestamp}_{uuid.uuid4().hex[:8]}"
+
             new_job = ScrapingJob(
                 job_id=new_job_id,
                 priority=scheduled_job.priority,
-                scheduled_job_id=scheduled_job.scheduled_job_id,  # Reference to parent
-                locations=locations,
-                listing_types=scheduled_job.listing_types,  # Use new multi-select field
-                listing_type=scheduled_job.listing_type,  # Keep for backward compatibility
+                scheduled_job_id=scheduled_job.scheduled_job_id,
+                locations=all_locations,
+                listing_types=scheduled_job.listing_types,
+                listing_type=scheduled_job.listing_type,
                 property_types=scheduled_job.property_types,
                 past_days=scheduled_job.past_days,
                 date_from=scheduled_job.date_from,
@@ -223,20 +266,46 @@ class JobScheduler:
                 proxy_config=scheduled_job.proxy_config,
                 user_agent=scheduled_job.user_agent,
                 request_delay=scheduled_job.request_delay,
-                total_locations=len(locations)
+                total_locations=len(all_locations),
+                split_by_zip=getattr(scheduled_job, "split_by_zip", False),
             )
-            
-            # Save to database
+
             await db.create_job(new_job)
-            
-            logger.info(f"Created job instance {new_job_id} from scheduled job {scheduled_job.scheduled_job_id}")
-            
-            return new_job
-            
+
+            logger.info(
+                "Created job instance from scheduled job %s with %d location(s)",
+                scheduled_job.scheduled_job_id,
+                len(all_locations),
+            )
+
+            return [new_job]
+
         except Exception as e:
-            logger.error(f"Error creating scheduled job instance: {e}")
+            logger.error(f"Error creating scheduled job instances: {e}")
             raise
-    
+
+    def _build_location_chunks(
+        self,
+        locations: List[str],
+        *,
+        split_by_zip: bool,
+        zip_batch_size: Optional[int],
+    ) -> List[Dict[str, Iterable[str]]]:
+        if not locations:
+            return []
+
+        if not split_by_zip:
+            return [{"locations": locations, "label": None, "split": False}]
+
+        batch_size = zip_batch_size if zip_batch_size and zip_batch_size > 0 else None
+        chunk_definitions: List[Dict[str, Iterable[str]]] = []
+
+        for location in locations:
+            expanded_chunks = zip_code_service.expand_location(location, batch_size)
+            chunk_definitions.extend(expanded_chunks)
+
+        return chunk_definitions
+
     async def _get_active_properties_locations(self) -> List[str]:
         """Get unique locations from properties with crm_status='active'"""
         try:
