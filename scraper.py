@@ -565,35 +565,61 @@ class MLSScraper:
             
             # Check for missing properties that may have gone off-market
             off_market_result = None
-            if found_property_ids and listing_types_to_scrape and job.scheduled_job_id:
-                # Only check if we're scraping for_sale or pending and have a scheduled_job_id
+            if found_property_ids and listing_types_to_scrape:
+                # Only check if we're scraping for_sale or pending
                 if any(lt in ['for_sale', 'pending'] for lt in listing_types_to_scrape):
-                    print(f"   [OFF-MARKET] Starting off-market detection for scheduled job {job.scheduled_job_id}")
-                    try:
-                        # Use job start time (not end time) to ensure we only check properties
-                        # that weren't scraped in THIS job run
-                        job_start = job_start_time or datetime.utcnow()
-                        
-                        off_market_result = await self.check_missing_properties_for_off_market(
-                            scheduled_job_id=job.scheduled_job_id,
-                            listing_types_scraped=listing_types_to_scrape,
-                            found_property_ids=found_property_ids,
-                            job_start_time=job_start,
-                            proxy_config=proxy_config,
-                            cancel_flag=cancel_flag,
-                            batch_size=50,  # Process in batches of 50
-                            progress_logs=progress_logs,
-                            job_id=job.job_id
-                        )
-                        print(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
-                    except Exception as e:
-                        print(f"   [OFF-MARKET] Error during off-market detection: {e}")
-                        off_market_result = {
-                            "missing_checked": 0,
-                            "off_market_found": 0,
-                            "errors": 1,
-                            "error": str(e)
-                        }
+                    # Use job start time (not end time) to ensure we only check properties
+                    # that weren't scraped in THIS job run
+                    job_start = job_start_time or datetime.utcnow()
+                    
+                    if job.scheduled_job_id:
+                        # Scheduled job: use scheduled_job_id for precise tracking
+                        print(f"   [OFF-MARKET] Starting off-market detection for scheduled job {job.scheduled_job_id}")
+                        try:
+                            off_market_result = await self.check_missing_properties_for_off_market(
+                                scheduled_job_id=job.scheduled_job_id,
+                                listing_types_scraped=listing_types_to_scrape,
+                                found_property_ids=found_property_ids,
+                                job_start_time=job_start,
+                                proxy_config=proxy_config,
+                                cancel_flag=cancel_flag,
+                                batch_size=50,  # Process in batches of 50
+                                progress_logs=progress_logs,
+                                job_id=job.job_id
+                            )
+                            print(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
+                        except Exception as e:
+                            print(f"   [OFF-MARKET] Error during off-market detection: {e}")
+                            off_market_result = {
+                                "missing_checked": 0,
+                                "off_market_found": 0,
+                                "errors": 1,
+                                "error": str(e)
+                            }
+                    else:
+                        # One-time job: use location-based matching as fallback
+                        print(f"   [OFF-MARKET] Starting off-market detection for location {location} (one-time job)")
+                        try:
+                            off_market_result = await self.check_missing_properties_for_off_market_by_location(
+                                location=location,
+                                listing_types_scraped=listing_types_to_scrape,
+                                found_property_ids=found_property_ids,
+                                job_start_time=job_start,
+                                proxy_config=proxy_config,
+                                cancel_flag=cancel_flag,
+                                batch_size=50,
+                                progress_logs=progress_logs,
+                                job_id=job.job_id
+                            )
+                            print(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
+                        except Exception as e:
+                            print(f"   [OFF-MARKET] Error during off-market detection: {e}")
+                            off_market_result = {
+                                "missing_checked": 0,
+                                "off_market_found": 0,
+                                "errors": 1,
+                                "error": str(e)
+                            }
             
             # Create final summary for this location
             final_summary = {
@@ -1273,6 +1299,256 @@ class MLSScraper:
             
         except Exception as e:
             print(f"   [OFF-MARKET] Error in off-market detection: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "missing_checked": 0,
+                "off_market_found": 0,
+                "errors": 1,
+                "skipped": False,
+                "error": str(e)
+            }
+    
+    async def check_missing_properties_for_off_market_by_location(
+        self,
+        location: str,
+        listing_types_scraped: List[str],
+        found_property_ids: set[str],
+        job_start_time: datetime,
+        proxy_config: Optional[Dict[str, Any]] = None,
+        cancel_flag: Optional[dict] = None,
+        batch_size: int = 50,
+        progress_logs: Optional[List[Dict[str, Any]]] = None,
+        job_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Check for missing properties using location-based matching (for one-time jobs without scheduled_job_id).
+        This is a fallback method when scheduled_job_id is not available.
+        
+        Uses city+state matching to find properties that weren't scraped in the current run.
+        """
+        try:
+            # Only check for for_sale and pending properties
+            listing_types_to_check = ['for_sale', 'pending']
+            
+            # Parse city and state from location
+            city, state = self._parse_city_state_from_location(location)
+            if not city or not state:
+                print(f"   [OFF-MARKET] Could not parse city/state from location '{location}', skipping check")
+                return {
+                    "missing_checked": 0,
+                    "off_market_found": 0,
+                    "errors": 0,
+                    "skipped": True,
+                    "reason": "Could not parse city/state"
+                }
+            
+            print(f"   [OFF-MARKET] Checking for missing properties in {city}, {state} (location-based)")
+            print(f"   [OFF-MARKET] Job start time: {job_start_time.isoformat()}")
+            
+            # Query database for properties in this city/state that weren't scraped recently
+            # For one-time jobs, we check properties with last_scraped < job_start_time OR no last_scraped
+            query = {
+                "address.city": {"$regex": f"^{city}$", "$options": "i"},
+                "address.state": {"$regex": f"^{state}$", "$options": "i"},
+                "listing_type": {"$in": listing_types_to_check},
+                "$or": [
+                    {"last_scraped": {"$lt": job_start_time}},
+                    {"last_scraped": None},
+                    {"last_scraped": {"$exists": False}}
+                ]
+            }
+            
+            cursor = db.properties_collection.find(query).sort("last_scraped", 1).limit(10000)
+            
+            existing_properties = []
+            async for prop_data in cursor:
+                prop_data["_id"] = str(prop_data["_id"])
+                # Convert ObjectId fields to strings
+                if "agent_id" in prop_data and prop_data["agent_id"]:
+                    prop_data["agent_id"] = str(prop_data["agent_id"])
+                if "broker_id" in prop_data and prop_data["broker_id"]:
+                    prop_data["broker_id"] = str(prop_data["broker_id"])
+                if "office_id" in prop_data and prop_data["office_id"]:
+                    prop_data["office_id"] = str(prop_data["office_id"])
+                if "builder_id" in prop_data and prop_data["builder_id"]:
+                    prop_data["builder_id"] = str(prop_data["builder_id"])
+                existing_properties.append(Property(**prop_data))
+            
+            if not existing_properties:
+                print(f"   [OFF-MARKET] No existing properties found in database for {city}, {state}")
+                return {
+                    "missing_checked": 0,
+                    "off_market_found": 0,
+                    "errors": 0,
+                    "skipped": False
+                }
+            
+            # Filter to properties that weren't found in current scrape
+            missing_properties = [
+                prop for prop in existing_properties
+                if prop.property_id not in found_property_ids
+            ]
+            
+            if not missing_properties:
+                print(f"   [OFF-MARKET] All existing properties were found in current scrape")
+                return {
+                    "missing_checked": 0,
+                    "off_market_found": 0,
+                    "errors": 0,
+                    "skipped": False
+                }
+            
+            total_missing = len(missing_properties)
+            print(f"   [OFF-MARKET] Found {total_missing} missing properties, processing in batches of {batch_size}")
+            
+            # Use the same batch processing logic as scheduled job method
+            off_market_count = 0
+            error_count = 0
+            total_checked = 0
+            
+            # Import history_tracker for recording changes
+            from services.history_tracker import HistoryTracker
+            history_tracker = HistoryTracker(db.db)
+            
+            # Process properties in batches until all are checked
+            batch_number = 0
+            while missing_properties:
+                # Check cancellation flag
+                if cancel_flag and cancel_flag.get("cancelled", False):
+                    print(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
+                    break
+                
+                batch_number += 1
+                # Get next batch
+                batch = missing_properties[:batch_size]
+                remaining = len(missing_properties) - len(batch)
+                
+                print(f"   [OFF-MARKET] Processing batch {batch_number}: {len(batch)} properties ({(total_checked + len(batch))}/{total_missing} total, {remaining} remaining)")
+                
+                # Update progress logs if provided
+                if progress_logs is not None and job_id:
+                    try:
+                        # Find most recent location entry in progress logs
+                        location_log_idx = None
+                        for idx in range(len(progress_logs) - 1, -1, -1):  # Search backwards
+                            log = progress_logs[idx]
+                            if isinstance(log, dict) and log.get("location") == location:
+                                location_log_idx = idx
+                                break
+                        
+                        if location_log_idx is not None:
+                            progress_logs[location_log_idx]["off_market_check"] = {
+                                "status": "in_progress",
+                                "location": location,
+                                "total_missing": total_missing,
+                                "checked": total_checked,
+                                "current_batch": batch_number,
+                                "batch_size": len(batch),
+                                "remaining": remaining,
+                                "off_market_found": off_market_count,
+                                "errors": error_count
+                            }
+                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    except Exception as e:
+                        print(f"   [OFF-MARKET] Error updating progress logs: {e}")
+                
+                # Check each property in batch
+                for i, prop in enumerate(batch):
+                    # Check cancellation flag
+                    if cancel_flag and cancel_flag.get("cancelled", False):
+                        print(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
+                        break
+                    
+                    try:
+                        # Query property directly by address
+                        if not prop.address or not prop.address.formatted_address:
+                            print(f"   [OFF-MARKET] Property {prop.property_id} has no formatted_address, skipping")
+                            total_checked += 1
+                            continue
+                        
+                        current_num = total_checked + i + 1
+                        print(f"   [OFF-MARKET] Checking property {current_num}/{total_missing} (batch {batch_number}): {prop.address.formatted_address}")
+                        
+                        queried_property = await self.query_property_by_address(
+                            prop.address.formatted_address,
+                            proxy_config
+                        )
+                        
+                        if queried_property:
+                            # Check if property is off-market
+                            if self.is_off_market_status(queried_property.status, queried_property.mls_status):
+                                print(f"   [OFF-MARKET] [OK] Property {prop.property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
+                                
+                                # Update property status
+                                old_status = prop.status or 'UNKNOWN'
+                                await db.properties_collection.update_one(
+                                    {"property_id": prop.property_id},
+                                    {
+                                        "$set": {
+                                            "status": "OFF_MARKET",
+                                            "mls_status": queried_property.mls_status or prop.mls_status,
+                                            "scraped_at": datetime.utcnow()
+                                        }
+                                    }
+                                )
+                                
+                                # Record status change in change_logs
+                                try:
+                                    change_entry = {
+                                        "field": "status",
+                                        "old_value": old_status,
+                                        "new_value": "OFF_MARKET",
+                                        "change_type": "modified",
+                                        "timestamp": datetime.utcnow()
+                                    }
+                                    await history_tracker.record_change_logs(
+                                        prop.property_id,
+                                        [change_entry],
+                                        "off_market_detection"
+                                    )
+                                except Exception as e:
+                                    print(f"   [OFF-MARKET] Error recording change log: {e}")
+                                
+                                off_market_count += 1
+                            else:
+                                print(f"   [OFF-MARKET] Property {prop.property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
+                        else:
+                            print(f"   [OFF-MARKET] Property {prop.property_id} not found in HomeHarvest (may be deleted)")
+                        
+                        # Add delay between queries to avoid rate limiting
+                        if i < len(batch) - 1:  # Don't delay after last property in batch
+                            await asyncio.sleep(1.0)  # 1 second delay between queries
+                        
+                    except Exception as e:
+                        error_count += 1
+                        print(f"   [OFF-MARKET] Error checking property {prop.property_id}: {e}")
+                        continue
+                
+                # Remove processed batch from list
+                total_checked += len(batch)
+                missing_properties = missing_properties[batch_size:]
+                
+                # Add delay between batches (shorter delay)
+                if missing_properties:
+                    print(f"   [OFF-MARKET] Batch {batch_number} complete: {off_market_count} off-market found so far, {len(missing_properties)} remaining")
+                    await asyncio.sleep(2.0)  # 2 second delay between batches
+            
+            result = {
+                "missing_checked": total_checked,
+                "missing_total": total_missing,
+                "missing_skipped": 0,  # No longer skipping - all are checked
+                "off_market_found": off_market_count,
+                "errors": error_count,
+                "batches_processed": batch_number,
+                "skipped": False
+            }
+            
+            print(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
+            return result
+            
+        except Exception as e:
+            print(f"   [OFF-MARKET] Error in off-market detection (location-based): {e}")
             import traceback
             traceback.print_exc()
             return {
