@@ -913,7 +913,7 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
                                 # Convert DataFrame to Property models
                                 for index, row in properties_df.iterrows():
                                     try:
-                                        property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type)
+                                        property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
                                         if listing_type == "sold":
                                             property_obj.is_comp = True
                                         all_properties.append(property_obj)
