@@ -300,6 +300,8 @@ class Property(BaseModel):
     # Metadata
     scraped_at: datetime = Field(default_factory=datetime.utcnow)
     job_id: Optional[str] = None
+    scheduled_job_id: Optional[str] = Field(None, description="ID of the scheduled job that scrapes this property")
+    last_scraped: Optional[datetime] = Field(None, description="Timestamp when this property was last successfully scraped")
     source: str = Field(default="homeharvest")
     is_comp: bool = Field(default=False, description="Whether this property is a comp for another property")
     

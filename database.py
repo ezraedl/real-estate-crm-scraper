@@ -68,6 +68,9 @@ class Database:
             await self.properties_collection.create_index([("status", ASCENDING)])
             await self.properties_collection.create_index([("scraped_at", DESCENDING)])
             await self.properties_collection.create_index([("job_id", ASCENDING)])
+            await self.properties_collection.create_index([("scheduled_job_id", ASCENDING)])
+            await self.properties_collection.create_index([("last_scraped", ASCENDING)])
+            await self.properties_collection.create_index([("scheduled_job_id", ASCENDING), ("last_scraped", ASCENDING)])
             await self.properties_collection.create_index([("crm_property_ids", ASCENDING)])
             
             # Scheduled jobs collection indexes
@@ -385,13 +388,19 @@ class Database:
                 new_hash = property_data.content_hash
                 
                 if existing_hash == new_hash:
-                    # Content unchanged - only update days_on_mls and scraped_at
+                    # Content unchanged - only update days_on_mls, scraped_at, scheduled_job_id, and last_scraped
                     # But also ensure contact IDs are preserved/updated if contacts exist
                     update_fields = {
                         "days_on_mls": property_data.days_on_mls,
                         "scraped_at": property_data.scraped_at,
                         "job_id": property_data.job_id
                     }
+                    
+                    # Update scheduled_job_id and last_scraped
+                    if property_data.scheduled_job_id:
+                        update_fields["scheduled_job_id"] = property_data.scheduled_job_id
+                    if property_data.last_scraped:
+                        update_fields["last_scraped"] = property_data.last_scraped
                     
                     # Check if we need to create/update contacts (in case contacts weren't created before)
                     if (property_data.agent and property_data.agent.agent_name and not existing_property.get("agent_id")) or \
@@ -453,6 +462,12 @@ class Database:
                     property_data.builder_id = contact_ids.get("builder_id")
                     property_data.office_id = contact_ids.get("office_id")
                     
+                    # Ensure scheduled_job_id and last_scraped are set
+                    if property_data.scheduled_job_id:
+                        property_data.scheduled_job_id = property_data.scheduled_job_id
+                    if not property_data.last_scraped:
+                        property_data.last_scraped = datetime.utcnow()
+                    
                     property_dict = property_data.dict(by_alias=True, exclude={"id"})
                     result = await self.properties_collection.replace_one(
                         {"property_id": property_data.property_id},
@@ -496,6 +511,12 @@ class Database:
                 property_data.broker_id = contact_ids.get("broker_id")
                 property_data.builder_id = contact_ids.get("builder_id")
                 property_data.office_id = contact_ids.get("office_id")
+                
+                # Ensure scheduled_job_id and last_scraped are set
+                if property_data.scheduled_job_id:
+                    property_data.scheduled_job_id = property_data.scheduled_job_id
+                if not property_data.last_scraped:
+                    property_data.last_scraped = datetime.utcnow()
                 
                 property_dict = property_data.dict(by_alias=True, exclude={"id"})
                 result = await self.properties_collection.insert_one(property_dict)
@@ -653,6 +674,41 @@ class Database:
             return properties
         except Exception as e:
             print(f"Error searching properties: {e}")
+            return []
+    
+    async def find_properties_by_city_state(self, city: str, state: str, listing_types: Optional[List[str]] = None, limit: int = 1000) -> List[Property]:
+        """Find properties by city and state, optionally filtered by listing_types. Returns sorted by most recently scraped."""
+        try:
+            # Build query
+            query = {
+                "address.city": {"$regex": f"^{city}$", "$options": "i"},
+                "address.state": {"$regex": f"^{state}$", "$options": "i"}
+            }
+            
+            # Add listing_type filter if provided
+            if listing_types:
+                query["listing_type"] = {"$in": listing_types}
+            
+            # Sort by most recently scraped (descending) to prioritize recent properties
+            cursor = self.properties_collection.find(query).sort("scraped_at", DESCENDING).limit(limit)
+            
+            properties = []
+            async for prop_data in cursor:
+                prop_data["_id"] = str(prop_data["_id"])
+                # Convert ObjectId fields to strings
+                if "agent_id" in prop_data and prop_data["agent_id"]:
+                    prop_data["agent_id"] = str(prop_data["agent_id"])
+                if "broker_id" in prop_data and prop_data["broker_id"]:
+                    prop_data["broker_id"] = str(prop_data["broker_id"])
+                if "office_id" in prop_data and prop_data["office_id"]:
+                    prop_data["office_id"] = str(prop_data["office_id"])
+                if "builder_id" in prop_data and prop_data["builder_id"]:
+                    prop_data["builder_id"] = str(prop_data["builder_id"])
+                properties.append(Property(**prop_data))
+            
+            return properties
+        except Exception as e:
+            print(f"Error finding properties by city/state: {e}")
             return []
     
     # Statistics Methods
