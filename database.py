@@ -578,10 +578,187 @@ class Database:
                 "enrichment_queue": []  # Property IDs that need enrichment
             }
             
-            # Process each property to determine action and prepare bulk operations
+            # Step 1: Identify which properties need contact processing
+            # This allows us to process all contacts in parallel
+            properties_needing_contacts = []
+            property_processing_info = {}  # Store processing info for each property
+            
             for prop in properties:
                 try:
                     existing_prop = existing_properties.get(prop.property_id)
+                    needs_contacts = False
+                    
+                    if existing_prop:
+                        existing_hash = existing_prop.get("content_hash")
+                        new_hash = prop.content_hash
+                        
+                        if existing_hash == new_hash:
+                            # Content unchanged - check if contacts need updating
+                            needs_contacts = (
+                                (prop.agent and prop.agent.agent_name and not existing_prop.get("agent_id")) or
+                                (prop.broker and prop.broker.broker_name and not existing_prop.get("broker_id")) or
+                                (prop.builder and prop.builder.builder_name and not existing_prop.get("builder_id")) or
+                                (prop.office and prop.office.office_name and not existing_prop.get("office_id"))
+                            )
+                        else:
+                            # Content changed - always process contacts
+                            needs_contacts = True
+                    else:
+                        # New property - always process contacts
+                        needs_contacts = True
+                    
+                    property_processing_info[prop.property_id] = {
+                        "prop": prop,
+                        "existing_prop": existing_prop,
+                        "needs_contacts": needs_contacts
+                    }
+                    
+                    if needs_contacts:
+                        properties_needing_contacts.append(prop)
+                        
+                except Exception as e:
+                    logger.error(f"Error analyzing property {prop.property_id if prop else 'unknown'}: {e}")
+                    results["errors"] += 1
+            
+            # Step 2: Collect all contacts from all properties and send in one batch request
+            contact_results = {}
+            if properties_needing_contacts:
+                logger.debug(f"Collecting contacts from {len(properties_needing_contacts)} properties for batch processing")
+                
+                # Collect all contacts with unique keys
+                batch_contacts = []
+                contact_key_map = {}  # Maps (property_id, contact_type) -> contact_key in batch
+                
+                for prop in properties_needing_contacts:
+                    # Agent contact
+                    if prop.agent and prop.agent.agent_name:
+                        phones = None
+                        phone = None
+                        if prop.agent.agent_phones:
+                            phones = []
+                            for p in prop.agent.agent_phones:
+                                if isinstance(p, dict):
+                                    phones.append({
+                                        "number": p.get('number'),
+                                        "type": p.get('type')
+                                    })
+                                    if not phone and p.get('number'):
+                                        phone = p.get('number')
+                                elif isinstance(p, str):
+                                    phones.append({"number": p})
+                                    if not phone:
+                                        phone = p
+                        
+                        contact_key = f"{prop.property_id}_agent"
+                        contact_key_map[(prop.property_id, 'agent')] = contact_key
+                        batch_contacts.append({
+                            "key": contact_key,
+                            "contact_type": "agent",
+                            "name": prop.agent.agent_name,
+                            "email": prop.agent.agent_email,
+                            "phone": phone,
+                            "phones": phones,
+                            "agent_id": prop.agent.agent_id,
+                            "agent_mls_set": prop.agent.agent_mls_set,
+                            "agent_nrds_id": prop.agent.agent_nrds_id,
+                            "source": "scraper"
+                        })
+                    
+                    # Broker contact
+                    if prop.broker and prop.broker.broker_name:
+                        contact_key = f"{prop.property_id}_broker"
+                        contact_key_map[(prop.property_id, 'broker')] = contact_key
+                        batch_contacts.append({
+                            "key": contact_key,
+                            "contact_type": "broker",
+                            "name": prop.broker.broker_name,
+                            "source": "scraper"
+                        })
+                    
+                    # Builder contact
+                    if prop.builder and prop.builder.builder_name:
+                        contact_key = f"{prop.property_id}_builder"
+                        contact_key_map[(prop.property_id, 'builder')] = contact_key
+                        batch_contacts.append({
+                            "key": contact_key,
+                            "contact_type": "builder",
+                            "name": prop.builder.builder_name,
+                            "source": "scraper"
+                        })
+                    
+                    # Office contact
+                    if prop.office and prop.office.office_name:
+                        phones = None
+                        phone = None
+                        if prop.office.office_phones:
+                            phones = []
+                            for p in prop.office.office_phones:
+                                if isinstance(p, dict):
+                                    phones.append({
+                                        "number": p.get('number'),
+                                        "type": p.get('type')
+                                    })
+                                    if not phone and p.get('number'):
+                                        phone = p.get('number')
+                                elif isinstance(p, str):
+                                    phones.append({"number": p})
+                                    if not phone:
+                                        phone = p
+                        
+                        contact_key = f"{prop.property_id}_office"
+                        contact_key_map[(prop.property_id, 'office')] = contact_key
+                        batch_contacts.append({
+                            "key": contact_key,
+                            "contact_type": "office",
+                            "name": prop.office.office_name,
+                            "email": prop.office.office_email,
+                            "phone": phone,
+                            "phones": phones,
+                            "office_id": prop.office.office_id,
+                            "office_mls_set": prop.office.office_mls_set,
+                            "source": "scraper"
+                        })
+                
+                # Send all contacts in one batch request
+                if batch_contacts:
+                    logger.debug(f"Sending {len(batch_contacts)} contacts in batch request")
+                    batch_result = await self.contact_service.batch_create_or_find_contacts(batch_contacts)
+                    
+                    # Map results back to properties
+                    for prop in properties_needing_contacts:
+                        contact_ids = {
+                            "agent_id": None,
+                            "broker_id": None,
+                            "builder_id": None,
+                            "office_id": None
+                        }
+                        
+                        for contact_type in ['agent', 'broker', 'builder', 'office']:
+                            contact_key = contact_key_map.get((prop.property_id, contact_type))
+                            if contact_key and contact_key in batch_result:
+                                contact = batch_result[contact_key]
+                                if contact and contact.get('_id'):
+                                    contact_ids[f'{contact_type}_id'] = str(contact['_id'])
+                        
+                        contact_results[prop.property_id] = contact_ids
+                else:
+                    # No contacts to process, initialize empty results
+                    for prop in properties_needing_contacts:
+                        contact_results[prop.property_id] = {
+                            "agent_id": None,
+                            "broker_id": None,
+                            "builder_id": None,
+                            "office_id": None
+                        }
+            
+            # Step 3: Build bulk operations using contact results
+            for prop in properties:
+                try:
+                    info = property_processing_info.get(prop.property_id)
+                    if not info:
+                        continue
+                    
+                    existing_prop = info["existing_prop"]
                     
                     if existing_prop:
                         # Property exists - check hash
@@ -600,17 +777,10 @@ class Database:
                             if prop.last_scraped:
                                 update_fields["last_scraped"] = prop.last_scraped
                             
-                            # Check if contacts need updating
-                            needs_contact_update = (
-                                (prop.agent and prop.agent.agent_name and not existing_prop.get("agent_id")) or
-                                (prop.broker and prop.broker.broker_name and not existing_prop.get("broker_id")) or
-                                (prop.builder and prop.builder.builder_name and not existing_prop.get("builder_id")) or
-                                (prop.office and prop.office.office_name and not existing_prop.get("office_id"))
-                            )
-                            
-                            if needs_contact_update:
-                                # Process contacts individually (may need async calls)
-                                contact_ids = await self.contact_service.process_property_contacts(prop)
+                            # Add contact IDs if they were processed
+                            if info["needs_contacts"]:
+                                contact_ids = contact_results.get(prop.property_id, {})
+                                # Preserve existing contact IDs if new ones weren't created
                                 if existing_prop.get("agent_id"):
                                     contact_ids["agent_id"] = existing_prop.get("agent_id")
                                 if existing_prop.get("broker_id"):
@@ -641,7 +811,7 @@ class Database:
                             })
                         else:
                             # Content changed - full update
-                            contact_ids = await self.contact_service.process_property_contacts(prop)
+                            contact_ids = contact_results.get(prop.property_id, {})
                             
                             # Preserve existing contact IDs if new ones weren't created
                             if existing_prop.get("agent_id") and not contact_ids.get("agent_id"):
@@ -684,7 +854,7 @@ class Database:
                             })
                     else:
                         # New property - insert
-                        contact_ids = await self.contact_service.process_property_contacts(prop)
+                        contact_ids = contact_results.get(prop.property_id, {})
                         
                         prop.agent_id = contact_ids.get("agent_id")
                         prop.broker_id = contact_ids.get("broker_id")
