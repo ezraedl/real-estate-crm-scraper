@@ -2496,6 +2496,166 @@ async def update_dom_all(limit: Optional[int] = None):
         logger.error(f"Error updating DOM: {e}")
         raise HTTPException(status_code=500, detail=f"Error updating DOM: {str(e)}")
 
+@app.post("/enrichment/recover-pending", response_model=EnrichmentRecalcResponse)
+async def recover_pending_enrichment(limit: Optional[int] = None, batch_size: int = 50):
+    """
+    Background recovery job: Find and enrich properties that need enrichment.
+    
+    Finds properties where:
+    1. Current values differ from _old values (changes detected)
+    2. Missing _old values (first time scraping)
+    3. Missing enrichment data
+    
+    This is useful for crash recovery and ensuring all properties are enriched.
+    """
+    try:
+        if not db.enrichment_pipeline:
+            raise HTTPException(status_code=503, detail="Enrichment service not available")
+        
+        logger.info(f"Starting enrichment recovery job (limit: {limit}, batch_size: {batch_size})")
+        
+        # Find properties that need enrichment
+        # Properties where current values differ from _old, or missing _old, or missing enrichment
+        query = {
+            "$or": [
+                # Current values differ from _old (using aggregation to compare)
+                # We'll check this in code since MongoDB aggregation is complex
+                # Missing _old values (first time)
+                {
+                    "$or": [
+                        {"financial.list_price": {"$exists": True, "$ne": None}},
+                        {"status": {"$exists": True, "$ne": None}}
+                    ],
+                    "$or": [
+                        {"financial.list_price_old": {"$exists": False}},
+                        {"status_old": {"$exists": False}},
+                        {"_old_values_scraped_at": {"$exists": False}}
+                    ]
+                },
+                # Missing enrichment
+                {
+                    "$or": [
+                        {"enrichment": {"$exists": False}},
+                        {"enrichment.enrichment_version": {"$ne": "2.0"}}
+                    ]
+                }
+            ]
+        }
+        
+        # Get properties
+        cursor = db.properties_collection.find(query)
+        if limit:
+            cursor = cursor.limit(limit)
+        
+        properties_to_enrich = []
+        async for prop_doc in cursor:
+            property_id = prop_doc.get("property_id")
+            if not property_id:
+                continue
+            
+            # Check if current values differ from _old
+            financial = prop_doc.get("financial", {})
+            current_list_price = financial.get("list_price")
+            old_list_price = financial.get("list_price_old")
+            current_status = prop_doc.get("status")
+            old_status = prop_doc.get("status_old")
+            
+            # Determine if needs enrichment
+            needs_enrichment = False
+            
+            # Missing _old values
+            if not old_list_price and not old_status and not prop_doc.get("_old_values_scraped_at"):
+                needs_enrichment = True
+            # Values differ
+            elif (current_list_price is not None and old_list_price is not None and current_list_price != old_list_price) or \
+                 (current_status is not None and old_status is not None and current_status != old_status):
+                needs_enrichment = True
+            # Missing enrichment
+            elif not prop_doc.get("enrichment") or prop_doc.get("enrichment", {}).get("enrichment_version") != "2.0":
+                needs_enrichment = True
+            
+            if needs_enrichment:
+                properties_to_enrich.append(prop_doc)
+        
+        total_found = len(properties_to_enrich)
+        logger.info(f"Found {total_found} properties that need enrichment")
+        
+        start_time = datetime.utcnow()
+        
+        if total_found == 0:
+            end_time = datetime.utcnow()
+            return EnrichmentRecalcResponse(
+                recalc_type="recovery",
+                total_processed=0,
+                total_updated=0,
+                total_errors=0,
+                started_at=start_time,
+                completed_at=end_time,
+                duration_seconds=(end_time - start_time).total_seconds(),
+                errors=[]
+            )
+        
+        # Process in batches
+        total_processed = 0
+        total_updated = 0
+        total_errors = 0
+        
+        for i in range(0, len(properties_to_enrich), batch_size):
+            batch = properties_to_enrich[i:i + batch_size]
+            batch_number = (i // batch_size) + 1
+            total_batches = (len(properties_to_enrich) + batch_size - 1) // batch_size
+            
+            logger.info(f"Processing batch {batch_number}/{total_batches} ({len(batch)} properties)")
+            
+            for prop_doc in batch:
+                try:
+                    property_id = prop_doc.get("property_id")
+                    property_dict = await db.enrichment_pipeline._get_property_dict(property_id)
+                    
+                    if not property_dict:
+                        total_errors += 1
+                        continue
+                    
+                    # Enrich the property (will use _old values from DB)
+                    enrichment_data = await db.enrichment_pipeline.enrich_property(
+                        property_id=property_id,
+                        property_dict=property_dict,
+                        existing_property=None,  # Will fetch from DB
+                        job_id=None
+                    )
+                    
+                    if enrichment_data:
+                        total_updated += 1
+                    else:
+                        total_errors += 1
+                    
+                    total_processed += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error enriching property {prop_doc.get('property_id', 'unknown')}: {e}")
+                    total_errors += 1
+                    total_processed += 1
+        
+        end_time = datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        
+        logger.info(f"Recovery job completed: {total_processed} processed, {total_updated} updated, {total_errors} errors")
+        
+        return EnrichmentRecalcResponse(
+            recalc_type="recovery",
+            total_processed=total_processed,
+            total_updated=total_updated,
+            total_errors=total_errors,
+            started_at=start_time,
+            completed_at=end_time,
+            duration_seconds=duration,
+            errors=[]
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in enrichment recovery: {e}")
+        raise HTTPException(status_code=500, detail=f"Error in enrichment recovery: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     # Use Railway's PORT environment variable if available, otherwise use settings
