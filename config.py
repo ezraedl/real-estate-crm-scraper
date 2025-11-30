@@ -43,7 +43,8 @@ class Settings:
     REQUEST_DELAY = float(get_required_env("REQUEST_DELAY", "1.0"))
     MAX_RETRIES = int(get_required_env("MAX_RETRIES", "3"))
     # Location timeout: if a location hasn't added/updated properties in this many minutes, mark it as failed
-    LOCATION_TIMEOUT_MINUTES = int(get_required_env("LOCATION_TIMEOUT_MINUTES", "30"))
+    # Default: 10 minutes - if no properties are added/updated in 10 minutes, the location is likely stuck
+    LOCATION_TIMEOUT_MINUTES = int(get_required_env("LOCATION_TIMEOUT_MINUTES", "10"))
     
     # Rate Limiting - Default values
     RATE_LIMIT_PER_MINUTE = int(get_required_env("RATE_LIMIT_PER_MINUTE", "60"))
