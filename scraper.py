@@ -216,12 +216,12 @@ class MLSScraper:
                             successful_locations += 1
                     
                     except Exception as e:
-                    location_failed = True
-                    location_error = str(e)
-                    print(f"Error scraping location {location}: {e}")
-                    import traceback
-                    error_traceback = traceback.format_exc()
-                    print(f"Traceback: {error_traceback}")
+                        location_failed = True
+                        location_error = str(e)
+                        print(f"Error scraping location {location}: {e}")
+                        import traceback
+                        error_traceback = traceback.format_exc()
+                        print(f"Traceback: {error_traceback}")
                 
                 # Handle failed location
                 if location_failed:
