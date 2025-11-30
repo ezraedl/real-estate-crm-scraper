@@ -168,54 +168,54 @@ class MLSScraper:
                     location_error = None
                     
                     try:
-                    print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
-                    
-                    # Get proxy configuration
-                    proxy_config = await self.get_proxy_config(job)
-                    
-                    # Scrape properties for this location (saves after each listing type)
-                    running_totals = {
-                        "total_properties": total_properties,
-                        "saved_properties": saved_properties,
-                        "total_inserted": total_inserted,
-                        "total_updated": total_updated,
-                        "total_skipped": total_skipped
-                    }
-                    
-                    location_summary = await self.scrape_location(
-                        location=location,
-                        job=job,
-                        proxy_config=proxy_config,
-                        cancel_flag=cancel_flag,
-                        progress_logs=progress_logs,
-                        running_totals=running_totals,
-                        location_index=i + 1,
-                        total_locations=len(job.locations),
-                        job_start_time=job_start_time,
-                        location_last_update=location_last_update
-                    )
-                    
-                    # Check if location scraping failed (returns None or has error status)
-                    if location_summary is None or location_summary.get("status") == "failed":
-                        location_failed = True
-                        location_error = location_summary.get("error", "Unknown error") if location_summary else "Scraping returned None"
-                        print(f"Location {location} failed: {location_error}")
-                    else:
-                        # Update totals from running_totals (modified by scrape_location)
-                        total_properties = running_totals["total_properties"]
-                        saved_properties = running_totals["saved_properties"]
-                        total_inserted = running_totals["total_inserted"]
-                        total_updated = running_totals["total_updated"]
-                        total_skipped = running_totals["total_skipped"]
+                        print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
                         
-                        # Location summary is already in progress_logs (replaced temp entry in scrape_location)
-                        # So we don't need to append it again here
-                        if location_summary:
-                            print(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
+                        # Get proxy configuration
+                        proxy_config = await self.get_proxy_config(job)
                         
-                        successful_locations += 1
+                        # Scrape properties for this location (saves after each listing type)
+                        running_totals = {
+                            "total_properties": total_properties,
+                            "saved_properties": saved_properties,
+                            "total_inserted": total_inserted,
+                            "total_updated": total_updated,
+                            "total_skipped": total_skipped
+                        }
+                        
+                        location_summary = await self.scrape_location(
+                            location=location,
+                            job=job,
+                            proxy_config=proxy_config,
+                            cancel_flag=cancel_flag,
+                            progress_logs=progress_logs,
+                            running_totals=running_totals,
+                            location_index=i + 1,
+                            total_locations=len(job.locations),
+                            job_start_time=job_start_time,
+                            location_last_update=location_last_update
+                        )
+                        
+                        # Check if location scraping failed (returns None or has error status)
+                        if location_summary is None or location_summary.get("status") == "failed":
+                            location_failed = True
+                            location_error = location_summary.get("error", "Unknown error") if location_summary else "Scraping returned None"
+                            print(f"Location {location} failed: {location_error}")
+                        else:
+                            # Update totals from running_totals (modified by scrape_location)
+                            total_properties = running_totals["total_properties"]
+                            saved_properties = running_totals["saved_properties"]
+                            total_inserted = running_totals["total_inserted"]
+                            total_updated = running_totals["total_updated"]
+                            total_skipped = running_totals["total_skipped"]
+                            
+                            # Location summary is already in progress_logs (replaced temp entry in scrape_location)
+                            # So we don't need to append it again here
+                            if location_summary:
+                                print(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
+                            
+                            successful_locations += 1
                     
-                except Exception as e:
+                    except Exception as e:
                     location_failed = True
                     location_error = str(e)
                     print(f"Error scraping location {location}: {e}")
