@@ -97,6 +97,9 @@ class JobScheduler:
                             logger.info(
                                 f"Running scheduled job: {job_instance.job_id}{chunk_suffix} (from {scheduled_job.scheduled_job_id})"
                             )
+                            # Update last_run_at when job instance is created (not just on completion)
+                            # This prevents the scheduler from thinking the job never ran if it gets stuck
+                            await db.update_scheduled_job(scheduled_job.scheduled_job_id, {"last_run_at": now})
                             asyncio.create_task(scraper.process_job(job_instance))
                         
                 except Exception as e:
@@ -117,13 +120,60 @@ class JobScheduler:
                 return False
             
             # Check if there's already a running job for this scheduled job
-            # Check dynamically instead of relying on cached field
-            running_jobs_count = await db.jobs_collection.count_documents({
+            # Also check for stuck jobs (running for more than 24 hours or not in active jobs for >1 hour)
+            running_jobs_cursor = db.jobs_collection.find({
                 "scheduled_job_id": scheduled_job.scheduled_job_id,
                 "status": JobStatus.RUNNING.value
             })
-            if running_jobs_count > 0:
-                logger.debug(f"Scheduled job {scheduled_job.scheduled_job_id} already has {running_jobs_count} running job(s), skipping")
+            
+            running_jobs = []
+            async for job_data in running_jobs_cursor:
+                running_jobs.append(job_data)
+            
+            # Check if any running jobs are actually stuck (not in scraper's current_jobs)
+            active_running_jobs = []
+            stuck_job_threshold_24h = now - timedelta(hours=24)
+            stuck_job_threshold_1h = now - timedelta(hours=1)
+            
+            for job_data in running_jobs:
+                job_id = job_data.get("job_id") or str(job_data.get("_id", ""))
+                updated_at = job_data.get("updated_at")
+                created_at = job_data.get("created_at")
+                
+                # Check if job is actually still running in the scraper
+                if job_id in scraper.current_jobs:
+                    # Job is active, but check if it's been running for more than 24 hours (truly stuck)
+                    check_time = updated_at or created_at
+                    if check_time and check_time < stuck_job_threshold_24h:
+                        logger.warning(
+                            f"Found long-running job {job_id} for scheduled job {scheduled_job.scheduled_job_id}. "
+                            f"Running for more than 24 hours (started: {check_time}), marking as failed."
+                        )
+                        await db.update_job_status(job_id, JobStatus.FAILED, error_message="Job running for more than 24 hours - likely stuck")
+                    else:
+                        active_running_jobs.append(job_data)
+                else:
+                    # Job is in RUNNING status but not in scraper's current_jobs - it's stuck
+                    # Check if it's been stuck for more than 1 hour
+                    check_time = updated_at or created_at
+                    if check_time and check_time < stuck_job_threshold_1h:
+                        logger.warning(
+                            f"Found stuck job {job_id} for scheduled job {scheduled_job.scheduled_job_id}. "
+                            f"Not in active jobs, last activity: {check_time}, marking as failed."
+                        )
+                        # Mark stuck job as failed
+                        await db.update_job_status(job_id, JobStatus.FAILED, error_message="Job stuck in running status - not found in active jobs")
+                    else:
+                        # Job might be starting up, give it a chance
+                        logger.debug(
+                            f"Job {job_id} is in RUNNING status but not in active jobs yet. "
+                            f"Last activity: {check_time}. Will check again next cycle."
+                        )
+                        active_running_jobs.append(job_data)  # Count it as active to be safe
+            
+            # Only count actually active running jobs
+            if len(active_running_jobs) > 0:
+                logger.debug(f"Scheduled job {scheduled_job.scheduled_job_id} already has {len(active_running_jobs)} active running job(s), skipping")
                 return False
             
             # Determine base time: use last_run_at if available, otherwise use a recent time

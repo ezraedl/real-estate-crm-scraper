@@ -42,6 +42,8 @@ class Settings:
     MAX_CONCURRENT_JOBS = int(get_required_env("MAX_CONCURRENT_JOBS", "3"))
     REQUEST_DELAY = float(get_required_env("REQUEST_DELAY", "1.0"))
     MAX_RETRIES = int(get_required_env("MAX_RETRIES", "3"))
+    # Location timeout: if a location hasn't added/updated properties in this many minutes, mark it as failed
+    LOCATION_TIMEOUT_MINUTES = int(get_required_env("LOCATION_TIMEOUT_MINUTES", "30"))
     
     # Rate Limiting - Default values
     RATE_LIMIT_PER_MINUTE = int(get_required_env("RATE_LIMIT_PER_MINUTE", "60"))

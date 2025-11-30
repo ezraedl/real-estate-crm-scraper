@@ -59,6 +59,36 @@ class MLSScraper:
                     break
         except Exception as e:
             print(f"[MONITOR] Error in cancellation monitor: {e}")
+    
+    async def check_location_timeout_loop(self, job_id: str, cancel_flag: dict, location_last_update: dict):
+        """Background task that checks for location timeouts every 30 seconds"""
+        try:
+            from config import settings
+            timeout_seconds = settings.LOCATION_TIMEOUT_MINUTES * 60
+            
+            while not cancel_flag.get("cancelled", False):
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                if cancel_flag.get("cancelled", False):
+                    break
+                
+                now = datetime.utcnow()
+                timed_out_locations = []
+                
+                # Check each location for timeout
+                for location, last_update_time in location_last_update.items():
+                    if last_update_time:
+                        time_since_update = (now - last_update_time).total_seconds()
+                        if time_since_update > timeout_seconds:
+                            timed_out_locations.append(location)
+                            print(f"[TIMEOUT] Location {location} has not updated properties in {time_since_update/60:.1f} minutes (timeout: {settings.LOCATION_TIMEOUT_MINUTES} minutes)")
+                
+                # Mark timed out locations (will be handled in main loop)
+                if timed_out_locations:
+                    cancel_flag["timed_out_locations"] = timed_out_locations
+                    
+        except Exception as e:
+            print(f"[MONITOR] Error in location timeout monitor: {e}")
 
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
@@ -67,8 +97,16 @@ class MLSScraper:
         # Cancellation flag shared between main task and monitor
         cancel_flag = {"cancelled": False}
         
+        # Track last property update time per location for timeout detection
+        location_last_update = {}  # {location: datetime}
+        
         # Start background cancellation monitor
         monitor_task = asyncio.create_task(self.check_cancellation_loop(job.job_id, cancel_flag))
+        
+        # Start background location timeout monitor
+        location_timeout_monitor = asyncio.create_task(
+            self.check_location_timeout_loop(job.job_id, cancel_flag, location_last_update)
+        )
         
         try:
             # Initialize progress logs with job start
@@ -103,20 +141,33 @@ class MLSScraper:
                     print(f"Job {job.job_id} was cancelled, stopping execution")
                     return  # Exit immediately
                 
-                # Log location start
-                progress_logs.append({
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "event": "location_started",
-                    "location": location,
-                    "location_index": i + 1,
-                    "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
-                })
-                await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
-                
-                location_failed = False
-                location_error = None
-                
-                try:
+                # Check if this location has timed out
+                timed_out_locations = cancel_flag.get("timed_out_locations", [])
+                if location in timed_out_locations:
+                    from config import settings
+                    location_failed = True
+                    location_error = f"Location timeout: no properties added/updated in {settings.LOCATION_TIMEOUT_MINUTES} minutes"
+                    print(f"[TIMEOUT] Location {location} timed out, marking as failed and moving to next location")
+                    # Remove from timed out list to avoid reprocessing
+                    timed_out_locations.remove(location)
+                else:
+                    # Initialize last update time for this location
+                    location_last_update[location] = datetime.utcnow()
+                    
+                    # Log location start
+                    progress_logs.append({
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "event": "location_started",
+                        "location": location,
+                        "location_index": i + 1,
+                        "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
+                    })
+                    await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    
+                    location_failed = False
+                    location_error = None
+                    
+                    try:
                     print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
                     
                     # Get proxy configuration
@@ -140,7 +191,8 @@ class MLSScraper:
                         running_totals=running_totals,
                         location_index=i + 1,
                         total_locations=len(job.locations),
-                        job_start_time=job_start_time
+                        job_start_time=job_start_time,
+                        location_last_update=location_last_update
                     )
                     
                     # Check if location scraping failed (returns None or has error status)
@@ -216,12 +268,69 @@ class MLSScraper:
                     # Shorter delay after failures
                     await asyncio.sleep(0.5)
             
+            # Retry failed locations once if there are any
+            if failed_locations:
+                print(f"[RETRY] Retrying {len(failed_locations)} failed location(s)...")
+                retry_failed_locations = []
+                
+                for failed_location_entry in failed_locations:
+                    location = failed_location_entry["location"]
+                    failed_location_entry["retry_count"] = failed_location_entry.get("retry_count", 0) + 1
+                    
+                    # Reset timeout tracking for retry
+                    location_last_update[location] = datetime.utcnow()
+                    
+                    # Log retry start
+                    progress_logs.append({
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "event": "location_retry",
+                        "location": location,
+                        "retry_count": failed_location_entry["retry_count"],
+                        "message": f"Retrying location {location} (attempt {failed_location_entry['retry_count']})"
+                    })
+                    await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    
+                    try:
+                        print(f"[RETRY] Scraping location: {location}")
+                        location_summary = await self.scrape_location(
+                            location=location,
+                            job=job,
+                            proxy_config=proxy_config,
+                            cancel_flag=cancel_flag,
+                            progress_logs=progress_logs,
+                            running_totals=running_totals,
+                            location_index=len(job.locations) + len(retry_failed_locations) + 1,
+                            total_locations=len(job.locations) + len(failed_locations),
+                            job_start_time=job_start_time,
+                            location_last_update=location_last_update
+                        )
+                        
+                        if location_summary and location_summary.get("status") != "failed":
+                            # Retry succeeded
+                            total_properties = running_totals["total_properties"]
+                            saved_properties = running_totals["saved_properties"]
+                            total_inserted = running_totals["total_inserted"]
+                            total_updated = running_totals["total_updated"]
+                            total_skipped = running_totals["total_skipped"]
+                            successful_locations += 1
+                            print(f"[RETRY] Location {location} succeeded on retry")
+                        else:
+                            # Retry also failed
+                            retry_failed_locations.append(failed_location_entry)
+                            print(f"[RETRY] Location {location} failed again on retry")
+                    except Exception as e:
+                        retry_failed_locations.append(failed_location_entry)
+                        print(f"[RETRY] Error retrying location {location}: {e}")
+                
+                # Update failed_locations with final retry results
+                failed_locations = retry_failed_locations
+            
             # Mark job as completed (even if some locations failed)
             final_status = JobStatus.COMPLETED
             completion_message = f"Job completed successfully. {successful_locations}/{len(job.locations)} locations processed."
             
             if failed_locations:
-                completion_message += f" {len(failed_locations)} location(s) failed and saved for retry."
+                completion_message += f" {len(failed_locations)} location(s) failed after retry."
                 print(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
             
             # Add completion log
@@ -305,12 +414,18 @@ class MLSScraper:
                 print(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
         
         finally:
-            # Stop the cancellation monitor
-            cancel_flag["cancelled"] = True  # Signal monitor to stop
+            # Stop the cancellation and timeout monitors
+            cancel_flag["cancelled"] = True  # Signal monitors to stop
             if 'monitor_task' in locals():
                 monitor_task.cancel()
                 try:
                     await monitor_task
+                except asyncio.CancelledError:
+                    pass  # Expected
+            if 'location_timeout_monitor' in locals():
+                location_timeout_monitor.cancel()
+                try:
+                    await location_timeout_monitor
                 except asyncio.CancelledError:
                     pass  # Expected
             
@@ -318,7 +433,7 @@ class MLSScraper:
             if job.job_id in self.current_jobs:
                 del self.current_jobs[job.job_id]
     
-    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: list = None, running_totals: dict = None, location_index: int = 1, total_locations: int = 1, job_start_time: Optional[datetime] = None):
+    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: list = None, running_totals: dict = None, location_index: int = 1, total_locations: int = 1, job_start_time: Optional[datetime] = None, location_last_update: dict = None):
         """Scrape properties for a specific location based on job's listing_types. Saves after each type and returns summary."""
         if cancel_flag is None:
             cancel_flag = {"cancelled": False}
@@ -332,6 +447,8 @@ class MLSScraper:
                 "total_updated": 0,
                 "total_skipped": 0
             }
+        if location_last_update is None:
+            location_last_update = {}
         try:
             listing_type_logs = []
             location_total_found = 0
@@ -458,6 +575,10 @@ class MLSScraper:
                         running_totals["total_inserted"] += save_results["inserted"]
                         running_totals["total_updated"] += save_results["updated"]
                         running_totals["total_skipped"] += save_results["skipped"]
+                        
+                        # Update last property update time for this location (for timeout detection)
+                        if location_last_update is not None:
+                            location_last_update[location] = datetime.utcnow()
                         
                         print(f"   [SAVED] {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
                     
