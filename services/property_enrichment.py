@@ -50,7 +50,7 @@ class PropertyEnrichmentPipeline:
         Args:
             property_id: Property identifier
             property_dict: Current property data
-            existing_property: Previous property data (None for new properties)
+            existing_property: DEPRECATED - Previous property data (ignored, will fetch from DB)
             job_id: Scraping job ID for tracking
             
         Returns:
@@ -63,31 +63,38 @@ class PropertyEnrichmentPipeline:
             logger.info(f"Starting enrichment for property {property_id}")
             start_time = datetime.utcnow()
             
-            # Step 1: Detect changes
-            changes = self.property_differ.detect_changes(existing_property, property_dict)
+            # Step 1: Get property from DB and extract _old values for comparison
+            property_doc = await self._get_property_dict(property_id)
+            old_property = self._extract_old_values(property_doc) if property_doc else None
             
-            # Step 2: Record history and change logs
-            await self._record_history_and_changes(property_id, changes, existing_property, property_dict, job_id)
+            # Step 2: Detect changes (compare current vs _old values)
+            changes = self.property_differ.detect_changes(old_property, property_dict)
             
-            # Step 3: Analyze property description
+            # Step 3: Record history and change logs
+            await self._record_history_and_changes(property_id, changes, old_property, property_dict, job_id)
+            
+            # Step 4: Analyze property description
             description = self._extract_description(property_dict)
             text_analysis = self.text_analyzer.analyze_property_description(description)
             
-            # Step 4: Get history data for motivated seller scoring
+            # Step 5: Get history data for motivated seller scoring
             history_data = await self._get_history_data(property_id)
             
-            # Step 5: Calculate motivated seller score (Phase 1 + Phase 2)
+            # Step 6: Calculate motivated seller score (Phase 1 + Phase 2)
             motivated_seller = self.motivated_seller_scorer.calculate_motivated_score(
                 property_dict, text_analysis, history_data
             )
             
-            # Step 6: Assemble enrichment data
+            # Step 7: Assemble enrichment data
             enrichment_data = self._assemble_enrichment_data(
                 changes, text_analysis, motivated_seller, property_dict, history_data
             )
             
-            # Step 7: Update property with enrichment data
+            # Step 8: Update property with enrichment data
             await self._update_property_enrichment(property_id, enrichment_data)
+            
+            # Step 9: Move current values to _old after successful enrichment
+            await self._move_current_to_old(property_id, property_dict)
             
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             logger.info(f"Enrichment completed for property {property_id} in {processing_time:.2f}s")
@@ -663,6 +670,84 @@ class PropertyEnrichmentPipeline:
         except Exception as e:
             logger.error(f"Error getting property {property_id}: {e}")
             return None
+    
+    def _extract_old_values(self, property_doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Extract _old values from property document for comparison.
+        Returns old_property dict in format expected by PropertyDiffer.
+        Returns None if no _old values exist (first scrape).
+        """
+        if not property_doc:
+            return None
+        
+        # Check if _old values exist (check for list_price_old as indicator)
+        financial = property_doc.get('financial', {})
+        if not financial.get('list_price_old') and not property_doc.get('status_old'):
+            # No _old values exist yet (first time scraping)
+            return None
+        
+        # Build old_property dict matching PropertyDiffer expected format
+        old_property = {
+            'financial': {
+                'list_price': financial.get('list_price_old'),
+                'original_list_price': financial.get('original_list_price_old')
+            },
+            'status': property_doc.get('status_old'),
+            'mls_status': property_doc.get('mls_status_old'),
+            'listing_type': property_doc.get('listing_type_old')
+        }
+        
+        return old_property
+    
+    async def _move_current_to_old(self, property_id: str, property_dict: Dict[str, Any]):
+        """
+        Move current tracked values to _old fields after enrichment completes.
+        Sets _old_values_scraped_at to when the current values were scraped.
+        """
+        try:
+            # Extract current values for the 5 tracked fields
+            financial = property_dict.get('financial', {})
+            
+            # Get scraped_at timestamp (when these values were scraped)
+            scraped_at = property_dict.get('scraped_at') or property_dict.get('last_scraped')
+            if isinstance(scraped_at, str):
+                try:
+                    # Try parsing ISO format string
+                    if 'T' in scraped_at or ' ' in scraped_at:
+                        scraped_at = datetime.fromisoformat(scraped_at.replace('Z', '+00:00'))
+                    else:
+                        scraped_at = datetime.utcnow()
+                except (ValueError, AttributeError):
+                    scraped_at = datetime.utcnow()
+            elif isinstance(scraped_at, datetime):
+                # Already a datetime object
+                pass
+            elif not scraped_at:
+                scraped_at = datetime.utcnow()
+            
+            # Prepare update fields
+            update_fields = {
+                # Copy current to _old
+                'financial.list_price_old': financial.get('list_price'),
+                'financial.original_list_price_old': financial.get('original_list_price'),
+                'status_old': property_dict.get('status'),
+                'mls_status_old': property_dict.get('mls_status'),
+                'listing_type_old': property_dict.get('listing_type'),
+                # Timestamp when these values were scraped
+                '_old_values_scraped_at': scraped_at
+            }
+            
+            # Update property document
+            await self.db.properties.update_one(
+                {"property_id": property_id},
+                {"$set": update_fields}
+            )
+            
+            logger.debug(f"Moved current values to _old for property {property_id}")
+            
+        except Exception as e:
+            logger.error(f"Error moving current to _old for property {property_id}: {e}")
+            # Don't raise - this is not critical, enrichment can continue
     
     async def _update_enrichment_with_text_analysis(
         self, 

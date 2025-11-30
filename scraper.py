@@ -2,6 +2,7 @@ import asyncio
 import random
 import re
 import time
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -14,16 +15,19 @@ from database import db
 from proxy_manager import proxy_manager
 from config import settings
 
+logger = logging.getLogger(__name__)
+
 class MLSScraper:
     def __init__(self):
         self.is_running = False
         self.current_jobs = {}
         self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
+        self.enrichment_executor = ThreadPoolExecutor(max_workers=settings.ENRICHMENT_WORKERS)  # Thread pool for enrichment workers
     
     async def start(self):
         """Start the scraper service"""
         self.is_running = True
-        print("MLS Scraper started")
+        logger.info("MLS Scraper started")
         
         while self.is_running:
             try:
@@ -39,13 +43,13 @@ class MLSScraper:
                 await asyncio.sleep(5)
                 
             except Exception as e:
-                print(f"Error in scraper main loop: {e}")
+                logger.error(f"Error in scraper main loop: {e}")
                 await asyncio.sleep(10)
     
     async def stop(self):
         """Stop the scraper service"""
         self.is_running = False
-        print("MLS Scraper stopped")
+        logger.info("MLS Scraper stopped")
     
     async def check_cancellation_loop(self, job_id: str, cancel_flag: dict):
         """Background task that checks for job cancellation every 2 seconds"""
@@ -54,11 +58,11 @@ class MLSScraper:
                 await asyncio.sleep(2)  # Check every 2 seconds
                 current_job_status = await db.get_job(job_id)
                 if current_job_status and current_job_status.status == JobStatus.CANCELLED:
-                    print(f"[MONITOR] Cancellation detected for job {job_id}")
+                    logger.debug(f"[MONITOR] Cancellation detected for job {job_id}")
                     cancel_flag["cancelled"] = True
                     break
         except Exception as e:
-            print(f"[MONITOR] Error in cancellation monitor: {e}")
+            logger.error(f"[MONITOR] Error in cancellation monitor: {e}")
     
     async def check_location_timeout_loop(self, job_id: str, cancel_flag: dict, location_last_update: dict):
         """Background task that checks for location timeouts every 30 seconds"""
@@ -81,14 +85,14 @@ class MLSScraper:
                         time_since_update = (now - last_update_time).total_seconds()
                         if time_since_update > timeout_seconds:
                             timed_out_locations.append(location)
-                            print(f"[TIMEOUT] Location {location} has not updated properties in {time_since_update/60:.1f} minutes (timeout: {settings.LOCATION_TIMEOUT_MINUTES} minutes)")
+                            logger.warning(f"[TIMEOUT] Location {location} has not updated properties in {time_since_update/60:.1f} minutes (timeout: {settings.LOCATION_TIMEOUT_MINUTES} minutes)")
                 
                 # Mark timed out locations (will be handled in main loop)
                 if timed_out_locations:
                     cancel_flag["timed_out_locations"] = timed_out_locations
                     
         except Exception as e:
-            print(f"[MONITOR] Error in location timeout monitor: {e}")
+            logger.error(f"[MONITOR] Error in location timeout monitor: {e}")
 
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
@@ -121,7 +125,7 @@ class MLSScraper:
             # Update job status to running with initial log
             await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
             
-            print(f"Processing job {job.job_id} for {len(job.locations)} locations")
+            logger.info(f"Processing job {job.job_id} for {len(job.locations)} locations")
             
             # Capture job start time for off-market detection
             job_start_time = datetime.utcnow()
@@ -133,12 +137,13 @@ class MLSScraper:
             total_skipped = 0
             failed_locations = []
             successful_locations = 0
+            last_progress_log_time = datetime.utcnow()
             
             # Process each location
             for i, location in enumerate(job.locations):
                 # Check if job has been cancelled (via background monitor)
                 if cancel_flag.get("cancelled", False):
-                    print(f"Job {job.job_id} was cancelled, stopping execution")
+                    logger.info(f"Job {job.job_id} was cancelled, stopping execution")
                     return  # Exit immediately
                 
                 # Check if this location has timed out
@@ -147,7 +152,7 @@ class MLSScraper:
                     from config import settings
                     location_failed = True
                     location_error = f"Location timeout: no properties added/updated in {settings.LOCATION_TIMEOUT_MINUTES} minutes"
-                    print(f"[TIMEOUT] Location {location} timed out, marking as failed and moving to next location")
+                    logger.warning(f"[TIMEOUT] Location {location} timed out, marking as failed and moving to next location")
                     # Remove from timed out list to avoid reprocessing
                     timed_out_locations.remove(location)
                 else:
@@ -168,7 +173,7 @@ class MLSScraper:
                     location_error = None
                     
                     try:
-                        print(f"Scraping location {i+1}/{len(job.locations)}: {location}")
+                        logger.info(f"Scraping location {i+1}/{len(job.locations)}: {location}")
                         
                         # Get proxy configuration
                         proxy_config = await self.get_proxy_config(job)
@@ -199,7 +204,7 @@ class MLSScraper:
                         if location_summary is None or location_summary.get("status") == "failed":
                             location_failed = True
                             location_error = location_summary.get("error", "Unknown error") if location_summary else "Scraping returned None"
-                            print(f"Location {location} failed: {location_error}")
+                            logger.warning(f"Location {location} failed: {location_error}")
                         else:
                             # Update totals from running_totals (modified by scrape_location)
                             total_properties = running_totals["total_properties"]
@@ -211,17 +216,17 @@ class MLSScraper:
                             # Location summary is already in progress_logs (replaced temp entry in scrape_location)
                             # So we don't need to append it again here
                             if location_summary:
-                                print(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
+                                logger.info(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
                             
                             successful_locations += 1
                     
                     except Exception as e:
                         location_failed = True
                         location_error = str(e)
-                        print(f"Error scraping location {location}: {e}")
+                        logger.error(f"Error scraping location {location}: {e}")
                         import traceback
                         error_traceback = traceback.format_exc()
-                        print(f"Traceback: {error_traceback}")
+                        logger.debug(f"Traceback: {error_traceback}")
                 
                 # Handle failed location
                 if location_failed:
@@ -244,7 +249,7 @@ class MLSScraper:
                         "message": f"Location {i+1}/{len(job.locations)} ({location}) failed: {location_error}. Skipping and continuing with next location."
                     }
                     progress_logs.append(failure_log)
-                    print(f"[SKIP] Location {location} failed, continuing with next location...")
+                    logger.debug(f"[SKIP] Location {location} failed, continuing with next location...")
                 
                 # Update job progress with detailed breakdown and logs (including failed locations)
                 await db.update_job_status(
@@ -260,6 +265,23 @@ class MLSScraper:
                     progress_logs=progress_logs
                 )
                 
+                # Periodic progress logging (every 10 locations or 5 minutes)
+                now = datetime.utcnow()
+                time_since_last_log = (now - last_progress_log_time).total_seconds()
+                should_log_progress = (
+                    (i + 1) % 10 == 0 or  # Every 10 locations
+                    time_since_last_log >= 300  # Every 5 minutes
+                )
+                
+                if should_log_progress:
+                    logger.info(
+                        f"Job {job.job_id} progress: {i+1}/{len(job.locations)} locations, "
+                        f"{successful_locations} successful, {len(failed_locations)} failed, "
+                        f"{total_properties} properties scraped, {saved_properties} saved "
+                        f"({total_inserted} inserted, {total_updated} updated)"
+                    )
+                    last_progress_log_time = now
+                
                 # Random delay between locations (even failed ones to avoid hammering)
                 if not location_failed:
                     delay = job.request_delay + random.uniform(0, 1)
@@ -270,7 +292,7 @@ class MLSScraper:
             
             # Retry failed locations once if there are any
             if failed_locations:
-                print(f"[RETRY] Retrying {len(failed_locations)} failed location(s)...")
+                logger.info(f"[RETRY] Retrying {len(failed_locations)} failed location(s)...")
                 retry_failed_locations = []
                 
                 for failed_location_entry in failed_locations:
@@ -291,7 +313,7 @@ class MLSScraper:
                     await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     
                     try:
-                        print(f"[RETRY] Scraping location: {location}")
+                        logger.info(f"[RETRY] Scraping location: {location}")
                         location_summary = await self.scrape_location(
                             location=location,
                             job=job,
@@ -313,14 +335,14 @@ class MLSScraper:
                             total_updated = running_totals["total_updated"]
                             total_skipped = running_totals["total_skipped"]
                             successful_locations += 1
-                            print(f"[RETRY] Location {location} succeeded on retry")
+                            logger.info(f"[RETRY] Location {location} succeeded on retry")
                         else:
                             # Retry also failed
                             retry_failed_locations.append(failed_location_entry)
-                            print(f"[RETRY] Location {location} failed again on retry")
+                            logger.warning(f"[RETRY] Location {location} failed again on retry")
                     except Exception as e:
                         retry_failed_locations.append(failed_location_entry)
-                        print(f"[RETRY] Error retrying location {location}: {e}")
+                        logger.error(f"[RETRY] Error retrying location {location}: {e}")
                 
                 # Update failed_locations with final retry results
                 failed_locations = retry_failed_locations
@@ -331,7 +353,7 @@ class MLSScraper:
             
             if failed_locations:
                 completion_message += f" {len(failed_locations)} location(s) failed after retry."
-                print(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
+                logger.info(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
             
             # Add completion log
             progress_logs.append({
@@ -367,7 +389,7 @@ class MLSScraper:
                         JobStatus.COMPLETED,
                         next_run_at=next_run
                     )
-                    print(f"Updated run history for scheduled job: {job.scheduled_job_id}")
+                    logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id}")
             
             # Legacy: Update run history for old recurring jobs
             elif job.original_job_id:
@@ -376,12 +398,12 @@ class MLSScraper:
                     job.job_id,
                     JobStatus.COMPLETED
                 )
-                print(f"Updated run history for legacy recurring job: {job.original_job_id}")
+                logger.debug(f"Updated run history for legacy recurring job: {job.original_job_id}")
             
-            print(f"Job {job.job_id} completed: {saved_properties} properties saved")
+            logger.info(f"Job {job.job_id} completed: {saved_properties} properties saved")
             
         except Exception as e:
-            print(f"Error processing job {job.job_id}: {e}")
+            logger.error(f"Error processing job {job.job_id}: {e}")
             await db.update_job_status(
                 job.job_id,
                 JobStatus.FAILED,
@@ -402,7 +424,7 @@ class MLSScraper:
                         JobStatus.FAILED,
                         next_run_at=next_run
                     )
-                    print(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
+                    logger.debug(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
             
             # Legacy: Update run history for old recurring jobs (failed)
             elif job.original_job_id:
@@ -411,7 +433,7 @@ class MLSScraper:
                     job.job_id,
                     JobStatus.FAILED
                 )
-                print(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
+                logger.debug(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
         
         finally:
             # Stop the cancellation and timeout monitors
@@ -458,20 +480,21 @@ class MLSScraper:
             location_total_errors = 0
             temp_idx = None  # Track temp entry index for this location
             found_property_ids = set()  # Track property IDs found in current scrape
+            enrichment_queue = []  # Collect properties that need enrichment
             
             # Determine which listing types to scrape
             if job.listing_types and len(job.listing_types) > 0:
                 # Use specified listing types
                 listing_types_to_scrape = job.listing_types
-                print(f"   [TARGET] Scraping specified types in {location}: {listing_types_to_scrape}")
+                logger.debug(f"   [TARGET] Scraping specified types in {location}: {listing_types_to_scrape}")
             elif job.listing_type:
                 # Backward compatibility: use single listing_type
                 listing_types_to_scrape = [job.listing_type]
-                print(f"   [TARGET] Scraping single type in {location}: {job.listing_type}")
+                logger.debug(f"   [TARGET] Scraping single type in {location}: {job.listing_type}")
             else:
                 # Default: scrape all types for comprehensive data
                 listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent"]
-                print(f"   [TARGET] Scraping ALL property types in {location} (default)")
+                logger.debug(f"   [TARGET] Scraping ALL property types in {location} (default)")
             
             # Enforce consistent order: for_sale, sold, pending, for_rent
             preferred_order = ["for_sale", "sold", "pending", "for_rent"]
@@ -480,18 +503,18 @@ class MLSScraper:
                 key=lambda x: preferred_order.index(x) if x in preferred_order else 999
             )
             
-            print(f"   [DEBUG] Listing types to scrape (ordered): {listing_types_to_scrape}")
-            print(f"   [NOTE] 'off_market' not supported by homeharvest library")
+            logger.debug(f"   [DEBUG] Listing types to scrape (ordered): {listing_types_to_scrape}")
+            logger.debug(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
             for listing_type in listing_types_to_scrape:
                 # Check if job was cancelled (checked every 2 seconds by background monitor)
                 if cancel_flag.get("cancelled", False):
-                    print(f"   [CANCELLED] Job was cancelled, stopping listing type fetch")
+                    logger.info(f"   [CANCELLED] Job was cancelled, stopping listing type fetch")
                     break  # Exit the listing type loop
                 
                 try:
                     start_time = datetime.utcnow()
-                    print(f"   [FETCH] Fetching {listing_type} properties...")
+                    logger.info(f"   [FETCH] Fetching {listing_type} properties from {location}...")
                     
                     # Log API call START with "fetching" status
                     fetching_log = {
@@ -548,21 +571,25 @@ class MLSScraper:
                     end_time = datetime.utcnow()
                     duration = (end_time - start_time).total_seconds()
                     
-                    print(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
-                    print(f"   [DEBUG] Properties type: {type(properties)}, truthy: {bool(properties)}, len: {len(properties)}")
+                    logger.info(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
+                    logger.debug(f"   [DEBUG] Properties type: {type(properties)}, truthy: {bool(properties)}, len: {len(properties)}")
                     
                     # Initialize save_results for use later
                     save_results = {"inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
                     
                     # Save properties immediately after each listing type fetch
                     if properties:
-                        print(f"   [DEBUG] Entering save block...")
+                        logger.debug(f"   [DEBUG] Entering save block...")
                         save_results = await db.save_properties_batch(properties)
                         location_total_found += len(properties)
                         location_total_inserted += save_results["inserted"]
                         location_total_updated += save_results["updated"]
                         location_total_skipped += save_results["skipped"]
                         location_total_errors += save_results["errors"]
+                        
+                        # Collect properties for enrichment (queued after location completes)
+                        if "enrichment_queue" in save_results:
+                            enrichment_queue.extend(save_results["enrichment_queue"])
                         
                         # Track property IDs found in this scrape
                         for prop in properties:
@@ -580,7 +607,7 @@ class MLSScraper:
                         if location_last_update is not None:
                             location_last_update[location] = datetime.utcnow()
                         
-                        print(f"   [SAVED] {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
+                        logger.debug(f"   [SAVED] {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
                     
                     # Update log with completion and save stats
                     listing_type_logs[-1] = {
@@ -595,7 +622,7 @@ class MLSScraper:
                     }
                     
                     # Update the temp summary with completed status and running totals
-                    print(f"   [DEBUG] temp_idx = {temp_idx}, will update progress logs")
+                    logger.debug(f"   [DEBUG] temp_idx = {temp_idx}, will update progress logs")
                     if temp_idx is not None:
                         progress_logs[temp_idx] = {
                             "timestamp": end_time.isoformat(),
@@ -612,7 +639,7 @@ class MLSScraper:
                             "skipped": location_total_skipped
                         }
                         # Push to database immediately with updated job totals
-                        print(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
+                        logger.debug(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
                         await db.update_job_status(
                             job.job_id, 
                             JobStatus.RUNNING,
@@ -623,10 +650,10 @@ class MLSScraper:
                             properties_skipped=running_totals["total_skipped"],
                             progress_logs=progress_logs
                         )
-                        print(f"   [DB-UPDATE] Job status updated successfully")
+                        logger.debug(f"   [DB-UPDATE] Job status updated successfully")
                     else:
                         # No temp entry found, still update job counts
-                        print(f"   [WARNING] No temp_idx found, but still updating job counts")
+                        logger.warning(f"   [WARNING] No temp_idx found, but still updating job counts")
                         await db.update_job_status(
                             job.job_id, 
                             JobStatus.RUNNING,
@@ -641,7 +668,7 @@ class MLSScraper:
                     await asyncio.sleep(0.5)
                     
                 except Exception as e:
-                    print(f"   [WARNING] Error scraping {listing_type} properties: {e}")
+                    logger.warning(f"   [WARNING] Error scraping {listing_type} properties: {e}")
                     # Log the error
                     error_log = {
                         "listing_type": listing_type,
@@ -682,7 +709,7 @@ class MLSScraper:
                     
                     continue
             
-            print(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
+            logger.info(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
             
             # Check for missing properties that may have gone off-market
             off_market_result = None
@@ -695,7 +722,7 @@ class MLSScraper:
                     
                     if job.scheduled_job_id:
                         # Scheduled job: use scheduled_job_id for precise tracking
-                        print(f"   [OFF-MARKET] Starting off-market detection for scheduled job {job.scheduled_job_id}")
+                        logger.debug(f"   [OFF-MARKET] Starting off-market detection for scheduled job {job.scheduled_job_id}")
                         try:
                             off_market_result = await self.check_missing_properties_for_off_market(
                                 scheduled_job_id=job.scheduled_job_id,
@@ -708,9 +735,9 @@ class MLSScraper:
                                 progress_logs=progress_logs,
                                 job_id=job.job_id
                             )
-                            print(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
+                            logger.debug(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
                         except Exception as e:
-                            print(f"   [OFF-MARKET] Error during off-market detection: {e}")
+                            logger.warning(f"   [OFF-MARKET] Error during off-market detection: {e}")
                             off_market_result = {
                                 "missing_checked": 0,
                                 "off_market_found": 0,
@@ -719,7 +746,7 @@ class MLSScraper:
                             }
                     else:
                         # One-time job: use location-based matching as fallback
-                        print(f"   [OFF-MARKET] Starting off-market detection for location {location} (one-time job)")
+                        logger.debug(f"   [OFF-MARKET] Starting off-market detection for location {location} (one-time job)")
                         try:
                             off_market_result = await self.check_missing_properties_for_off_market_by_location(
                                 location=location,
@@ -732,9 +759,9 @@ class MLSScraper:
                                 progress_logs=progress_logs,
                                 job_id=job.job_id
                             )
-                            print(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
+                            logger.debug(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
                         except Exception as e:
-                            print(f"   [OFF-MARKET] Error during off-market detection: {e}")
+                            logger.warning(f"   [OFF-MARKET] Error during off-market detection: {e}")
                             off_market_result = {
                                 "missing_checked": 0,
                                 "off_market_found": 0,
@@ -760,6 +787,40 @@ class MLSScraper:
             if off_market_result:
                 final_summary["off_market_check"] = off_market_result
             
+            # Queue enrichment for all properties from this location (non-blocking, parallel threads)
+            if enrichment_queue and db.enrichment_pipeline:
+                enrichment_count = len(enrichment_queue)
+                logger.info(f"   [ENRICHMENT] Starting enrichment for {enrichment_count} properties from {location}")
+                
+                # Process enrichment in batches if configured
+                batch_size = settings.ENRICHMENT_BATCH_SIZE
+                if batch_size and isinstance(batch_size, str):
+                    try:
+                        batch_size = int(batch_size)
+                    except ValueError:
+                        batch_size = None
+                
+                if batch_size and batch_size > 0:
+                    # Process in batches
+                    for i in range(0, len(enrichment_queue), batch_size):
+                        batch = enrichment_queue[i:i + batch_size]
+                        for enrichment_item in batch:
+                            self.enrichment_executor.submit(
+                                self._enrich_property_sync,
+                                enrichment_item["property_id"],
+                                enrichment_item["property_dict"],
+                                enrichment_item["job_id"]
+                            )
+                else:
+                    # Process all at once
+                    for enrichment_item in enrichment_queue:
+                        self.enrichment_executor.submit(
+                            self._enrich_property_sync,
+                            enrichment_item["property_id"],
+                            enrichment_item["property_dict"],
+                            enrichment_item["job_id"]
+                        )
+            
             # Replace temp entry with final summary if it exists
             # temp_idx was set when the first listing type started processing
             if progress_logs is not None and temp_idx is not None:
@@ -781,10 +842,10 @@ class MLSScraper:
             return final_summary
             
         except Exception as e:
-            print(f"Error scraping location {location}: {e}")
+            logger.error(f"Error scraping location {location}: {e}")
             import traceback
             error_traceback = traceback.format_exc()
-            print(f"Traceback: {error_traceback}")
+            logger.debug(f"Traceback: {error_traceback}")
             
             # Return failure information instead of None
             return {
@@ -802,10 +863,30 @@ class MLSScraper:
                 "message": f"Location scraping failed: {str(e)}"
             }
     
+    def _enrich_property_sync(self, property_id: str, property_dict: Dict[str, Any], job_id: Optional[str]):
+        """Synchronous wrapper for enrichment that runs in thread pool"""
+        try:
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    db.enrichment_pipeline.enrich_property(
+                        property_id=property_id,
+                        property_dict=property_dict,
+                        existing_property=None,  # Deprecated - enrichment will fetch from DB
+                        job_id=job_id
+                    )
+                )
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"Error in enrichment thread for property {property_id}: {e}")
+    
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
         try:
-            print(f"   [DEBUG] _scrape_listing_type called with listing_type: '{listing_type}' (type: {type(listing_type)})")
+            logger.debug(f"   [DEBUG] _scrape_listing_type called with listing_type: '{listing_type}' (type: {type(listing_type)})")
             
             # Prepare scraping parameters - remove all filtering for comprehensive data
             scrape_params = {
@@ -848,7 +929,7 @@ class MLSScraper:
                 )
             except asyncio.TimeoutError:
                 error_msg = f"Scraping {listing_type} properties in {location} timed out after {timeout_seconds} seconds"
-                print(f"   [TIMEOUT] {error_msg}")
+                logger.warning(f"   [TIMEOUT] {error_msg}")
                 raise TimeoutError(error_msg)
             
             # Convert DataFrame to our Property models
@@ -861,13 +942,13 @@ class MLSScraper:
                         property_obj.is_comp = True
                     properties.append(property_obj)
                 except Exception as e:
-                    print(f"Error converting property: {e}")
+                    logger.error(f"Error converting property: {e}")
                     continue
             
             return properties
             
         except Exception as e:
-            print(f"Error scraping {listing_type} properties in {location}: {e}")
+            logger.error(f"Error scraping {listing_type} properties in {location}: {e}")
             return []
     
     def convert_to_property_model(self, prop_data: Any, job_id: str, listing_type: str = None, scheduled_job_id: Optional[str] = None) -> Property:
@@ -1067,7 +1148,7 @@ class MLSScraper:
             return property_obj
             
         except Exception as e:
-            print(f"Error converting property data: {e}")
+            logger.error(f"Error converting property data: {e}")
             raise
     
     async def get_proxy_config(self, job: ScrapingJob) -> Optional[Dict[str, Any]]:
@@ -1095,7 +1176,7 @@ class MLSScraper:
             }
             
         except Exception as e:
-            print(f"Error getting proxy config: {e}")
+            logger.error(f"Error getting proxy config: {e}")
             return None
     
     def is_off_market_status(self, status: Optional[str], mls_status: Optional[str]) -> bool:
@@ -1665,13 +1746,13 @@ class MLSScraper:
                 "skipped": False
             }
             
-            print(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
+            logger.debug(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
             return result
             
         except Exception as e:
-            print(f"   [OFF-MARKET] Error in off-market detection (location-based): {e}")
+            logger.error(f"   [OFF-MARKET] Error in off-market detection (location-based): {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
             return {
                 "missing_checked": 0,
                 "off_market_found": 0,

@@ -57,6 +57,11 @@ class Settings:
     # Logging Configuration - Default values
     LOG_LEVEL = get_required_env("LOG_LEVEL", "INFO")
     
+    # Enrichment Configuration - Default values
+    ENRICHMENT_WORKERS = int(get_required_env("ENRICHMENT_WORKERS", "3"))  # Number of parallel enrichment threads
+    _enrichment_batch_size = os.getenv("ENRICHMENT_BATCH_SIZE")
+    ENRICHMENT_BATCH_SIZE = int(_enrichment_batch_size) if _enrichment_batch_size else None  # None = process all properties from location
+    
     # Additional Configuration - Default values
     PORT = int(get_required_env("PORT", "8000"))
     JWT_SECRET = get_required_env("JWT_SECRET", "default-secret-key")

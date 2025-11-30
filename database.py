@@ -1,5 +1,6 @@
 import motor.motor_asyncio
 from pymongo import ASCENDING, DESCENDING
+from pymongo.operations import InsertOne, UpdateOne, ReplaceOne
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import asyncio
@@ -44,10 +45,10 @@ class Database:
             self.enrichment_pipeline = PropertyEnrichmentPipeline(self.db)
             await self.enrichment_pipeline.initialize()
             
-            print(f"Connected to MongoDB: {database_name}")
+            logger.info(f"Connected to MongoDB: {database_name}")
             return True
         except Exception as e:
-            print(f"Failed to connect to MongoDB: {e}")
+            logger.error(f"Failed to connect to MongoDB: {e}")
             return False
     
     async def _create_indexes(self):
@@ -489,7 +490,7 @@ class Database:
                             self._enrich_property_background(
                                 property_id=property_data.property_id,
                                 property_dict=property_dict,
-                                existing_property=existing_property,
+                                existing_property=None,  # Deprecated - enrichment will fetch from DB
                                 job_id=property_data.job_id
                             )
                         )
@@ -527,7 +528,7 @@ class Database:
                         self._enrich_property_background(
                             property_id=property_data.property_id,
                             property_dict=property_dict,
-                            existing_property=None,
+                            existing_property=None,  # Deprecated - enrichment will fetch from DB
                             job_id=property_data.job_id
                         )
                     )
@@ -540,9 +541,9 @@ class Database:
                 }
                 
         except Exception as e:
-            print(f"Error saving property {property_data.property_id}: {e}")
-            print(f"Error type: {type(e).__name__}")
-            print(f"Property data keys: {list(property_data.dict().keys()) if hasattr(property_data, 'dict') else 'No dict method'}")
+            logger.error(f"Error saving property {property_data.property_id}: {e}")
+            logger.debug(f"Error type: {type(e).__name__}")
+            logger.debug(f"Property data keys: {list(property_data.dict().keys()) if hasattr(property_data, 'dict') else 'No dict method'}")
             return {
                 "action": "error",
                 "reason": str(e),
@@ -550,40 +551,185 @@ class Database:
             }
     
     async def save_properties_batch(self, properties: List[Property]) -> Dict[str, Any]:
-        """Save multiple properties in batch with hash-based change detection"""
+        """Save multiple properties in batch with hash-based change detection using bulk operations"""
         try:
             if not properties:
-                return {"total": 0, "inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
+                return {"total": 0, "inserted": 0, "updated": 0, "skipped": 0, "errors": 0, "enrichment_queue": []}
             
+            # Extract property IDs for batch fetch
+            property_ids = [prop.property_id for prop in properties if prop.property_id]
+            
+            # Batch fetch all existing properties in one query
+            existing_properties = {}
+            if property_ids:
+                cursor = self.properties_collection.find({"property_id": {"$in": property_ids}})
+                async for prop_data in cursor:
+                    existing_properties[prop_data["property_id"]] = prop_data
+            
+            # Prepare bulk operations
+            bulk_operations = []
             results = {
                 "total": len(properties),
                 "inserted": 0,
                 "updated": 0,
                 "skipped": 0,
                 "errors": 0,
-                "details": []
+                "details": [],
+                "enrichment_queue": []  # Property IDs that need enrichment
             }
             
-            # Process each property individually for hash comparison
+            # Process each property to determine action and prepare bulk operations
             for prop in properties:
-                result = await self.save_property(prop)
-                results["details"].append(result)
-                
-                if result["action"] == "inserted":
-                    results["inserted"] += 1
-                elif result["action"] == "updated":
-                    results["updated"] += 1
-                elif result["action"] == "skipped":
-                    results["skipped"] += 1
-                elif result["action"] == "error":
+                try:
+                    existing_prop = existing_properties.get(prop.property_id)
+                    
+                    if existing_prop:
+                        # Property exists - check hash
+                        existing_hash = existing_prop.get("content_hash")
+                        new_hash = prop.content_hash
+                        
+                        if existing_hash == new_hash:
+                            # Content unchanged - skip (only update metadata)
+                            update_fields = {
+                                "days_on_mls": prop.days_on_mls,
+                                "scraped_at": prop.scraped_at,
+                                "job_id": prop.job_id
+                            }
+                            if prop.scheduled_job_id:
+                                update_fields["scheduled_job_id"] = prop.scheduled_job_id
+                            if prop.last_scraped:
+                                update_fields["last_scraped"] = prop.last_scraped
+                            
+                            # Check if contacts need updating
+                            needs_contact_update = (
+                                (prop.agent and prop.agent.agent_name and not existing_prop.get("agent_id")) or
+                                (prop.broker and prop.broker.broker_name and not existing_prop.get("broker_id")) or
+                                (prop.builder and prop.builder.builder_name and not existing_prop.get("builder_id")) or
+                                (prop.office and prop.office.office_name and not existing_prop.get("office_id"))
+                            )
+                            
+                            if needs_contact_update:
+                                # Process contacts individually (may need async calls)
+                                contact_ids = await self.contact_service.process_property_contacts(prop)
+                                if existing_prop.get("agent_id"):
+                                    contact_ids["agent_id"] = existing_prop.get("agent_id")
+                                if existing_prop.get("broker_id"):
+                                    contact_ids["broker_id"] = existing_prop.get("broker_id")
+                                if existing_prop.get("builder_id"):
+                                    contact_ids["builder_id"] = existing_prop.get("builder_id")
+                                if existing_prop.get("office_id"):
+                                    contact_ids["office_id"] = existing_prop.get("office_id")
+                                
+                                if contact_ids.get("agent_id"):
+                                    update_fields["agent_id"] = contact_ids["agent_id"]
+                                if contact_ids.get("broker_id"):
+                                    update_fields["broker_id"] = contact_ids["broker_id"]
+                                if contact_ids.get("builder_id"):
+                                    update_fields["builder_id"] = contact_ids["builder_id"]
+                                if contact_ids.get("office_id"):
+                                    update_fields["office_id"] = contact_ids["office_id"]
+                            
+                            bulk_operations.append(UpdateOne(
+                                {"property_id": prop.property_id},
+                                {"$set": update_fields}
+                            ))
+                            results["skipped"] += 1
+                            results["details"].append({
+                                "action": "skipped",
+                                "reason": "content_unchanged",
+                                "property_id": prop.property_id
+                            })
+                        else:
+                            # Content changed - full update
+                            contact_ids = await self.contact_service.process_property_contacts(prop)
+                            
+                            # Preserve existing contact IDs if new ones weren't created
+                            if existing_prop.get("agent_id") and not contact_ids.get("agent_id"):
+                                contact_ids["agent_id"] = existing_prop.get("agent_id")
+                            if existing_prop.get("broker_id") and not contact_ids.get("broker_id"):
+                                contact_ids["broker_id"] = existing_prop.get("broker_id")
+                            if existing_prop.get("builder_id") and not contact_ids.get("builder_id"):
+                                contact_ids["builder_id"] = existing_prop.get("builder_id")
+                            if existing_prop.get("office_id") and not contact_ids.get("office_id"):
+                                contact_ids["office_id"] = existing_prop.get("office_id")
+                            
+                            prop.agent_id = contact_ids.get("agent_id")
+                            prop.broker_id = contact_ids.get("broker_id")
+                            prop.builder_id = contact_ids.get("builder_id")
+                            prop.office_id = contact_ids.get("office_id")
+                            
+                            if prop.scheduled_job_id:
+                                prop.scheduled_job_id = prop.scheduled_job_id
+                            if not prop.last_scraped:
+                                prop.last_scraped = datetime.utcnow()
+                            
+                            property_dict = prop.dict(by_alias=True, exclude={"id"})
+                            bulk_operations.append(ReplaceOne(
+                                {"property_id": prop.property_id},
+                                property_dict,
+                                upsert=True
+                            ))
+                            results["updated"] += 1
+                            results["enrichment_queue"].append({
+                                "property_id": prop.property_id,
+                                "property_dict": property_dict,
+                                "job_id": prop.job_id
+                            })
+                            results["details"].append({
+                                "action": "updated",
+                                "reason": "content_changed",
+                                "property_id": prop.property_id,
+                                "old_hash": existing_hash,
+                                "new_hash": new_hash
+                            })
+                    else:
+                        # New property - insert
+                        contact_ids = await self.contact_service.process_property_contacts(prop)
+                        
+                        prop.agent_id = contact_ids.get("agent_id")
+                        prop.broker_id = contact_ids.get("broker_id")
+                        prop.builder_id = contact_ids.get("builder_id")
+                        prop.office_id = contact_ids.get("office_id")
+                        
+                        if prop.scheduled_job_id:
+                            prop.scheduled_job_id = prop.scheduled_job_id
+                        if not prop.last_scraped:
+                            prop.last_scraped = datetime.utcnow()
+                        
+                        property_dict = prop.dict(by_alias=True, exclude={"id"})
+                        bulk_operations.append(InsertOne(property_dict))
+                        results["inserted"] += 1
+                        results["enrichment_queue"].append({
+                            "property_id": prop.property_id,
+                            "property_dict": property_dict,
+                            "job_id": prop.job_id
+                        })
+                        results["details"].append({
+                            "action": "inserted",
+                            "reason": "new_property",
+                            "property_id": prop.property_id,
+                            "new_hash": prop.content_hash
+                        })
+                except Exception as e:
+                    logger.error(f"Error processing property {prop.property_id if prop else 'unknown'}: {e}")
                     results["errors"] += 1
+                    results["details"].append({
+                        "action": "error",
+                        "reason": str(e),
+                        "property_id": prop.property_id if prop else None
+                    })
             
-            print(f"Batch save results: {results['inserted']} inserted, {results['updated']} updated, {results['skipped']} skipped, {results['errors']} errors")
+            # Execute bulk write operation
+            if bulk_operations:
+                bulk_result = await self.properties_collection.bulk_write(bulk_operations, ordered=False)
+                logger.debug(f"Bulk write: {bulk_result.inserted_count} inserted, {bulk_result.modified_count} modified, {bulk_result.upserted_count} upserted")
+            
+            logger.debug(f"Batch save results: {results['inserted']} inserted, {results['updated']} updated, {results['skipped']} skipped, {results['errors']} errors")
             return results
             
         except Exception as e:
-            print(f"Error saving properties batch: {e}")
-            return {"total": len(properties), "inserted": 0, "updated": 0, "skipped": 0, "errors": len(properties), "details": []}
+            logger.error(f"Error saving properties batch: {e}")
+            return {"total": len(properties), "inserted": 0, "updated": 0, "skipped": 0, "errors": len(properties), "details": [], "enrichment_queue": []}
     
     async def get_property(self, property_id: str) -> Optional[Property]:
         """Get property by property_id"""
@@ -940,20 +1086,20 @@ class Database:
     async def _enrich_property_background(self, property_id: str, property_dict: Dict[str, Any], existing_property: Optional[Dict[str, Any]], job_id: Optional[str]):
         """Background enrichment task - runs asynchronously without blocking scraping"""
         try:
-            print(f"Starting background enrichment for property {property_id}")
+            logger.debug(f"Starting background enrichment for property {property_id}")
             
-            # Run enrichment
+            # Run enrichment (existing_property is deprecated, enrichment will fetch from DB)
             enrichment_data = await self.enrichment_pipeline.enrich_property(
                 property_id=property_id,
                 property_dict=property_dict,
-                existing_property=existing_property,
+                existing_property=None,  # Deprecated - enrichment will fetch from DB
                 job_id=job_id
             )
             
-            print(f"Background enrichment completed for property {property_id}")
+            logger.debug(f"Background enrichment completed for property {property_id}")
             
         except Exception as e:
-            print(f"Error in background enrichment for property {property_id}: {e}")
+            logger.error(f"Error in background enrichment for property {property_id}: {e}")
             # Don't re-raise - this is a background task
     
     # Enrichment Recalculation Methods
