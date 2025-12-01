@@ -14,7 +14,8 @@ class ContactService:
     
     def __init__(self):
         # Get backend API URL from environment or use default
-        self.backend_url = os.getenv('BACKEND_API_URL', 'http://localhost:3000')
+        # Default to port 5000 (backend) instead of 3000 (frontend)
+        self.backend_url = os.getenv('BACKEND_API_URL', 'http://localhost:5000')
         self.api_base = f"{self.backend_url}/api"
     
     async def create_or_find_contact(
