@@ -87,6 +87,10 @@ class MLSScraper:
                         if time_since_update > timeout_seconds:
                             timed_out_locations.append(location)
                             logger.warning(f"[TIMEOUT] Location {location} has not updated properties in {time_since_update/60:.1f} minutes (timeout: {settings.LOCATION_TIMEOUT_MINUTES} minutes)")
+                    else:
+                        # If location is in the dict but has no timestamp, it might be stuck
+                        # Check if it's been more than timeout since job started
+                        logger.debug(f"[TIMEOUT-CHECK] Location {location} has no update timestamp")
                 
                 # Mark timed out locations (will be handled in main loop)
                 if timed_out_locations:
@@ -114,14 +118,22 @@ class MLSScraper:
         )
         
         try:
-            # Initialize progress logs with job start
-            progress_logs = [{
-                "timestamp": datetime.utcnow().isoformat(),
-                "event": "job_started",
-                "message": f"Job started - Processing {len(job.locations)} location(s)",
-                "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"],
-                "total_locations": len(job.locations)
-            }]
+            # Initialize progress logs with new table format
+            progress_logs = {
+                "locations": [],
+                "summary": {
+                    "total_locations": len(job.locations),
+                    "completed_locations": 0,
+                    "in_progress_locations": 0,
+                    "failed_locations": 0
+                },
+                "job_started": {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "event": "job_started",
+                    "message": f"Job started - Processing {len(job.locations)} location(s)",
+                    "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"]
+                }
+            }
             
             # Update job status to running with initial log
             await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
@@ -160,14 +172,7 @@ class MLSScraper:
                     # Initialize last update time for this location
                     location_last_update[location] = datetime.utcnow()
                     
-                    # Log location start
-                    progress_logs.append({
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "event": "location_started",
-                        "location": location,
-                        "location_index": i + 1,
-                        "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
-                    })
+                    # Location entry will be created in scrape_location, no need to append here
                     # Update current_location field so GUI can show the active location
                     await db.update_job_status(
                         job.job_id, 
@@ -247,16 +252,7 @@ class MLSScraper:
                     }
                     failed_locations.append(failed_location_entry)
                     
-                    # Log the failure
-                    failure_log = {
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "event": "location_failed",
-                        "location": location,
-                        "location_index": i + 1,
-                        "error": location_error,
-                        "message": f"Location {i+1}/{len(job.locations)} ({location}) failed: {location_error}. Skipping and continuing with next location."
-                    }
-                    progress_logs.append(failure_log)
+                    # Failure is already tracked in location entry status, no need for separate event log
                     logger.debug(f"[SKIP] Location {location} failed, continuing with next location...")
                 
                 # Update job progress with detailed breakdown and logs (including failed locations)
@@ -313,14 +309,7 @@ class MLSScraper:
                     # Reset timeout tracking for retry
                     location_last_update[location] = datetime.utcnow()
                     
-                    # Log retry start
-                    progress_logs.append({
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "event": "location_retry",
-                        "location": location,
-                        "retry_count": failed_location_entry["retry_count"],
-                        "message": f"Retrying location {location} (attempt {failed_location_entry['retry_count']})"
-                    })
+                    # Retry will update location entry in scrape_location, no need for separate event log
                     await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     
                     try:
@@ -366,15 +355,15 @@ class MLSScraper:
                 completion_message += f" {len(failed_locations)} location(s) failed after retry."
                 logger.info(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
             
-            # Add completion log
-            progress_logs.append({
+            # Add completion info to summary
+            progress_logs["job_completed"] = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "event": "job_completed",
                 "message": completion_message,
                 "successful_locations": successful_locations,
                 "failed_locations": len(failed_locations),
                 "total_locations": len(job.locations)
-            })
+            }
             
             await db.update_job_status(
                 job.job_id,
@@ -468,12 +457,12 @@ class MLSScraper:
             if job.job_id in self.current_jobs:
                 del self.current_jobs[job.job_id]
     
-    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: list = None, running_totals: dict = None, location_index: int = 1, total_locations: int = 1, job_start_time: Optional[datetime] = None, location_last_update: dict = None):
+    async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: dict = None, running_totals: dict = None, location_index: int = 1, total_locations: int = 1, job_start_time: Optional[datetime] = None, location_last_update: dict = None):
         """Scrape properties for a specific location based on job's listing_types. Saves after each type and returns summary."""
         if cancel_flag is None:
             cancel_flag = {"cancelled": False}
         if progress_logs is None:
-            progress_logs = []
+            progress_logs = {"locations": [], "summary": {"total_locations": total_locations, "completed_locations": 0, "in_progress_locations": 0, "failed_locations": 0}}
         if running_totals is None:
             running_totals = {
                 "total_properties": 0,
@@ -519,6 +508,58 @@ class MLSScraper:
             logger.debug(f"   [DEBUG] Listing types to scrape (ordered): {listing_types_to_scrape}")
             logger.debug(f"   [NOTE] 'off_market' not supported by homeharvest library")
             
+            # Initialize location entry in progress_logs with new structure
+            location_entry = {
+                "location": location,
+                "location_index": location_index,
+                "status": "in_progress",
+                "listing_types": {},
+                "enrichment": {
+                    "status": "pending",
+                    "total": 0,
+                    "completed": 0,
+                    "failed": 0
+                },
+                "off_market_check": {
+                    "status": "pending",
+                    "checked": 0,
+                    "found": 0,
+                    "errors": 0
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            # Initialize listing_types tracking for each listing type
+            for listing_type in listing_types_to_scrape:
+                location_entry["listing_types"][listing_type] = {
+                    "found": 0,
+                    "inserted": 0,
+                    "updated": 0,
+                    "skipped": 0,
+                    "enriched": 0,
+                    "off_market": 0
+                }
+            
+            # Find or create location entry in progress_logs
+            location_idx = None
+            for idx, loc_entry in enumerate(progress_logs.get("locations", [])):
+                if loc_entry.get("location") == location:
+                    location_idx = idx
+                    break
+            
+            if location_idx is not None:
+                # Update existing entry
+                progress_logs["locations"][location_idx] = location_entry
+            else:
+                # Add new location entry
+                progress_logs["locations"].append(location_entry)
+                location_idx = len(progress_logs["locations"]) - 1
+            
+            # Update summary
+            progress_logs["summary"]["in_progress_locations"] = sum(
+                1 for loc in progress_logs["locations"] if loc.get("status") == "in_progress"
+            )
+            
             for listing_type in listing_types_to_scrape:
                 # Check if job was cancelled (checked every 2 seconds by background monitor)
                 if cancel_flag.get("cancelled", False):
@@ -529,57 +570,37 @@ class MLSScraper:
                     start_time = datetime.utcnow()
                     logger.info(f"   [FETCH] Fetching {listing_type} properties from {location}...")
                     
-                    # Log API call START with "fetching" status
-                    fetching_log = {
-                        "listing_type": listing_type,
-                        "status": "fetching",
-                        "message": f"Fetching {listing_type} properties...",
-                        "timestamp": start_time.isoformat()
-                    }
-                    listing_type_logs.append(fetching_log)
+                    # Update location_last_update when scraping starts (for timeout detection)
+                    if location_last_update is not None:
+                        location_last_update[location] = datetime.utcnow()
                     
-                    # Update progress logs immediately for real-time UI feedback
-                    # Create a summary log entry for this location showing what we're fetching
-                    temp_summary = {
-                        "timestamp": start_time.isoformat(),
-                        "location": location,
-                        "location_index": location_index,
-                        "total_locations": total_locations,
-                        "status": "in_progress",
-                        "message": f"Fetching {listing_type} properties from {location}...",
-                        "listing_type_breakdown": listing_type_logs.copy(),
-                        # Current running totals for this location
-                        "properties_found": location_total_found,
-                        "inserted": location_total_inserted,
-                        "updated": location_total_updated,
-                        "skipped": location_total_skipped
-                    }
-                    # Find if we already have a temp entry for this location
-                    temp_idx = None
-                    for idx, log in enumerate(progress_logs):
-                        if isinstance(log, dict) and log.get("location") == location and log.get("status") == "in_progress":
-                            temp_idx = idx
-                            break
-                    
-                    if temp_idx is not None:
-                        # Update existing temp entry
-                        progress_logs[temp_idx] = temp_summary
-                    else:
-                        # Add new temp entry
-                        progress_logs.append(temp_summary)
+                    # Update location entry to show we're fetching this listing type
+                    if location_idx is not None and location_idx < len(progress_logs["locations"]):
+                        progress_logs["locations"][location_idx]["timestamp"] = start_time.isoformat()
+                        # Update will happen after properties are found
                     
                     # Push to database immediately for real-time UI update
                     await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     
                     # Use job's limit (or None to get all properties)
-                    properties = await self._scrape_listing_type(
-                        location, 
-                        job, 
-                        proxy_config, 
-                        listing_type, 
-                        limit=job.limit if job.limit else None,
-                        past_days=job.past_days if job.past_days else 90
-                    )
+                    # Wrap in timeout to prevent getting stuck
+                    from config import settings
+                    scrape_timeout = min(settings.LOCATION_TIMEOUT_MINUTES * 60, 600)  # Max 10 minutes per listing type
+                    try:
+                        properties = await asyncio.wait_for(
+                            self._scrape_listing_type(
+                                location, 
+                                job, 
+                                proxy_config, 
+                                listing_type, 
+                                limit=job.limit if job.limit else None,
+                                past_days=job.past_days if job.past_days else 90
+                            ),
+                            timeout=scrape_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"   [TIMEOUT] Scraping {listing_type} in {location} exceeded {scrape_timeout}s timeout, skipping this listing type")
+                        properties = []  # Continue with next listing type
                     
                     end_time = datetime.utcnow()
                     duration = (end_time - start_time).total_seconds()
@@ -622,57 +643,15 @@ class MLSScraper:
                         
                         logger.debug(f"   [SAVED] {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
                     
-                    # Update log with completion and save stats
-                    listing_type_logs[-1] = {
-                        "listing_type": listing_type,
-                        "status": "completed",
-                        "properties_found": len(properties),
-                        "inserted": save_results.get("inserted", 0) if properties else 0,
-                        "updated": save_results.get("updated", 0) if properties else 0,
-                        "skipped": save_results.get("skipped", 0) if properties else 0,
-                        "duration_seconds": round(duration, 2),
-                        "timestamp": start_time.isoformat()
-                    }
-                    
-                    # Update the temp summary with completed status and running totals
-                    # Re-find temp_idx in case progress_logs was modified
-                    temp_idx = None
-                    for idx, log in enumerate(progress_logs):
-                        if isinstance(log, dict) and log.get("location") == location and log.get("status") == "in_progress":
-                            temp_idx = idx
-                            break
-                    
-                    logger.debug(f"   [DEBUG] temp_idx = {temp_idx}, will update progress logs")
-                    if temp_idx is not None:
-                        progress_logs[temp_idx] = {
-                            "timestamp": end_time.isoformat(),
-                            "location": location,
-                            "location_index": location_index,
-                            "total_locations": total_locations,
-                            "status": "in_progress",
-                            "message": f"Completed {listing_type}: {len(properties)} found, {save_results.get('inserted', 0) if properties else 0} inserted, {save_results.get('updated', 0) if properties else 0} updated",
-                            "listing_type_breakdown": listing_type_logs.copy(),
-                            # Running totals for this location so far
-                            "properties_found": location_total_found,
-                            "inserted": location_total_inserted,
-                            "updated": location_total_updated,
-                            "skipped": location_total_skipped
-                        }
-                    else:
-                        # Create new temp entry if not found
-                        progress_logs.append({
-                            "timestamp": end_time.isoformat(),
-                            "location": location,
-                            "location_index": location_index,
-                            "total_locations": total_locations,
-                            "status": "in_progress",
-                            "message": f"Completed {listing_type}: {len(properties)} found, {save_results.get('inserted', 0) if properties else 0} inserted, {save_results.get('updated', 0) if properties else 0} updated",
-                            "listing_type_breakdown": listing_type_logs.copy(),
-                            "properties_found": location_total_found,
-                            "inserted": location_total_inserted,
-                            "updated": location_total_updated,
-                            "skipped": location_total_skipped
-                        })
+                    # Update location entry's listing_types with completion stats
+                    if location_idx is not None and location_idx < len(progress_logs["locations"]):
+                        location_entry = progress_logs["locations"][location_idx]
+                        if listing_type in location_entry.get("listing_types", {}):
+                            location_entry["listing_types"][listing_type]["found"] = len(properties)
+                            location_entry["listing_types"][listing_type]["inserted"] = save_results.get("inserted", 0) if properties else 0
+                            location_entry["listing_types"][listing_type]["updated"] = save_results.get("updated", 0) if properties else 0
+                            location_entry["listing_types"][listing_type]["skipped"] = save_results.get("skipped", 0) if properties else 0
+                        location_entry["timestamp"] = end_time.isoformat()
                     
                     # Push to database immediately with updated job totals
                     logger.debug(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
@@ -703,40 +682,43 @@ class MLSScraper:
                     }
                     listing_type_logs.append(error_log)
                     
-                    # Update progress logs with error
-                    if temp_idx is not None:
-                        progress_logs[temp_idx] = {
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "location": location,
-                            "location_index": location_index,
-                            "total_locations": total_locations,
-                            "status": "in_progress",
-                            "message": f"Error fetching {listing_type}: {str(e)}",
-                            "listing_type_breakdown": listing_type_logs.copy(),
-                            # Running totals for this location so far (with error)
-                            "properties_found": location_total_found,
-                            "inserted": location_total_inserted,
-                            "updated": location_total_updated,
-                            "skipped": location_total_skipped
-                        }
-                        # Push to database immediately with current totals
-                        await db.update_job_status(
-                            job.job_id, 
-                            JobStatus.RUNNING,
-                            properties_scraped=running_totals["total_properties"],
-                            properties_saved=running_totals["saved_properties"],
-                            properties_inserted=running_totals["total_inserted"],
-                            properties_updated=running_totals["total_updated"],
-                            properties_skipped=running_totals["total_skipped"],
-                            progress_logs=progress_logs
-                        )
+                    # Update location entry with error
+                    if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                        location_entry = progress_logs["locations"][location_idx]
+                        location_entry["timestamp"] = datetime.utcnow().isoformat()
+                        # Error is logged but location continues with other listing types
+                    
+                    # Push to database immediately with current totals
+                    await db.update_job_status(
+                        job.job_id, 
+                        JobStatus.RUNNING,
+                        properties_scraped=running_totals["total_properties"],
+                        properties_saved=running_totals["saved_properties"],
+                        properties_inserted=running_totals["total_inserted"],
+                        properties_updated=running_totals["total_updated"],
+                        properties_skipped=running_totals["total_skipped"],
+                        progress_logs=progress_logs
+                    )
                     
                     continue
             
             logger.info(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
             
-            # Create final summary for this location
-            # Mark location as complete immediately (off-market detection will run in background)
+            # Update location entry to mark as completed
+            if location_idx is not None and location_idx < len(progress_logs["locations"]):
+                location_entry = progress_logs["locations"][location_idx]
+                location_entry["status"] = "completed"
+                location_entry["timestamp"] = datetime.utcnow().isoformat()
+                
+                # Update summary
+                progress_logs["summary"]["completed_locations"] = sum(
+                    1 for loc in progress_logs["locations"] if loc.get("status") == "completed"
+                )
+                progress_logs["summary"]["in_progress_locations"] = sum(
+                    1 for loc in progress_logs["locations"] if loc.get("status") == "in_progress"
+                )
+            
+            # Create final summary for return value (backward compatibility)
             final_summary = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "location": location,
@@ -747,7 +729,7 @@ class MLSScraper:
                 "updated": location_total_updated,
                 "skipped": location_total_skipped,
                 "errors": location_total_errors,
-                "listing_type_breakdown": listing_type_logs
+                "status": "completed"
             }
             
             # Check for missing properties that may have gone off-market
@@ -781,6 +763,14 @@ class MLSScraper:
                 enrichment_count = len(enrichment_queue)
                 logger.info(f"   [ENRICHMENT] Starting enrichment for {enrichment_count} properties from {location}")
                 
+                # Initialize enrichment status in location entry
+                if location_idx is not None and location_idx < len(progress_logs["locations"]):
+                    location_entry = progress_logs["locations"][location_idx]
+                    location_entry["enrichment"]["status"] = "in_progress"
+                    location_entry["enrichment"]["total"] = enrichment_count
+                    location_entry["enrichment"]["completed"] = 0
+                    location_entry["enrichment"]["failed"] = 0
+                
                 # Process enrichment in batches if configured
                 batch_size = settings.ENRICHMENT_BATCH_SIZE
                 if batch_size and isinstance(batch_size, str):
@@ -799,7 +789,11 @@ class MLSScraper:
                                 self._enrich_property_async(
                                     enrichment_item["property_id"],
                                     enrichment_item["property_dict"],
-                                    enrichment_item["job_id"]
+                                    enrichment_item["job_id"],
+                                    location=location,
+                                    location_idx=location_idx,
+                                    listing_type=enrichment_item.get("listing_type"),
+                                    progress_logs=progress_logs
                                 )
                             )
                 else:
@@ -810,26 +804,25 @@ class MLSScraper:
                             self._enrich_property_async(
                                 enrichment_item["property_id"],
                                 enrichment_item["property_dict"],
-                                enrichment_item["job_id"]
+                                enrichment_item["job_id"],
+                                location=location,
+                                location_idx=location_idx,
+                                listing_type=enrichment_item.get("listing_type"),
+                                progress_logs=progress_logs
                             )
                         )
             
-            # Replace temp entry with final summary if it exists
-            # temp_idx was set when the first listing type started processing
-            if progress_logs is not None and temp_idx is not None:
-                # Replace temp entry with final summary
-                progress_logs[temp_idx] = final_summary
-                # Update database with final summary
-                await db.update_job_status(
-                    job.job_id,
-                    JobStatus.RUNNING,
-                    properties_scraped=running_totals["total_properties"],
-                    properties_saved=running_totals["saved_properties"],
-                    properties_inserted=running_totals["total_inserted"],
-                    properties_updated=running_totals["total_updated"],
-                    properties_skipped=running_totals["total_skipped"],
-                    progress_logs=progress_logs
-                )
+            # Update database with final summary
+            await db.update_job_status(
+                job.job_id,
+                JobStatus.RUNNING,
+                properties_scraped=running_totals["total_properties"],
+                properties_saved=running_totals["saved_properties"],
+                properties_inserted=running_totals["total_inserted"],
+                properties_updated=running_totals["total_updated"],
+                properties_skipped=running_totals["total_skipped"],
+                progress_logs=progress_logs
+            )
             
             # Return final summary for this location
             return final_summary
@@ -839,6 +832,21 @@ class MLSScraper:
             import traceback
             error_traceback = traceback.format_exc()
             logger.debug(f"Traceback: {error_traceback}")
+            
+            # Update location entry to mark as failed
+            if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                location_entry = progress_logs["locations"][location_idx]
+                location_entry["status"] = "failed"
+                location_entry["error"] = str(e)
+                location_entry["timestamp"] = datetime.utcnow().isoformat()
+                
+                # Update summary
+                progress_logs["summary"]["failed_locations"] = sum(
+                    1 for loc in progress_logs["locations"] if loc.get("status") == "failed"
+                )
+                progress_logs["summary"]["in_progress_locations"] = sum(
+                    1 for loc in progress_logs["locations"] if loc.get("status") == "in_progress"
+                )
             
             # Return failure information instead of None
             return {
@@ -856,9 +864,19 @@ class MLSScraper:
                 "message": f"Location scraping failed: {str(e)}"
             }
     
-    async def _enrich_property_async(self, property_id: str, property_dict: Dict[str, Any], job_id: Optional[str]):
+    async def _enrich_property_async(
+        self, 
+        property_id: str, 
+        property_dict: Dict[str, Any], 
+        job_id: Optional[str],
+        location: Optional[str] = None,
+        location_idx: Optional[int] = None,
+        listing_type: Optional[str] = None,
+        progress_logs: Optional[Dict[str, Any]] = None
+    ):
         """Async enrichment task with semaphore for concurrency control"""
         async with self.enrichment_semaphore:
+            success = False
             try:
                 await db.enrichment_pipeline.enrich_property(
                     property_id=property_id,
@@ -866,8 +884,38 @@ class MLSScraper:
                     existing_property=None,  # Deprecated - enrichment will fetch from DB
                     job_id=job_id
                 )
+                success = True
             except Exception as e:
                 logger.error(f"Error in enrichment task for property {property_id}: {e}")
+            finally:
+                # Update progress logs if provided
+                if progress_logs and location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                    location_entry = progress_logs["locations"][location_idx]
+                    enrichment_status = location_entry.get("enrichment", {})
+                    
+                    if success:
+                        enrichment_status["completed"] = enrichment_status.get("completed", 0) + 1
+                        # Update per-listing-type enriched counter
+                        if listing_type and listing_type in location_entry.get("listing_types", {}):
+                            location_entry["listing_types"][listing_type]["enriched"] = \
+                                location_entry["listing_types"][listing_type].get("enriched", 0) + 1
+                    else:
+                        enrichment_status["failed"] = enrichment_status.get("failed", 0) + 1
+                    
+                    # Check if enrichment is complete
+                    total = enrichment_status.get("total", 0)
+                    completed = enrichment_status.get("completed", 0)
+                    failed = enrichment_status.get("failed", 0)
+                    
+                    if completed + failed >= total and total > 0:
+                        enrichment_status["status"] = "completed"
+                    
+                    # Update job status periodically (every 10 completions to avoid too many DB writes)
+                    if (completed + failed) % 10 == 0 or (completed + failed) >= total:
+                        try:
+                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        except Exception as e:
+                            logger.error(f"Error updating job status with enrichment progress: {e}")
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
@@ -1266,7 +1314,7 @@ class MLSScraper:
         proxy_config: Optional[Dict[str, Any]] = None,
         cancel_flag: Optional[dict] = None,
         batch_size: int = 50,
-        progress_logs: Optional[List[Dict[str, Any]]] = None,
+        progress_logs: Optional[Dict[str, Any]] = None,
         job_id: Optional[str] = None,
         location: Optional[str] = None  # Add location parameter to filter by specific location
     ) -> Dict[str, Any]:
@@ -1286,8 +1334,8 @@ class MLSScraper:
             listing_types_to_check = ['for_sale', 'pending']
             
             location_info = f" for location {location}" if location else ""
-            print(f"   [OFF-MARKET] Checking for missing properties for scheduled job {scheduled_job_id}{location_info}")
-            print(f"   [OFF-MARKET] Job start time: {job_start_time.isoformat()}")
+            logger.debug(f"   [OFF-MARKET] Checking for missing properties for scheduled job {scheduled_job_id}{location_info}")
+            logger.debug(f"   [OFF-MARKET] Job start time: {job_start_time.isoformat()}")
             
             # Query database for properties with this scheduled_job_id that weren't scraped in THIS job run
             # Properties that have last_scraped < job_start_time (weren't updated in this scrape)
@@ -1311,7 +1359,7 @@ class MLSScraper:
                     # Location contains zip code - filter by zip code for precise matching
                     zip_code = zip_match.group(1)
                     query["address.zip_code"] = zip_code
-                    print(f"   [OFF-MARKET] Filtering by zip code: {zip_code}")
+                    logger.debug(f"   [OFF-MARKET] Filtering by zip code: {zip_code}")
                 else:
                     # No zip code found - parse city/state for broader matching
                     city, state = self._parse_city_state_from_location(location)
@@ -1319,44 +1367,35 @@ class MLSScraper:
                         # Filter by city and state (covers all zip codes in that city)
                         query["address.city"] = {"$regex": f"^{city}$", "$options": "i"}
                         query["address.state"] = {"$regex": f"^{state}$", "$options": "i"}
-                        print(f"   [OFF-MARKET] Filtering by city/state: {city}, {state} (no zip code in location)")
+                        logger.debug(f"   [OFF-MARKET] Filtering by city/state: {city}, {state} (no zip code in location)")
                     else:
                         # Could not parse location - log warning but continue with scheduled_job_id filter only
                         logger.warning(f"   [OFF-MARKET] Could not parse location '{location}' - checking all properties for scheduled job (may be slow)")
             
-            cursor = db.properties_collection.find(query).sort("last_scraped", 1).limit(10000)  # Sort by oldest last_scraped first
+            # Optimize query: only fetch property_id and address fields needed for checking
+            # This reduces memory usage and speeds up the query significantly
+            cursor = db.properties_collection.find(
+                query,
+                {"property_id": 1, "address": 1, "status": 1, "mls_status": 1, "listing_type": 1}  # Include listing_type for tracking
+            ).sort("last_scraped", 1).limit(10000)  # Sort by oldest last_scraped first
             
-            existing_properties = []
+            # Store lightweight property data instead of full Property objects
+            # Already filtered to only missing properties (not in found_property_ids)
+            missing_properties = []
             async for prop_data in cursor:
-                prop_data["_id"] = str(prop_data["_id"])
-                # Convert ObjectId fields to strings
-                if "agent_id" in prop_data and prop_data["agent_id"]:
-                    prop_data["agent_id"] = str(prop_data["agent_id"])
-                if "broker_id" in prop_data and prop_data["broker_id"]:
-                    prop_data["broker_id"] = str(prop_data["broker_id"])
-                if "office_id" in prop_data and prop_data["office_id"]:
-                    prop_data["office_id"] = str(prop_data["office_id"])
-                if "builder_id" in prop_data and prop_data["builder_id"]:
-                    prop_data["builder_id"] = str(prop_data["builder_id"])
-                existing_properties.append(Property(**prop_data))
-            
-            if not existing_properties:
-                print(f"   [OFF-MARKET] No existing properties found for scheduled job {scheduled_job_id}")
-                return {
-                    "missing_checked": 0,
-                    "off_market_found": 0,
-                    "errors": 0,
-                    "skipped": False
-                }
-            
-            # Filter to properties that weren't found in current scrape
-            missing_properties = [
-                prop for prop in existing_properties
-                if prop.property_id not in found_property_ids
-            ]
+                property_id = prop_data.get("property_id")
+                if property_id and property_id not in found_property_ids:
+                    # Only include properties not found in current scrape
+                    missing_properties.append({
+                        "property_id": property_id,
+                        "address": prop_data.get("address", {}),
+                        "status": prop_data.get("status"),
+                        "mls_status": prop_data.get("mls_status"),
+                        "listing_type": prop_data.get("listing_type")  # For per-listing-type tracking
+                    })
             
             if not missing_properties:
-                print(f"   [OFF-MARKET] All existing properties were found in current scrape")
+                logger.debug(f"   [OFF-MARKET] No missing properties found for scheduled job {scheduled_job_id}")
                 return {
                     "missing_checked": 0,
                     "off_market_found": 0,
@@ -1365,7 +1404,7 @@ class MLSScraper:
                 }
             
             total_missing = len(missing_properties)
-            print(f"   [OFF-MARKET] Found {total_missing} missing properties, processing in batches of {batch_size}")
+            logger.info(f"   [OFF-MARKET] Found {total_missing} missing properties, processing in batches of {batch_size}")
             
             off_market_count = 0
             error_count = 0
@@ -1375,12 +1414,20 @@ class MLSScraper:
             from services.history_tracker import HistoryTracker
             history_tracker = HistoryTracker(db.db)
             
+            # Get location_entry for updating progress_logs (outside batch loop for efficiency)
+            location_entry = None
+            if progress_logs and location:
+                for loc_entry in progress_logs.get("locations", []):
+                    if loc_entry.get("location") == location:
+                        location_entry = loc_entry
+                        break
+            
             # Process properties in batches until all are checked
             batch_number = 0
             while missing_properties:
                 # Check cancellation flag
                 if cancel_flag and cancel_flag.get("cancelled", False):
-                    print(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
+                    logger.info(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
                     break
                 
                 batch_number += 1
@@ -1388,21 +1435,13 @@ class MLSScraper:
                 batch = missing_properties[:batch_size]
                 remaining = len(missing_properties) - len(batch)
                 
-                print(f"   [OFF-MARKET] Processing batch {batch_number}: {len(batch)} properties ({(total_checked + len(batch))}/{total_missing} total, {remaining} remaining)")
+                logger.debug(f"   [OFF-MARKET] Processing batch {batch_number}: {len(batch)} properties ({(total_checked + len(batch))}/{total_missing} total, {remaining} remaining)")
                 
                 # Update progress logs if provided
-                if progress_logs is not None and job_id:
+                if location_entry is not None and job_id:
                     try:
-                        # Find most recent location entry in progress logs (off-market check applies to the whole job)
-                        location_log_idx = None
-                        for idx in range(len(progress_logs) - 1, -1, -1):  # Search backwards
-                            log = progress_logs[idx]
-                            if isinstance(log, dict) and log.get("location"):
-                                location_log_idx = idx
-                                break
-                        
-                        if location_log_idx is not None:
-                            progress_logs[location_log_idx]["off_market_check"] = {
+                        if location_entry is not None:
+                            location_entry["off_market_check"] = {
                                 "status": "in_progress",
                                 "scheduled_job_id": scheduled_job_id,
                                 "total_missing": total_missing,
@@ -1415,43 +1454,51 @@ class MLSScraper:
                             }
                             await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     except Exception as e:
-                        print(f"   [OFF-MARKET] Error updating progress logs: {e}")
+                        logger.error(f"   [OFF-MARKET] Error updating progress logs: {e}")
+                
+                # Track off-market per listing type
+                off_market_by_listing_type = {}
                 
                 # Check each property in batch
-                for i, prop in enumerate(batch):
+                for i, prop_data in enumerate(batch):
                     # Check cancellation flag
                     if cancel_flag and cancel_flag.get("cancelled", False):
-                        print(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
+                        logger.info(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
                         break
                     
                     try:
+                        property_id = prop_data["property_id"]
+                        address = prop_data.get("address", {})
+                        formatted_address = address.get("formatted_address") if address else None
+                        listing_type = prop_data.get("listing_type")
+                        
                         # Query property directly by address
-                        if not prop.address or not prop.address.formatted_address:
-                            print(f"   [OFF-MARKET] Property {prop.property_id} has no formatted_address, skipping")
+                        if not formatted_address:
+                            logger.debug(f"   [OFF-MARKET] Property {property_id} has no formatted_address, skipping")
                             total_checked += 1
                             continue
                         
                         current_num = total_checked + i + 1
-                        print(f"   [OFF-MARKET] Checking property {current_num}/{total_missing} (batch {batch_number}): {prop.address.formatted_address}")
+                        logger.debug(f"   [OFF-MARKET] Checking property {current_num}/{total_missing} (batch {batch_number}): {formatted_address}")
                         
                         queried_property = await self.query_property_by_address(
-                            prop.address.formatted_address,
+                            formatted_address,
                             proxy_config
                         )
                         
                         if queried_property:
                             # Check if property is off-market
                             if self.is_off_market_status(queried_property.status, queried_property.mls_status):
-                                print(f"   [OFF-MARKET] [OK] Property {prop.property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
+                                logger.info(f"   [OFF-MARKET] [OK] Property {property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
                                 
                                 # Update property status
-                                old_status = prop.status or 'UNKNOWN'
+                                old_status = prop_data.get("status") or 'UNKNOWN'
                                 await db.properties_collection.update_one(
-                                    {"property_id": prop.property_id},
+                                    {"property_id": property_id},
                                     {
                                         "$set": {
                                             "status": "OFF_MARKET",
-                                            "mls_status": queried_property.mls_status or prop.mls_status,
+                                            "mls_status": queried_property.mls_status or prop_data.get("mls_status"),
                                             "scraped_at": datetime.utcnow()
                                         }
                                     }
@@ -1467,18 +1514,26 @@ class MLSScraper:
                                         "timestamp": datetime.utcnow()
                                     }
                                     await history_tracker.record_change_logs(
-                                        prop.property_id,
+                                        property_id,
                                         [change_entry],
                                         "off_market_detection"
                                     )
                                 except Exception as e:
-                                    print(f"   [OFF-MARKET] Error recording change log: {e}")
+                                    logger.error(f"   [OFF-MARKET] Error recording change log: {e}")
                                 
                                 off_market_count += 1
+                                # Track per listing type (only for for_sale and pending)
+                                if listing_type in ['for_sale', 'pending']:
+                                    off_market_by_listing_type[listing_type] = off_market_by_listing_type.get(listing_type, 0) + 1
+                                    
+                                    # Update progress_logs per listing type
+                                    if location_entry and listing_type in location_entry.get("listing_types", {}):
+                                        location_entry["listing_types"][listing_type]["off_market"] = \
+                                            location_entry["listing_types"][listing_type].get("off_market", 0) + 1
                             else:
-                                print(f"   [OFF-MARKET] Property {prop.property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
+                                logger.debug(f"   [OFF-MARKET] Property {property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
                         else:
-                            print(f"   [OFF-MARKET] Property {prop.property_id} not found in HomeHarvest (may be deleted)")
+                            logger.debug(f"   [OFF-MARKET] Property {property_id} not found in HomeHarvest (may be deleted)")
                         
                         # Add delay between queries to avoid rate limiting
                         if i < len(batch) - 1:  # Don't delay after last property in batch
@@ -1486,7 +1541,7 @@ class MLSScraper:
                         
                     except Exception as e:
                         error_count += 1
-                        print(f"   [OFF-MARKET] Error checking property {prop.property_id}: {e}")
+                        logger.error(f"   [OFF-MARKET] Error checking property {prop_data.get('property_id', 'unknown')}: {e}")
                         continue
                 
                 # Remove processed batch from list
@@ -1495,8 +1550,26 @@ class MLSScraper:
                 
                 # Add delay between batches (shorter delay)
                 if missing_properties:
-                    print(f"   [OFF-MARKET] Batch {batch_number} complete: {off_market_count} off-market found so far, {len(missing_properties)} remaining")
+                    logger.debug(f"   [OFF-MARKET] Batch {batch_number} complete: {off_market_count} off-market found so far, {len(missing_properties)} remaining")
                     await asyncio.sleep(2.0)  # 2 second delay between batches
+            
+            # Update final off-market check status in progress_logs
+            if progress_logs and location and job_id:
+                try:
+                    location_entry = None
+                    for loc_entry in progress_logs.get("locations", []):
+                        if loc_entry.get("location") == location:
+                            location_entry = loc_entry
+                            break
+                    
+                    if location_entry:
+                        location_entry["off_market_check"]["status"] = "completed"
+                        location_entry["off_market_check"]["checked"] = total_checked
+                        location_entry["off_market_check"]["found"] = off_market_count
+                        location_entry["off_market_check"]["errors"] = error_count
+                        await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                except Exception as e:
+                    logger.error(f"   [OFF-MARKET] Error updating final progress logs: {e}")
             
             result = {
                 "missing_checked": total_checked,
@@ -1508,13 +1581,13 @@ class MLSScraper:
                 "skipped": False
             }
             
-            print(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
+            logger.info(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
             return result
             
         except Exception as e:
-            print(f"   [OFF-MARKET] Error in off-market detection: {e}")
+            logger.error(f"   [OFF-MARKET] Error in off-market detection: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return {
                 "missing_checked": 0,
                 "off_market_found": 0,
@@ -1532,7 +1605,7 @@ class MLSScraper:
         proxy_config: Optional[Dict[str, Any]] = None,
         cancel_flag: Optional[dict] = None,
         batch_size: int = 50,
-        progress_logs: Optional[List[Dict[str, Any]]] = None,
+        progress_logs: Optional[Dict[str, Any]] = None,
         job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
@@ -1548,7 +1621,7 @@ class MLSScraper:
             # Parse city and state from location
             city, state = self._parse_city_state_from_location(location)
             if not city or not state:
-                print(f"   [OFF-MARKET] Could not parse city/state from location '{location}', skipping check")
+                logger.warning(f"   [OFF-MARKET] Could not parse city/state from location '{location}', skipping check")
                 return {
                     "missing_checked": 0,
                     "off_market_found": 0,
@@ -1557,8 +1630,8 @@ class MLSScraper:
                     "reason": "Could not parse city/state"
                 }
             
-            print(f"   [OFF-MARKET] Checking for missing properties in {city}, {state} (location-based)")
-            print(f"   [OFF-MARKET] Job start time: {job_start_time.isoformat()}")
+            logger.debug(f"   [OFF-MARKET] Checking for missing properties in {city}, {state} (location-based)")
+            logger.debug(f"   [OFF-MARKET] Job start time: {job_start_time.isoformat()}")
             
             # Query database for properties in this city/state that weren't scraped recently
             # For one-time jobs, we check properties with last_scraped < job_start_time OR no last_scraped
@@ -1573,39 +1646,27 @@ class MLSScraper:
                 ]
             }
             
-            cursor = db.properties_collection.find(query).sort("last_scraped", 1).limit(10000)
+            # Optimize query: only fetch needed fields
+            cursor = db.properties_collection.find(
+                query,
+                {"property_id": 1, "address": 1, "status": 1, "mls_status": 1, "listing_type": 1}
+            ).sort("last_scraped", 1).limit(10000)
             
-            existing_properties = []
+            # Store lightweight property data (already filtered to missing properties)
+            missing_properties = []
             async for prop_data in cursor:
-                prop_data["_id"] = str(prop_data["_id"])
-                # Convert ObjectId fields to strings
-                if "agent_id" in prop_data and prop_data["agent_id"]:
-                    prop_data["agent_id"] = str(prop_data["agent_id"])
-                if "broker_id" in prop_data and prop_data["broker_id"]:
-                    prop_data["broker_id"] = str(prop_data["broker_id"])
-                if "office_id" in prop_data and prop_data["office_id"]:
-                    prop_data["office_id"] = str(prop_data["office_id"])
-                if "builder_id" in prop_data and prop_data["builder_id"]:
-                    prop_data["builder_id"] = str(prop_data["builder_id"])
-                existing_properties.append(Property(**prop_data))
-            
-            if not existing_properties:
-                print(f"   [OFF-MARKET] No existing properties found in database for {city}, {state}")
-                return {
-                    "missing_checked": 0,
-                    "off_market_found": 0,
-                    "errors": 0,
-                    "skipped": False
-                }
-            
-            # Filter to properties that weren't found in current scrape
-            missing_properties = [
-                prop for prop in existing_properties
-                if prop.property_id not in found_property_ids
-            ]
+                property_id = prop_data.get("property_id")
+                if property_id and property_id not in found_property_ids:
+                    missing_properties.append({
+                        "property_id": property_id,
+                        "address": prop_data.get("address", {}),
+                        "status": prop_data.get("status"),
+                        "mls_status": prop_data.get("mls_status"),
+                        "listing_type": prop_data.get("listing_type")
+                    })
             
             if not missing_properties:
-                print(f"   [OFF-MARKET] All existing properties were found in current scrape")
+                logger.debug(f"   [OFF-MARKET] No missing properties found in database for {city}, {state}")
                 return {
                     "missing_checked": 0,
                     "off_market_found": 0,
@@ -1614,7 +1675,7 @@ class MLSScraper:
                 }
             
             total_missing = len(missing_properties)
-            print(f"   [OFF-MARKET] Found {total_missing} missing properties, processing in batches of {batch_size}")
+            logger.info(f"   [OFF-MARKET] Found {total_missing} missing properties, processing in batches of {batch_size}")
             
             # Use the same batch processing logic as scheduled job method
             off_market_count = 0
@@ -1630,7 +1691,7 @@ class MLSScraper:
             while missing_properties:
                 # Check cancellation flag
                 if cancel_flag and cancel_flag.get("cancelled", False):
-                    print(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
+                    logger.info(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
                     break
                 
                 batch_number += 1
@@ -1638,70 +1699,76 @@ class MLSScraper:
                 batch = missing_properties[:batch_size]
                 remaining = len(missing_properties) - len(batch)
                 
-                print(f"   [OFF-MARKET] Processing batch {batch_number}: {len(batch)} properties ({(total_checked + len(batch))}/{total_missing} total, {remaining} remaining)")
+                logger.debug(f"   [OFF-MARKET] Processing batch {batch_number}: {len(batch)} properties ({(total_checked + len(batch))}/{total_missing} total, {remaining} remaining)")
+                
+                # Get location_entry for updating progress_logs
+                location_entry = None
+                if progress_logs and location:
+                    for loc_entry in progress_logs.get("locations", []):
+                        if loc_entry.get("location") == location:
+                            location_entry = loc_entry
+                            break
                 
                 # Update progress logs if provided
-                if progress_logs is not None and job_id:
+                if location_entry is not None and job_id:
                     try:
-                        # Find most recent location entry in progress logs
-                        location_log_idx = None
-                        for idx in range(len(progress_logs) - 1, -1, -1):  # Search backwards
-                            log = progress_logs[idx]
-                            if isinstance(log, dict) and log.get("location") == location:
-                                location_log_idx = idx
-                                break
-                        
-                        if location_log_idx is not None:
-                            progress_logs[location_log_idx]["off_market_check"] = {
-                                "status": "in_progress",
-                                "location": location,
-                                "total_missing": total_missing,
-                                "checked": total_checked,
-                                "current_batch": batch_number,
-                                "batch_size": len(batch),
-                                "remaining": remaining,
-                                "off_market_found": off_market_count,
-                                "errors": error_count
-                            }
-                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        location_entry["off_market_check"] = {
+                            "status": "in_progress",
+                            "total_missing": total_missing,
+                            "checked": total_checked,
+                            "current_batch": batch_number,
+                            "batch_size": len(batch),
+                            "remaining": remaining,
+                            "off_market_found": off_market_count,
+                            "errors": error_count
+                        }
+                        await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     except Exception as e:
-                        print(f"   [OFF-MARKET] Error updating progress logs: {e}")
+                        logger.error(f"   [OFF-MARKET] Error updating progress logs: {e}")
+                
+                # Track off-market per listing type
+                off_market_by_listing_type = {}
                 
                 # Check each property in batch
-                for i, prop in enumerate(batch):
+                for i, prop_data in enumerate(batch):
                     # Check cancellation flag
                     if cancel_flag and cancel_flag.get("cancelled", False):
-                        print(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
+                        logger.info(f"   [OFF-MARKET] Job cancelled, stopping off-market check")
                         break
                     
                     try:
+                        property_id = prop_data["property_id"]
+                        address = prop_data.get("address", {})
+                        formatted_address = address.get("formatted_address") if address else None
+                        listing_type = prop_data.get("listing_type")
+                        
                         # Query property directly by address
-                        if not prop.address or not prop.address.formatted_address:
-                            print(f"   [OFF-MARKET] Property {prop.property_id} has no formatted_address, skipping")
+                        if not formatted_address:
+                            logger.debug(f"   [OFF-MARKET] Property {property_id} has no formatted_address, skipping")
                             total_checked += 1
                             continue
                         
                         current_num = total_checked + i + 1
-                        print(f"   [OFF-MARKET] Checking property {current_num}/{total_missing} (batch {batch_number}): {prop.address.formatted_address}")
+                        logger.debug(f"   [OFF-MARKET] Checking property {current_num}/{total_missing} (batch {batch_number}): {formatted_address}")
                         
                         queried_property = await self.query_property_by_address(
-                            prop.address.formatted_address,
+                            formatted_address,
                             proxy_config
                         )
                         
                         if queried_property:
                             # Check if property is off-market
                             if self.is_off_market_status(queried_property.status, queried_property.mls_status):
-                                print(f"   [OFF-MARKET] [OK] Property {prop.property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
+                                logger.info(f"   [OFF-MARKET] [OK] Property {property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
                                 
                                 # Update property status
-                                old_status = prop.status or 'UNKNOWN'
+                                old_status = prop_data.get("status") or 'UNKNOWN'
                                 await db.properties_collection.update_one(
-                                    {"property_id": prop.property_id},
+                                    {"property_id": property_id},
                                     {
                                         "$set": {
                                             "status": "OFF_MARKET",
-                                            "mls_status": queried_property.mls_status or prop.mls_status,
+                                            "mls_status": queried_property.mls_status or prop_data.get("mls_status"),
                                             "scraped_at": datetime.utcnow()
                                         }
                                     }
@@ -1717,18 +1784,26 @@ class MLSScraper:
                                         "timestamp": datetime.utcnow()
                                     }
                                     await history_tracker.record_change_logs(
-                                        prop.property_id,
+                                        property_id,
                                         [change_entry],
                                         "off_market_detection"
                                     )
                                 except Exception as e:
-                                    print(f"   [OFF-MARKET] Error recording change log: {e}")
+                                    logger.error(f"   [OFF-MARKET] Error recording change log: {e}")
                                 
                                 off_market_count += 1
+                                # Track per listing type (only for for_sale and pending)
+                                if listing_type in ['for_sale', 'pending']:
+                                    off_market_by_listing_type[listing_type] = off_market_by_listing_type.get(listing_type, 0) + 1
+                                    
+                                    # Update progress_logs per listing type
+                                    if location_entry and listing_type in location_entry.get("listing_types", {}):
+                                        location_entry["listing_types"][listing_type]["off_market"] = \
+                                            location_entry["listing_types"][listing_type].get("off_market", 0) + 1
                             else:
-                                print(f"   [OFF-MARKET] Property {prop.property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
+                                logger.debug(f"   [OFF-MARKET] Property {property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
                         else:
-                            print(f"   [OFF-MARKET] Property {prop.property_id} not found in HomeHarvest (may be deleted)")
+                            logger.debug(f"   [OFF-MARKET] Property {property_id} not found in HomeHarvest (may be deleted)")
                         
                         # Add delay between queries to avoid rate limiting
                         if i < len(batch) - 1:  # Don't delay after last property in batch
@@ -1736,7 +1811,7 @@ class MLSScraper:
                         
                     except Exception as e:
                         error_count += 1
-                        print(f"   [OFF-MARKET] Error checking property {prop.property_id}: {e}")
+                        logger.error(f"   [OFF-MARKET] Error checking property {prop_data.get('property_id', 'unknown')}: {e}")
                         continue
                 
                 # Remove processed batch from list
@@ -1745,8 +1820,19 @@ class MLSScraper:
                 
                 # Add delay between batches (shorter delay)
                 if missing_properties:
-                    print(f"   [OFF-MARKET] Batch {batch_number} complete: {off_market_count} off-market found so far, {len(missing_properties)} remaining")
+                    logger.debug(f"   [OFF-MARKET] Batch {batch_number} complete: {off_market_count} off-market found so far, {len(missing_properties)} remaining")
                     await asyncio.sleep(2.0)  # 2 second delay between batches
+            
+            # Update final off-market check status in progress_logs
+            if location_entry and job_id:
+                try:
+                    location_entry["off_market_check"]["status"] = "completed"
+                    location_entry["off_market_check"]["checked"] = total_checked
+                    location_entry["off_market_check"]["found"] = off_market_count
+                    location_entry["off_market_check"]["errors"] = error_count
+                    await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                except Exception as e:
+                    logger.error(f"   [OFF-MARKET] Error updating final progress logs: {e}")
             
             result = {
                 "missing_checked": total_checked,
@@ -1758,7 +1844,7 @@ class MLSScraper:
                 "skipped": False
             }
             
-            logger.debug(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
+            logger.info(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
             return result
             
         except Exception as e:
