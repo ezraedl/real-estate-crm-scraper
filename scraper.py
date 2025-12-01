@@ -22,7 +22,8 @@ class MLSScraper:
         self.is_running = False
         self.current_jobs = {}
         self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
-        self.enrichment_executor = ThreadPoolExecutor(max_workers=settings.ENRICHMENT_WORKERS)  # Thread pool for enrichment workers
+        # Use asyncio.Semaphore instead of ThreadPoolExecutor for enrichment to avoid event loop conflicts
+        self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
     
     async def start(self):
         """Start the scraper service"""
@@ -167,7 +168,14 @@ class MLSScraper:
                         "location_index": i + 1,
                         "message": f"Starting location {i+1}/{len(job.locations)}: {location}"
                     })
-                    await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    # Update current_location field so GUI can show the active location
+                    await db.update_job_status(
+                        job.job_id, 
+                        JobStatus.RUNNING, 
+                        progress_logs=progress_logs,
+                        current_location=location,
+                        current_location_index=i + 1
+                    )
                     
                     location_failed = False
                     location_error = None
@@ -252,6 +260,7 @@ class MLSScraper:
                     logger.debug(f"[SKIP] Location {location} failed, continuing with next location...")
                 
                 # Update job progress with detailed breakdown and logs (including failed locations)
+                # Include current_location so GUI can show which location is being processed
                 await db.update_job_status(
                     job.job_id,
                     JobStatus.RUNNING,
@@ -262,7 +271,9 @@ class MLSScraper:
                     properties_updated=total_updated,
                     properties_skipped=total_skipped,
                     failed_locations=failed_locations,
-                    progress_logs=progress_logs
+                    progress_logs=progress_logs,
+                    current_location=location,  # Keep current_location updated
+                    current_location_index=i + 1
                 )
                 
                 # Periodic progress logging (every 10 locations or 5 minutes)
@@ -371,7 +382,9 @@ class MLSScraper:
                 properties_scraped=total_properties,
                 properties_saved=saved_properties,
                 failed_locations=failed_locations,
-                progress_logs=progress_logs
+                progress_logs=progress_logs,
+                current_location=None,  # Clear current_location when job completes
+                current_location_index=None
             )
             
             # Update run history for scheduled jobs (new architecture)
@@ -622,6 +635,13 @@ class MLSScraper:
                     }
                     
                     # Update the temp summary with completed status and running totals
+                    # Re-find temp_idx in case progress_logs was modified
+                    temp_idx = None
+                    for idx, log in enumerate(progress_logs):
+                        if isinstance(log, dict) and log.get("location") == location and log.get("status") == "in_progress":
+                            temp_idx = idx
+                            break
+                    
                     logger.debug(f"   [DEBUG] temp_idx = {temp_idx}, will update progress logs")
                     if temp_idx is not None:
                         progress_logs[temp_idx] = {
@@ -638,31 +658,35 @@ class MLSScraper:
                             "updated": location_total_updated,
                             "skipped": location_total_skipped
                         }
-                        # Push to database immediately with updated job totals
-                        logger.debug(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
-                        await db.update_job_status(
-                            job.job_id, 
-                            JobStatus.RUNNING,
-                            properties_scraped=running_totals["total_properties"],
-                            properties_saved=running_totals["saved_properties"],
-                            properties_inserted=running_totals["total_inserted"],
-                            properties_updated=running_totals["total_updated"],
-                            properties_skipped=running_totals["total_skipped"],
-                            progress_logs=progress_logs
-                        )
-                        logger.debug(f"   [DB-UPDATE] Job status updated successfully")
                     else:
-                        # No temp entry found, still update job counts
-                        logger.warning(f"   [WARNING] No temp_idx found, but still updating job counts")
-                        await db.update_job_status(
-                            job.job_id, 
-                            JobStatus.RUNNING,
-                            properties_scraped=running_totals["total_properties"],
-                            properties_saved=running_totals["saved_properties"],
-                            properties_inserted=running_totals["total_inserted"],
-                            properties_updated=running_totals["total_updated"],
-                            properties_skipped=running_totals["total_skipped"]
-                        )
+                        # Create new temp entry if not found
+                        progress_logs.append({
+                            "timestamp": end_time.isoformat(),
+                            "location": location,
+                            "location_index": location_index,
+                            "total_locations": total_locations,
+                            "status": "in_progress",
+                            "message": f"Completed {listing_type}: {len(properties)} found, {save_results.get('inserted', 0) if properties else 0} inserted, {save_results.get('updated', 0) if properties else 0} updated",
+                            "listing_type_breakdown": listing_type_logs.copy(),
+                            "properties_found": location_total_found,
+                            "inserted": location_total_inserted,
+                            "updated": location_total_updated,
+                            "skipped": location_total_skipped
+                        })
+                    
+                    # Push to database immediately with updated job totals
+                    logger.debug(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
+                    await db.update_job_status(
+                        job.job_id, 
+                        JobStatus.RUNNING,
+                        properties_scraped=running_totals["total_properties"],
+                        properties_saved=running_totals["saved_properties"],
+                        properties_inserted=running_totals["total_inserted"],
+                        properties_updated=running_totals["total_updated"],
+                        properties_skipped=running_totals["total_skipped"],
+                        progress_logs=progress_logs
+                    )
+                    logger.debug(f"   [DB-UPDATE] Job status updated successfully")
                     
                     # Reduced delay for faster response
                     await asyncio.sleep(0.5)
@@ -711,65 +735,8 @@ class MLSScraper:
             
             logger.info(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
             
-            # Check for missing properties that may have gone off-market
-            off_market_result = None
-            if found_property_ids and listing_types_to_scrape:
-                # Only check if we're scraping for_sale or pending
-                if any(lt in ['for_sale', 'pending'] for lt in listing_types_to_scrape):
-                    # Use job start time (not end time) to ensure we only check properties
-                    # that weren't scraped in THIS job run
-                    job_start = job_start_time or datetime.utcnow()
-                    
-                    if job.scheduled_job_id:
-                        # Scheduled job: use scheduled_job_id for precise tracking
-                        logger.debug(f"   [OFF-MARKET] Starting off-market detection for scheduled job {job.scheduled_job_id}")
-                        try:
-                            off_market_result = await self.check_missing_properties_for_off_market(
-                                scheduled_job_id=job.scheduled_job_id,
-                                listing_types_scraped=listing_types_to_scrape,
-                                found_property_ids=found_property_ids,
-                                job_start_time=job_start,
-                                proxy_config=proxy_config,
-                                cancel_flag=cancel_flag,
-                                batch_size=50,  # Process in batches of 50
-                                progress_logs=progress_logs,
-                                job_id=job.job_id
-                            )
-                            logger.debug(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
-                        except Exception as e:
-                            logger.warning(f"   [OFF-MARKET] Error during off-market detection: {e}")
-                            off_market_result = {
-                                "missing_checked": 0,
-                                "off_market_found": 0,
-                                "errors": 1,
-                                "error": str(e)
-                            }
-                    else:
-                        # One-time job: use location-based matching as fallback
-                        logger.debug(f"   [OFF-MARKET] Starting off-market detection for location {location} (one-time job)")
-                        try:
-                            off_market_result = await self.check_missing_properties_for_off_market_by_location(
-                                location=location,
-                                listing_types_scraped=listing_types_to_scrape,
-                                found_property_ids=found_property_ids,
-                                job_start_time=job_start,
-                                proxy_config=proxy_config,
-                                cancel_flag=cancel_flag,
-                                batch_size=50,
-                                progress_logs=progress_logs,
-                                job_id=job.job_id
-                            )
-                            logger.debug(f"   [OFF-MARKET] Detection complete: {off_market_result.get('off_market_found', 0)} off-market found")
-                        except Exception as e:
-                            logger.warning(f"   [OFF-MARKET] Error during off-market detection: {e}")
-                            off_market_result = {
-                                "missing_checked": 0,
-                                "off_market_found": 0,
-                                "errors": 1,
-                                "error": str(e)
-                            }
-            
             # Create final summary for this location
+            # Mark location as complete immediately (off-market detection will run in background)
             final_summary = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "location": location,
@@ -783,11 +750,33 @@ class MLSScraper:
                 "listing_type_breakdown": listing_type_logs
             }
             
-            # Add off-market detection results if available
-            if off_market_result:
-                final_summary["off_market_check"] = off_market_result
+            # Check for missing properties that may have gone off-market
+            # Run this in the background so it doesn't block location completion
+            if found_property_ids and listing_types_to_scrape:
+                # Only check if we're scraping for_sale or pending
+                if any(lt in ['for_sale', 'pending'] for lt in listing_types_to_scrape):
+                    # Use job start time (not end time) to ensure we only check properties
+                    # that weren't scraped in THIS job run
+                    job_start = job_start_time or datetime.utcnow()
+                    
+                    # Run off-market detection in background (non-blocking)
+                    # This allows the location to be marked as complete immediately
+                    # Only check properties for THIS specific location (zip code), not all properties in the job
+                    logger.info(f"   [OFF-MARKET] Starting background off-market detection for location {location}")
+                    asyncio.create_task(
+                        self._run_off_market_detection_background(
+                            job=job,
+                            location=location,  # Pass location to filter by zip code
+                            listing_types_to_scrape=listing_types_to_scrape,
+                            found_property_ids=found_property_ids,
+                            job_start_time=job_start,
+                            proxy_config=proxy_config,
+                            cancel_flag=cancel_flag,
+                            progress_logs=progress_logs
+                        )
+                    )
             
-            # Queue enrichment for all properties from this location (non-blocking, parallel threads)
+            # Queue enrichment for all properties from this location (non-blocking, async tasks)
             if enrichment_queue and db.enrichment_pipeline:
                 enrichment_count = len(enrichment_queue)
                 logger.info(f"   [ENRICHMENT] Starting enrichment for {enrichment_count} properties from {location}")
@@ -805,20 +794,24 @@ class MLSScraper:
                     for i in range(0, len(enrichment_queue), batch_size):
                         batch = enrichment_queue[i:i + batch_size]
                         for enrichment_item in batch:
-                            self.enrichment_executor.submit(
-                                self._enrich_property_sync,
-                                enrichment_item["property_id"],
-                                enrichment_item["property_dict"],
-                                enrichment_item["job_id"]
+                            # Create async task with semaphore for concurrency control
+                            asyncio.create_task(
+                                self._enrich_property_async(
+                                    enrichment_item["property_id"],
+                                    enrichment_item["property_dict"],
+                                    enrichment_item["job_id"]
+                                )
                             )
                 else:
                     # Process all at once
                     for enrichment_item in enrichment_queue:
-                        self.enrichment_executor.submit(
-                            self._enrich_property_sync,
-                            enrichment_item["property_id"],
-                            enrichment_item["property_dict"],
-                            enrichment_item["job_id"]
+                        # Create async task with semaphore for concurrency control
+                        asyncio.create_task(
+                            self._enrich_property_async(
+                                enrichment_item["property_id"],
+                                enrichment_item["property_dict"],
+                                enrichment_item["job_id"]
+                            )
                         )
             
             # Replace temp entry with final summary if it exists
@@ -863,25 +856,18 @@ class MLSScraper:
                 "message": f"Location scraping failed: {str(e)}"
             }
     
-    def _enrich_property_sync(self, property_id: str, property_dict: Dict[str, Any], job_id: Optional[str]):
-        """Synchronous wrapper for enrichment that runs in thread pool"""
-        try:
-            # Create new event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    async def _enrich_property_async(self, property_id: str, property_dict: Dict[str, Any], job_id: Optional[str]):
+        """Async enrichment task with semaphore for concurrency control"""
+        async with self.enrichment_semaphore:
             try:
-                loop.run_until_complete(
-                    db.enrichment_pipeline.enrich_property(
-                        property_id=property_id,
-                        property_dict=property_dict,
-                        existing_property=None,  # Deprecated - enrichment will fetch from DB
-                        job_id=job_id
-                    )
+                await db.enrichment_pipeline.enrich_property(
+                    property_id=property_id,
+                    property_dict=property_dict,
+                    existing_property=None,  # Deprecated - enrichment will fetch from DB
+                    job_id=job_id
                 )
-            finally:
-                loop.close()
-        except Exception as e:
-            logger.error(f"Error in enrichment thread for property {property_id}: {e}")
+            except Exception as e:
+                logger.error(f"Error in enrichment task for property {property_id}: {e}")
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
@@ -1281,7 +1267,8 @@ class MLSScraper:
         cancel_flag: Optional[dict] = None,
         batch_size: int = 50,
         progress_logs: Optional[List[Dict[str, Any]]] = None,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        location: Optional[str] = None  # Add location parameter to filter by specific location
     ) -> Dict[str, Any]:
         """
         Check for properties that belong to a scheduled job but weren't scraped in the current run.
@@ -1291,12 +1278,15 @@ class MLSScraper:
         Uses scheduled_job_id and last_scraped timestamp to identify properties that need checking.
         Only checks properties where last_scraped < job_start_time to ensure we don't check
         properties that were already scraped in this job run.
+        
+        If location is provided, only checks properties in that specific location (zip code).
         """
         try:
             # Only check for for_sale and pending properties
             listing_types_to_check = ['for_sale', 'pending']
             
-            print(f"   [OFF-MARKET] Checking for missing properties for scheduled job {scheduled_job_id}")
+            location_info = f" for location {location}" if location else ""
+            print(f"   [OFF-MARKET] Checking for missing properties for scheduled job {scheduled_job_id}{location_info}")
             print(f"   [OFF-MARKET] Job start time: {job_start_time.isoformat()}")
             
             # Query database for properties with this scheduled_job_id that weren't scraped in THIS job run
@@ -1311,6 +1301,28 @@ class MLSScraper:
                     {"last_scraped": {"$exists": False}}
                 ]
             }
+            
+            # If location is provided, filter by location to only check properties in this specific location
+            if location:
+                # Try to extract zip code from location string (e.g., "Indianapolis, IN 46201" -> "46201")
+                import re
+                zip_match = re.search(r'\b(\d{5})\b', location)
+                if zip_match:
+                    # Location contains zip code - filter by zip code for precise matching
+                    zip_code = zip_match.group(1)
+                    query["address.zip_code"] = zip_code
+                    print(f"   [OFF-MARKET] Filtering by zip code: {zip_code}")
+                else:
+                    # No zip code found - parse city/state for broader matching
+                    city, state = self._parse_city_state_from_location(location)
+                    if city and state:
+                        # Filter by city and state (covers all zip codes in that city)
+                        query["address.city"] = {"$regex": f"^{city}$", "$options": "i"}
+                        query["address.state"] = {"$regex": f"^{state}$", "$options": "i"}
+                        print(f"   [OFF-MARKET] Filtering by city/state: {city}, {state} (no zip code in location)")
+                    else:
+                        # Could not parse location - log warning but continue with scheduled_job_id filter only
+                        logger.warning(f"   [OFF-MARKET] Could not parse location '{location}' - checking all properties for scheduled job (may be slow)")
             
             cursor = db.properties_collection.find(query).sort("last_scraped", 1).limit(10000)  # Sort by oldest last_scraped first
             
@@ -1760,6 +1772,49 @@ class MLSScraper:
                 "skipped": False,
                 "error": str(e)
             }
+    
+    async def _run_off_market_detection_background(
+        self,
+        job: ScrapingJob,
+        location: str,
+        listing_types_to_scrape: List[str],
+        found_property_ids: set[str],
+        job_start_time: datetime,
+        proxy_config: Optional[Dict[str, Any]],
+        cancel_flag: Optional[dict],
+        progress_logs: Optional[List[Dict[str, Any]]]
+    ):
+        """Background task to run off-market detection without blocking location completion"""
+        try:
+            if job.scheduled_job_id:
+                # Scheduled job: use scheduled_job_id with location filter
+                await self.check_missing_properties_for_off_market(
+                    scheduled_job_id=job.scheduled_job_id,
+                    listing_types_scraped=listing_types_to_scrape,
+                    found_property_ids=found_property_ids,
+                    job_start_time=job_start_time,
+                    proxy_config=proxy_config,
+                    cancel_flag=cancel_flag,
+                    batch_size=50,
+                    progress_logs=progress_logs,
+                    job_id=job.job_id,
+                    location=location  # Filter by specific location (zip code or city/state)
+                )
+            else:
+                # One-time job: use location-based matching
+                await self.check_missing_properties_for_off_market_by_location(
+                    location=location,
+                    listing_types_scraped=listing_types_to_scrape,
+                    found_property_ids=found_property_ids,
+                    job_start_time=job_start_time,
+                    proxy_config=proxy_config,
+                    cancel_flag=cancel_flag,
+                    batch_size=50,
+                    progress_logs=progress_logs,
+                    job_id=job.job_id
+                )
+        except Exception as e:
+            logger.error(f"Error in background off-market detection for location {location}: {e}")
     
     async def immediate_scrape(self, locations: List[str], listing_type: str, **kwargs) -> str:
         """Perform immediate scraping with high priority"""

@@ -171,10 +171,31 @@ async def handle_stuck_jobs():
     """
     try:
         # Find all jobs stuck in "running" status
-        stuck_jobs_cursor = db.jobs_collection.find({"status": JobStatus.RUNNING.value}).sort([("created_at", -1)])
+        # Exclude jobs that were manually cancelled (they should be in CANCELLED status, but check error_message too)
+        # Only retry jobs that are actually stuck (crashed), not manually cancelled
+        stuck_jobs_cursor = db.jobs_collection.find({
+            "status": {"$in": [JobStatus.RUNNING.value]},  # Only RUNNING status
+            # Exclude jobs with error messages indicating manual cancellation
+            "$or": [
+                {"error_message": {"$exists": False}},
+                {"error_message": {"$not": {"$regex": "manually cancelled|manually stopped|user cancelled|cancelled by user", "$options": "i"}}}
+            ]
+        }).sort([("created_at", -1)])
         stuck_jobs = []
         async for job_data in stuck_jobs_cursor:
             job_data["_id"] = str(job_data["_id"])
+            # Double-check: skip if error_message indicates manual cancellation
+            error_msg = job_data.get("error_message", "").lower() if job_data.get("error_message") else ""
+            cancellation_keywords = ["manually cancelled", "manually stopped", "user cancelled", "cancelled by user"]
+            if any(keyword in error_msg for keyword in cancellation_keywords):
+                logger.info(f"Skipping job {job_data.get('job_id')} - appears to be manually cancelled (error_message: {job_data.get('error_message')})")
+                # Ensure it's marked as cancelled if it's still in RUNNING status
+                await db.update_job_status(
+                    job_data.get("job_id"),
+                    JobStatus.CANCELLED,
+                    error_message=job_data.get("error_message", "Manually cancelled by user")
+                )
+                continue
             stuck_jobs.append(ScrapingJob(**job_data))
         
         if not stuck_jobs:
@@ -193,106 +214,150 @@ async def handle_stuck_jobs():
         
         # Process each group
         for scheduled_key, job_group in jobs_by_scheduled.items():
-            if len(job_group) > 1:
-                logger.warning(
-                    f"Found {len(job_group)} stuck jobs for scheduled_job_id={scheduled_key}. "
-                    f"Will retry only the most recent one and fail the rest."
-                )
-                # Most recent is first (sorted by created_at desc)
-                job_to_retry = job_group[0]
-                jobs_to_fail = job_group[1:]
+            # Check if there's already a retry job in progress for this scheduled_job_id
+            # This prevents creating duplicate retry jobs
+            scheduled_job_id = job_group[0].scheduled_job_id if job_group else None
+            if scheduled_job_id:
+                # Check for existing retry jobs (PENDING or RUNNING) for this scheduled_job_id
+                existing_retry_jobs_cursor = db.jobs_collection.find({
+                    "scheduled_job_id": scheduled_job_id,
+                    "status": {"$in": [JobStatus.PENDING.value, JobStatus.RUNNING.value]},
+                    "job_id": {"$regex": "_retry_"}
+                })
+                existing_retry_jobs = []
+                async for retry_job_data in existing_retry_jobs_cursor:
+                    existing_retry_jobs.append(retry_job_data.get("job_id"))
                 
-                # Mark the older ones as failed immediately
-                for old_job in jobs_to_fail:
-                    logger.info(f"Marking old stuck job as failed: {old_job.job_id}")
-                    await db.update_job_status(
-                        old_job.job_id,
-                        JobStatus.FAILED,
-                        error_message="Job stuck in running status. Newer job found for same scheduled job."
-                    )
-            else:
-                job_to_retry = job_group[0]
-            
-            # Now handle the job to retry
-            job = job_to_retry
-            try:
-                # Check how many times this job has been retried
-                retry_count = job.job_id.count("_retry_")
-                
-                if retry_count >= 2:
-                    # Already retried twice (3 total attempts), mark as failed
-                    logger.warning(
-                        f"Job {job.job_id} has been retried {retry_count} times. Marking as failed."
-                    )
-                    await db.update_job_status(
-                        job.job_id,
-                        JobStatus.FAILED,
-                        error_message="Job stuck in running status after service restart. Max retries exceeded."
-                    )
-                    
-                    # Update scheduled job history if applicable
-                    if job.scheduled_job_id:
-                        await db.update_scheduled_job_run_history(
-                            job.scheduled_job_id,
-                            job.job_id,
-                            JobStatus.FAILED
-                        )
-                else:
-                    # Retry the job - smart resume from where it left off
+                if existing_retry_jobs:
                     logger.info(
-                        f"Retrying stuck job {job.job_id} (attempt {retry_count + 2}/3)"
+                        f"Skipping retry for scheduled_job_id={scheduled_job_id} - "
+                        f"retry job(s) already exist: {existing_retry_jobs}"
                     )
-                    
-                    # Determine which locations still need to be processed
-                    remaining_locations = get_remaining_locations(job)
-                    
-                    if not remaining_locations:
-                        logger.warning(f"No remaining locations for job {job.job_id}, marking as completed")
+                    # Mark all stuck jobs as failed since we're not retrying them
+                    for job in job_group:
                         await db.update_job_status(
                             job.job_id,
-                            JobStatus.COMPLETED,
-                            error_message="Job was stuck but all locations were completed"
+                            JobStatus.FAILED,
+                            error_message=f"Job stuck in running status. Retry job already exists: {existing_retry_jobs[0]}"
                         )
-                        continue
+                    continue
+            
+            # Sort jobs by created_at (most recent first)
+            # Use utcnow() as fallback for None values to ensure proper sorting
+            job_group.sort(key=lambda j: j.created_at if j.created_at else datetime.utcnow(), reverse=True)
+            
+            # Collect all remaining locations from ALL stuck jobs in this group
+            # This ensures we create ONE retry job that covers all remaining locations
+            all_remaining_locations = set()
+            all_job_configs = {}  # Store config from most recent job
+            
+            for job in job_group:
+                # Get remaining locations for this job
+                remaining_locations = get_remaining_locations(job)
+                all_remaining_locations.update(remaining_locations)
+                
+                # Store config from most recent job (first in sorted list)
+                if not all_job_configs:
+                    all_job_configs = {
+                        "scheduled_job_id": job.scheduled_job_id,
+                        "listing_types": job.listing_types,
+                        "listing_type": job.listing_type,
+                        "property_types": job.property_types,
+                        "past_days": job.past_days,
+                        "date_from": job.date_from,
+                        "date_to": job.date_to,
+                        "radius": job.radius,
+                        "mls_only": job.mls_only,
+                        "foreclosure": job.foreclosure,
+                        "exclude_pending": job.exclude_pending,
+                        "limit": job.limit,
+                        "proxy_config": job.proxy_config,
+                        "user_agent": job.user_agent,
+                        "request_delay": job.request_delay,
+                    }
+            
+            if not all_remaining_locations:
+                # All locations completed, mark all jobs as completed
+                logger.info(f"All locations completed for scheduled_job_id={scheduled_key}, marking jobs as completed")
+                for job in job_group:
+                    await db.update_job_status(
+                        job.job_id,
+                        JobStatus.COMPLETED,
+                        error_message="Job was stuck but all locations were completed"
+                    )
+                continue
+            
+            # Use the most recent job as the base for retry count
+            job_to_retry = job_group[0]
+            
+            try:
+                # Check how many times this job has been retried
+                retry_count = job_to_retry.job_id.count("_retry_")
+                
+                if retry_count >= 2:
+                    # Already retried twice (3 total attempts), mark all as failed
+                    logger.warning(
+                        f"Job {job_to_retry.job_id} has been retried {retry_count} times. Marking all as failed."
+                    )
+                    for job in job_group:
+                        await db.update_job_status(
+                            job.job_id,
+                            JobStatus.FAILED,
+                            error_message="Job stuck in running status after service restart. Max retries exceeded."
+                        )
+                        # Update scheduled job history if applicable
+                        if job.scheduled_job_id:
+                            await db.update_scheduled_job_run_history(
+                                job.scheduled_job_id,
+                                job.job_id,
+                                JobStatus.FAILED
+                            )
+                else:
+                    # Create ONE retry job with ALL remaining locations from ALL stuck jobs
+                    logger.info(
+                        f"Creating single retry job for scheduled_job_id={scheduled_key} "
+                        f"covering {len(all_remaining_locations)} remaining locations from {len(job_group)} stuck job(s)"
+                    )
                     
-                    # Create a retry job with only remaining locations
-                    retry_job_id = f"{job.job_id}_retry_{retry_count + 1}"
+                    # Create a retry job with all remaining locations
+                    retry_job_id = f"{job_to_retry.job_id}_retry_{retry_count + 1}"
                     retry_job = ScrapingJob(
                         job_id=retry_job_id,
                         priority=JobPriority.HIGH,  # High priority for retries
-                        scheduled_job_id=job.scheduled_job_id,
-                        locations=remaining_locations,  # Only remaining locations!
-                        listing_types=job.listing_types,  # Support multi-select
-                        listing_type=job.listing_type,
-                        property_types=job.property_types,
-                        past_days=job.past_days,
-                        date_from=job.date_from,
-                        date_to=job.date_to,
-                        radius=job.radius,
-                        mls_only=job.mls_only,
-                        foreclosure=job.foreclosure,
-                        exclude_pending=job.exclude_pending,
-                        limit=job.limit,
-                        proxy_config=job.proxy_config,
-                        user_agent=job.user_agent,
-                        request_delay=job.request_delay,
-                        total_locations=len(remaining_locations)  # Update count
+                        scheduled_job_id=all_job_configs.get("scheduled_job_id"),
+                        locations=list(all_remaining_locations),  # All remaining locations from all stuck jobs
+                        listing_types=all_job_configs.get("listing_types"),
+                        listing_type=all_job_configs.get("listing_type"),
+                        property_types=all_job_configs.get("property_types"),
+                        past_days=all_job_configs.get("past_days"),
+                        date_from=all_job_configs.get("date_from"),
+                        date_to=all_job_configs.get("date_to"),
+                        radius=all_job_configs.get("radius"),
+                        mls_only=all_job_configs.get("mls_only"),
+                        foreclosure=all_job_configs.get("foreclosure"),
+                        exclude_pending=all_job_configs.get("exclude_pending"),
+                        limit=all_job_configs.get("limit"),
+                        proxy_config=all_job_configs.get("proxy_config"),
+                        user_agent=all_job_configs.get("user_agent"),
+                        request_delay=all_job_configs.get("request_delay"),
+                        total_locations=len(all_remaining_locations)
                     )
                     
-                    logger.info(f"Smart resume: Retrying {len(remaining_locations)}/{len(job.locations)} locations")
+                    logger.info(f"Consolidated retry: {len(all_remaining_locations)} remaining locations from {len(job_group)} stuck job(s)")
                     
-                    # Mark the stuck job as failed
-                    await db.update_job_status(
-                        job.job_id,
-                        JobStatus.FAILED,
-                        error_message=f"Job stuck in running status. Retrying as {retry_job_id}"
-                    )
+                    # Mark all stuck jobs as failed
+                    for job in job_group:
+                        await db.update_job_status(
+                            job.job_id,
+                            JobStatus.FAILED,
+                            error_message=f"Job stuck in running status. Consolidated retry as {retry_job_id}"
+                        )
                     
                     # Create and start the retry job
                     await db.create_job(retry_job)
                     asyncio.create_task(scraper.process_job(retry_job))
                     
-                    logger.info(f"Created retry job: {retry_job_id}")
+                    logger.info(f"Created consolidated retry job: {retry_job_id} for scheduled_job_id={scheduled_key}")
                     
             except Exception as job_error:
                 logger.error(f"Error handling stuck job {job.job_id}: {job_error}")
@@ -1215,7 +1280,7 @@ async def get_job_status(job_id: str):
 
 # Get statistics for a scheduled job (MUST come before generic /{scheduled_job_id} route)
 @app.get("/scheduled-jobs/{scheduled_job_id}/stats")
-async def get_scheduled_job_stats(scheduled_job_id: str):
+async def get_scheduled_job_stats(scheduled_job_id: str, limit: int = 1000):
     """Get detailed statistics for a scheduled job"""
     try:
         # Get the scheduled job
@@ -1223,51 +1288,100 @@ async def get_scheduled_job_stats(scheduled_job_id: str):
         if not scheduled_job:
             raise HTTPException(status_code=404, detail=f"Scheduled job not found: {scheduled_job_id}")
         
-        # Get all job runs for this scheduled job
-        job_runs_cursor = db.jobs_collection.find(
-            {"scheduled_job_id": scheduled_job_id}
-        ).sort([("created_at", -1)])
-        
-        total_runs = 0
-        successful_runs = 0
-        failed_runs = 0
-        total_properties_scraped = 0
-        total_properties_saved = 0
-        total_duration_seconds = 0
-        duration_count = 0
-        last_successful_run = None
-        
-        async for job_data in job_runs_cursor:
-            total_runs += 1
-            
-            if job_data.get('status') == 'completed':
-                successful_runs += 1
-                total_properties_scraped += job_data.get('properties_scraped', 0)
-                total_properties_saved += job_data.get('properties_saved', 0)
-                
-                # Calculate duration
-                if job_data.get('started_at') and job_data.get('completed_at'):
-                    duration = (job_data['completed_at'] - job_data['started_at']).total_seconds()
-                    total_duration_seconds += duration
-                    duration_count += 1
-                
-                # Track last successful run
-                if not last_successful_run:
-                    last_successful_run = {
-                        "job_id": job_data.get('job_id'),
-                        "completed_at": job_data.get('completed_at'),
-                        "properties_scraped": job_data.get('properties_scraped', 0),
-                        "properties_saved": job_data.get('properties_saved', 0)
+        # Use aggregation to calculate statistics efficiently (much faster than iterating)
+        stats_pipeline = [
+            {"$match": {"scheduled_job_id": scheduled_job_id}},
+            {"$group": {
+                "_id": None,
+                "total_runs": {"$sum": 1},
+                "successful_runs": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "completed"]}, 1, 0]}
+                },
+                "failed_runs": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "failed"]}, 1, 0]}
+                },
+                "total_properties_scraped": {
+                    "$sum": {"$ifNull": ["$properties_scraped", 0]}
+                },
+                "total_properties_saved": {
+                    "$sum": {"$ifNull": ["$properties_saved", 0]}
+                },
+                "durations": {
+                    "$push": {
+                        "$cond": [
+                            {"$and": [
+                                {"$ne": ["$started_at", None]},
+                                {"$ne": ["$completed_at", None]}
+                            ]},
+                            {"$subtract": ["$completed_at", "$started_at"]},
+                            None
+                        ]
                     }
-                    
-            elif job_data.get('status') == 'failed':
-                failed_runs += 1
+                }
+            }},
+            {"$project": {
+                "total_runs": 1,
+                "successful_runs": 1,
+                "failed_runs": 1,
+                "total_properties_scraped": 1,
+                "total_properties_saved": 1,
+                "duration_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$durations",
+                            "cond": {"$ne": ["$$this", None]}
+                        }
+                    }
+                },
+                "total_duration_ms": {
+                    "$sum": {
+                        "$filter": {
+                            "input": "$durations",
+                            "cond": {"$ne": ["$$this", None]}
+                        }
+                    }
+                }
+            }}
+        ]
+        
+        stats_result = None
+        async for result in db.jobs_collection.aggregate(stats_pipeline):
+            stats_result = result
+            break
+        
+        if stats_result:
+            total_runs = stats_result.get("total_runs", 0)
+            successful_runs = stats_result.get("successful_runs", 0)
+            failed_runs = stats_result.get("failed_runs", 0)
+            total_properties_scraped = stats_result.get("total_properties_scraped", 0)
+            total_properties_saved = stats_result.get("total_properties_saved", 0)
+            duration_count = stats_result.get("duration_count", 0)
+            total_duration_ms = stats_result.get("total_duration_ms", 0)
+            average_duration_seconds = (total_duration_ms / 1000 / duration_count) if duration_count > 0 else 0
+        else:
+            total_runs = 0
+            successful_runs = 0
+            failed_runs = 0
+            total_properties_scraped = 0
+            total_properties_saved = 0
+            average_duration_seconds = 0
+        
+        # Get last successful run (single query with limit)
+        last_successful_job = await db.jobs_collection.find_one(
+            {"scheduled_job_id": scheduled_job_id, "status": "completed"},
+            sort=[("completed_at", -1)]
+        )
+        last_successful_run = None
+        if last_successful_job:
+            last_successful_run = {
+                "job_id": last_successful_job.get('job_id'),
+                "completed_at": last_successful_job.get('completed_at'),
+                "properties_scraped": last_successful_job.get('properties_scraped', 0),
+                "properties_saved": last_successful_job.get('properties_saved', 0)
+            }
         
         # Calculate success rate
         success_rate = (successful_runs / total_runs * 100) if total_runs > 0 else 0
-        
-        # Calculate average duration
-        average_duration_seconds = (total_duration_seconds / duration_count) if duration_count > 0 else 0
         
         # Count unique properties added (properties with this job's scheduled_job_id)
         unique_properties_count = await db.properties_collection.count_documents({
@@ -1452,20 +1566,38 @@ async def list_scheduled_jobs(
                 ("next_run_at", 1)
             ]).limit(limit)
         
-        scheduled_jobs = []
+        # Collect all scheduled job IDs first
+        scheduled_job_ids = []
+        scheduled_jobs_data = []
         async for job_data in cursor:
             scheduled_job_id = job_data.get("scheduled_job_id")
-            
-            # Get actual run count from jobs collection
-            actual_run_count = await db.jobs_collection.count_documents({
-                "scheduled_job_id": scheduled_job_id
-            })
-            
-            # Check if any job is currently running
-            has_running_job = await db.jobs_collection.count_documents({
-                "scheduled_job_id": scheduled_job_id,
-                "status": JobStatus.RUNNING.value
-            }) > 0
+            scheduled_job_ids.append(scheduled_job_id)
+            scheduled_jobs_data.append(job_data)
+        
+        # Use aggregation to get all counts in a single query (much faster than N*2 queries)
+        job_stats = {}
+        if scheduled_job_ids:
+            pipeline = [
+                {"$match": {"scheduled_job_id": {"$in": scheduled_job_ids}}},
+                {"$group": {
+                    "_id": "$scheduled_job_id",
+                    "total_runs": {"$sum": 1},
+                    "running_count": {
+                        "$sum": {"$cond": [{"$eq": ["$status", JobStatus.RUNNING.value]}, 1, 0]}
+                    }
+                }}
+            ]
+            async for result in db.jobs_collection.aggregate(pipeline):
+                job_stats[result["_id"]] = {
+                    "run_count": result["total_runs"],
+                    "has_running_job": result["running_count"] > 0
+                }
+        
+        # Build response with pre-computed stats
+        scheduled_jobs = []
+        for job_data in scheduled_jobs_data:
+            scheduled_job_id = job_data.get("scheduled_job_id")
+            stats = job_stats.get(scheduled_job_id, {"run_count": 0, "has_running_job": False})
             
             scheduled_jobs.append({
                 "scheduled_job_id": scheduled_job_id,
@@ -1478,8 +1610,8 @@ async def list_scheduled_jobs(
                 "listing_type": job_data.get("listing_type"),  # Backward compatibility
                 "split_by_zip": job_data.get("split_by_zip", False),
                 "zip_batch_size": job_data.get("zip_batch_size"),
-                "run_count": actual_run_count,  # Use actual count from jobs collection
-                "has_running_job": has_running_job,  # Indicator if a job is currently running
+                "run_count": stats["run_count"],  # Use aggregated count
+                "has_running_job": stats["has_running_job"],  # Use aggregated flag
                 "last_run_at": job_data.get("last_run_at"),
                 "last_run_status": job_data.get("last_run_status"),
                 "next_run_at": job_data.get("next_run_at"),
@@ -1779,8 +1911,12 @@ async def cancel_job(job_id: str):
         if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
             raise HTTPException(status_code=400, detail="Job cannot be cancelled in current status")
         
-        # Update job status
-        success = await db.update_job_status(job_id, JobStatus.CANCELLED)
+        # Update job status with error message indicating manual cancellation
+        success = await db.update_job_status(
+            job_id, 
+            JobStatus.CANCELLED,
+            error_message="Job manually cancelled by user"
+        )
         if not success:
             raise HTTPException(status_code=500, detail="Failed to cancel job")
         
