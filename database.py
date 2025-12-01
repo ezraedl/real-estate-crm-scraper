@@ -843,7 +843,8 @@ class Database:
                             results["enrichment_queue"].append({
                                 "property_id": prop.property_id,
                                 "property_dict": property_dict,
-                                "job_id": prop.job_id
+                                "job_id": prop.job_id,
+                                "listing_type": prop.listing_type  # Add listing_type for tracking
                             })
                             results["details"].append({
                                 "action": "updated",
@@ -872,7 +873,8 @@ class Database:
                         results["enrichment_queue"].append({
                             "property_id": prop.property_id,
                             "property_dict": property_dict,
-                            "job_id": prop.job_id
+                            "job_id": prop.job_id,
+                            "listing_type": prop.listing_type  # Add listing_type for tracking
                         })
                         results["details"].append({
                             "action": "inserted",
