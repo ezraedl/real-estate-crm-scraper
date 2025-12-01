@@ -60,6 +60,7 @@ def get_remaining_locations(job: ScrapingJob) -> List[str]:
     """
     Parse progress logs to determine which locations still need to be processed.
     Returns list of locations that were not completed.
+    Handles both old format (list) and new format (dict with 'locations' key).
     """
     if not job.progress_logs or not job.locations:
         # No logs or no locations, retry everything
@@ -67,18 +68,30 @@ def get_remaining_locations(job: ScrapingJob) -> List[str]:
     
     completed_locations = set()
     
-    # Look for location completion entries in progress logs
-    for log in job.progress_logs:
-        if isinstance(log, dict):
-            # A location is considered complete ONLY if it has the final summary
-            # (not the in-progress entries created after each listing type)
-            # Final summary has properties_found but NO status field or status != "in_progress"
-            if "location" in log and "properties_found" in log:
-                # Check if this is a final summary (not an in-progress update)
-                status = log.get("status")
-                if status != "in_progress":
-                    # This is a final location summary
-                    completed_locations.add(log["location"])
+    # Handle new format (dict with 'locations' key)
+    if isinstance(job.progress_logs, dict) and "locations" in job.progress_logs:
+        # New format: progress_logs is a dict with 'locations' array
+        for location_entry in job.progress_logs.get("locations", []):
+            if isinstance(location_entry, dict):
+                location = location_entry.get("location")
+                status = location_entry.get("status")
+                # A location is considered complete if status is "completed"
+                if location and status == "completed":
+                    completed_locations.add(location)
+    # Handle old format (list of log entries)
+    elif isinstance(job.progress_logs, list):
+        # Old format: progress_logs is a list of log entries
+        for log in job.progress_logs:
+            if isinstance(log, dict):
+                # A location is considered complete ONLY if it has the final summary
+                # (not the in-progress entries created after each listing type)
+                # Final summary has properties_found but NO status field or status != "in_progress"
+                if "location" in log and "properties_found" in log:
+                    # Check if this is a final summary (not an in-progress update)
+                    status = log.get("status")
+                    if status != "in_progress":
+                        # This is a final location summary
+                        completed_locations.add(log["location"])
     
     # Return locations that weren't completed
     remaining = [loc for loc in job.locations if loc not in completed_locations]

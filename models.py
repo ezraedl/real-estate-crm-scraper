@@ -156,7 +156,9 @@ class ScrapingJob(BaseModel):
     failed_locations: List[Dict[str, Any]] = Field(default_factory=list, description="Locations that failed during scraping, saved for retry")
     
     # Detailed progress logs
-    progress_logs: List[Dict[str, Any]] = Field(default_factory=list, description="Detailed logs per location and listing type")
+    # Accept both old format (list) and new format (dict with 'locations' key) for backward compatibility
+    # Using Any to be permissive and avoid validation errors during migration
+    progress_logs: Any = Field(default_factory=list, description="Detailed logs per location and listing type")
     
     # Anti-bot configuration
     proxy_config: Optional[Dict[str, Any]] = None
