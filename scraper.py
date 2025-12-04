@@ -554,7 +554,8 @@ class MLSScraper:
                     # If status is already final, just remove from current_jobs
                     if job.job_id in self.current_jobs:
                         del self.current_jobs[job.job_id]
-                        logger.debug(f"Removed job {job.job_id} from current_jobs (status: {current_job.status.value})")
+                        status_str = current_job.status.value if hasattr(current_job.status, 'value') else str(current_job.status)
+                        logger.debug(f"Removed job {job.job_id} from current_jobs (status: {status_str})")
                 elif cancel_flag.get("cancelled", False):
                     # If status is still RUNNING, check if it was cancelled
                     # Job was cancelled - status should already be CANCELLED, but if not, don't change it here
@@ -598,12 +599,17 @@ class MLSScraper:
                     if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                         if job.job_id in self.current_jobs:
                             del self.current_jobs[job.job_id]
-                            logger.debug(f"Removed job {job.job_id} from current_jobs (status: {current_job.status.value})")
+                            status_str = current_job.status.value if hasattr(current_job.status, 'value') else str(current_job.status)
+                            logger.debug(f"Removed job {job.job_id} from current_jobs (status: {status_str})")
                     else:
                         # Keep in current_jobs - job is still running or status is unclear
+                        if current_job:
+                            status_str = current_job.status.value if hasattr(current_job.status, 'value') else str(current_job.status)
+                        else:
+                            status_str = 'unknown'
                         logger.debug(
                             f"Keeping job {job.job_id} in current_jobs "
-                            f"(status: {current_job.status.value if current_job else 'unknown'})"
+                            f"(status: {status_str})"
                         )
             except Exception as e:
                 logger.warning(f"Error in finally block while updating job status: {e}")
