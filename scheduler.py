@@ -143,6 +143,16 @@ class JobScheduler:
                 # Check if job is actually still running in the scraper
                 if job_id in scraper.current_jobs:
                     # Job is active, but check if it's been running for more than 24 hours (truly stuck)
+                    # First verify the job status is still RUNNING (might have completed but not removed from current_jobs yet)
+                    current_job_status = await db.get_job(job_id)
+                    if current_job_status and current_job_status.status not in [JobStatus.RUNNING, JobStatus.PENDING]:
+                        # Job has actually completed/failed, just not removed from current_jobs yet
+                        logger.debug(
+                            f"Job {job_id} is in current_jobs but status is {current_job_status.status.value}, "
+                            f"so it's not stuck - likely just finished."
+                        )
+                        continue  # Skip this job, it's not stuck
+                    
                     check_time = updated_at or created_at
                     if check_time and check_time < stuck_job_threshold_24h:
                         logger.warning(
@@ -153,7 +163,19 @@ class JobScheduler:
                     else:
                         active_running_jobs.append(job_data)
                 else:
-                    # Job is in RUNNING status but not in scraper's current_jobs - it's stuck
+                    # Job is in RUNNING status but not in scraper's current_jobs
+                    # First, check if the job status has actually been updated to COMPLETED/FAILED
+                    # This can happen if the job finished but the status update hasn't propagated yet
+                    current_job_status = await db.get_job(job_id)
+                    if current_job_status and current_job_status.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                        # Job has actually completed/failed, just not removed from current_jobs yet (or already removed)
+                        # Don't mark it as stuck
+                        logger.debug(
+                            f"Job {job_id} is not in active jobs but status is {current_job_status.status.value}, "
+                            f"so it's not stuck - likely just finished."
+                        )
+                        continue  # Skip this job, it's not stuck
+                    
                     # Check if it's been stuck for more than 1 hour
                     check_time = updated_at or created_at
                     if check_time and check_time < stuck_job_threshold_1h:

@@ -365,7 +365,8 @@ class MLSScraper:
                 "total_locations": len(job.locations)
             }
             
-            await db.update_job_status(
+            # Update job status to COMPLETED - verify it succeeds
+            update_success = await db.update_job_status(
                 job.job_id,
                 final_status,
                 properties_scraped=total_properties,
@@ -375,6 +376,20 @@ class MLSScraper:
                 current_location=None,  # Clear current_location when job completes
                 current_location_index=None
             )
+            
+            # Verify the update was actually saved to the database
+            if update_success:
+                # Double-check by reading back from database
+                verify_job = await db.get_job(job.job_id)
+                if verify_job and verify_job.status == JobStatus.COMPLETED:
+                    logger.info(f"Successfully updated and verified job {job.job_id} status to COMPLETED in database")
+                else:
+                    logger.error(
+                        f"Job {job.job_id} status update reported success but verification failed! "
+                        f"Current status in DB: {verify_job.status.value if verify_job else 'NOT FOUND'}"
+                    )
+            else:
+                logger.error(f"Failed to update job {job.job_id} status to COMPLETED in database!")
             
             # Update run history for scheduled jobs (new architecture)
             # Wrap in try-except to prevent job from being marked as failed if this update fails
@@ -498,9 +513,60 @@ class MLSScraper:
                 except asyncio.CancelledError:
                     pass  # Expected
             
-            # Remove from current jobs
-            if job.job_id in self.current_jobs:
-                del self.current_jobs[job.job_id]
+            # Ensure job status is updated before removing from current_jobs
+            # This is a safety net, but we need to be careful not to mark incomplete jobs as completed
+            try:
+                current_job = await db.get_job(job.job_id)
+                
+                if not current_job:
+                    # Job doesn't exist, nothing to do
+                    if job.job_id in self.current_jobs:
+                        del self.current_jobs[job.job_id]
+                elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                    # If status is already final, just remove from current_jobs
+                    if job.job_id in self.current_jobs:
+                        del self.current_jobs[job.job_id]
+                        logger.debug(f"Removed job {job.job_id} from current_jobs (status: {current_job.status.value})")
+                elif cancel_flag.get("cancelled", False):
+                    # If status is still RUNNING, check if it was cancelled
+                    # Job was cancelled - status should already be CANCELLED, but if not, don't change it here
+                    # The cancellation monitor should have handled this
+                    logger.debug(f"Job {job.job_id} was cancelled, keeping in current_jobs until status is updated")
+                else:
+                    # If status is RUNNING, check if all locations are actually done
+                    # Only update to COMPLETED if we're certain all locations finished
+                    progress_logs = current_job.progress_logs or {}
+                    job_completed = progress_logs.get("job_completed")
+                    completed_locations = current_job.completed_locations or 0
+                    total_locations = current_job.total_locations or len(job.locations)
+                    
+                    # Only mark as COMPLETED if we have explicit completion signal
+                    if job_completed and completed_locations >= total_locations and total_locations > 0:
+                        logger.warning(
+                            f"Job {job.job_id} was still in RUNNING status but has completion signal. "
+                            f"Updating status to COMPLETED in finally block."
+                        )
+                        await db.update_job_status(
+                            job.job_id,
+                            JobStatus.COMPLETED,
+                            progress_logs=progress_logs
+                        )
+                        current_job = await db.get_job(job.job_id)
+                    
+                    # Now remove from current_jobs only if status is final
+                    if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                        if job.job_id in self.current_jobs:
+                            del self.current_jobs[job.job_id]
+                            logger.debug(f"Removed job {job.job_id} from current_jobs (status: {current_job.status.value})")
+                    else:
+                        # Keep in current_jobs - job is still running or status is unclear
+                        logger.debug(
+                            f"Keeping job {job.job_id} in current_jobs "
+                            f"(status: {current_job.status.value if current_job else 'unknown'})"
+                        )
+            except Exception as e:
+                logger.warning(f"Error in finally block while updating job status: {e}")
+                # Don't remove from current_jobs if we can't verify/update status
     
     async def scrape_location(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]] = None, cancel_flag: dict = None, progress_logs: dict = None, running_totals: dict = None, location_index: int = 1, total_locations: int = 1, job_start_time: Optional[datetime] = None, location_last_update: dict = None):
         """Scrape properties for a specific location based on job's listing_types. Saves after each type and returns summary."""

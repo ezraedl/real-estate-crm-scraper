@@ -150,8 +150,11 @@ class Database:
     
     async def update_job_status(self, job_id: str, status: JobStatus, **kwargs) -> bool:
         """Update job status and other fields"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
-            update_data = {"status": status.value}
+            update_data = {"status": status.value, "updated_at": datetime.utcnow()}
             update_data.update(kwargs)
             
             if status == JobStatus.RUNNING:
@@ -166,9 +169,25 @@ class Database:
                 {"job_id": job_id},
                 {"$set": update_data}
             )
-            return result.modified_count > 0
+            
+            success = result.modified_count > 0
+            if not success:
+                logger.warning(
+                    f"Job status update returned modified_count=0 for job {job_id}, status={status.value}. "
+                    f"Job may not exist or update was not applied."
+                )
+                # Verify the job exists
+                job_exists = await self.jobs_collection.find_one({"job_id": job_id})
+                if not job_exists:
+                    logger.error(f"Job {job_id} does not exist in database!")
+                else:
+                    logger.warning(f"Job {job_id} exists but update did not modify it. Current status: {job_exists.get('status')}")
+            else:
+                logger.debug(f"Successfully updated job {job_id} status to {status.value}")
+            
+            return success
         except Exception as e:
-            print(f"Error updating job status: {e}")
+            logger.error(f"Error updating job status for {job_id}: {e}", exc_info=True)
             return False
     
     async def update_recurring_job_run_history(self, original_job_id: str, run_job_id: str, status: JobStatus) -> bool:
