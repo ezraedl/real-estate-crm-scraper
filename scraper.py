@@ -414,36 +414,73 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"Error processing job {job.job_id}: {e}")
-            await db.update_job_status(
-                job.job_id,
-                JobStatus.FAILED,
-                error_message=str(e)
-            )
             
-            # Update run history for scheduled jobs (new architecture)
-            if job.scheduled_job_id:
-                scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
-                if scheduled_job and scheduled_job.cron_expression:
-                    import croniter
-                    cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
-                    next_run = cron.get_next(datetime)
-                    
-                    await db.update_scheduled_job_run_history(
-                        job.scheduled_job_id,
-                        job.job_id,
-                        JobStatus.FAILED,
-                        next_run_at=next_run
-                    )
-                    logger.debug(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
-            
-            # Legacy: Update run history for old recurring jobs (failed)
-            elif job.original_job_id:
-                await db.update_recurring_job_run_history(
-                    job.original_job_id,
-                    job.job_id,
-                    JobStatus.FAILED
+            # Check if job was already marked as COMPLETED before overwriting with FAILED
+            # This prevents successful jobs from being marked as failed due to post-completion errors
+            current_job = await db.get_job(job.job_id)
+            if current_job and current_job.status == JobStatus.COMPLETED:
+                logger.warning(
+                    f"Job {job.job_id} encountered an error after completion, "
+                    f"but keeping status as COMPLETED since all locations finished successfully. Error: {e}"
                 )
-                logger.debug(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
+                # Still try to update run history, but don't change job status
+                try:
+                    if job.scheduled_job_id:
+                        scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                        if scheduled_job and scheduled_job.cron_expression:
+                            import croniter
+                            cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+                            next_run = cron.get_next(datetime)
+                            
+                            await db.update_scheduled_job_run_history(
+                                job.scheduled_job_id,
+                                job.job_id,
+                                JobStatus.COMPLETED,
+                                next_run_at=next_run
+                            )
+                    elif job.original_job_id:
+                        await db.update_recurring_job_run_history(
+                            job.original_job_id,
+                            job.job_id,
+                            JobStatus.COMPLETED
+                        )
+                except Exception as run_history_error:
+                    logger.warning(f"Failed to update run history after completion error: {run_history_error}")
+            else:
+                # Job was not completed, so it's a real failure
+                await db.update_job_status(
+                    job.job_id,
+                    JobStatus.FAILED,
+                    error_message=str(e)
+                )
+                
+                # Update run history for scheduled jobs (new architecture)
+                try:
+                    if job.scheduled_job_id:
+                        scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                        if scheduled_job and scheduled_job.cron_expression:
+                            import croniter
+                            cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
+                            next_run = cron.get_next(datetime)
+                            
+                            await db.update_scheduled_job_run_history(
+                                job.scheduled_job_id,
+                                job.job_id,
+                                JobStatus.FAILED,
+                                next_run_at=next_run
+                            )
+                            logger.debug(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
+                    
+                    # Legacy: Update run history for old recurring jobs (failed)
+                    elif job.original_job_id:
+                        await db.update_recurring_job_run_history(
+                            job.original_job_id,
+                            job.job_id,
+                            JobStatus.FAILED
+                        )
+                        logger.debug(f"Updated run history for legacy recurring job (failed): {job.original_job_id}")
+                except Exception as run_history_error:
+                    logger.warning(f"Failed to update run history for failed job: {run_history_error}")
         
         finally:
             # Stop the cancellation and timeout monitors
