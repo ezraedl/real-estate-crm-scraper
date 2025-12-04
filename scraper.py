@@ -653,13 +653,19 @@ class MLSScraper:
             
             # Find or create location entry in progress_logs
             location_idx = None
+            original_location_index = None
             for idx, loc_entry in enumerate(progress_logs.get("locations", [])):
                 if loc_entry.get("location") == location:
                     location_idx = idx
+                    # Preserve the original location_index if this is a retry
+                    original_location_index = loc_entry.get("location_index")
                     break
             
             if location_idx is not None:
-                # Update existing entry
+                # Update existing entry (this is a retry)
+                # Preserve the original location_index to maintain proper ordering
+                if original_location_index is not None:
+                    location_entry["location_index"] = original_location_index
                 progress_logs["locations"][location_idx] = location_entry
             else:
                 # Add new location entry
