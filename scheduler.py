@@ -148,16 +148,27 @@ class JobScheduler:
                     if current_job_status:
                         # Handle both enum and string status values
                         status = current_job_status.status
-                        status_value = status.value if hasattr(status, 'value') else str(status)
-                        status_enum = status if isinstance(status, JobStatus) else JobStatus(status_value)
-                        
-                        if status_enum not in [JobStatus.RUNNING, JobStatus.PENDING]:
-                            # Job has actually completed/failed, just not removed from current_jobs yet
-                            logger.debug(
-                                f"Job {job_id} is in current_jobs but status is {status_value}, "
-                                f"so it's not stuck - likely just finished."
-                            )
-                            continue  # Skip this job, it's not stuck
+                        try:
+                            if isinstance(status, JobStatus):
+                                status_enum = status
+                            else:
+                                # Try to convert string to enum
+                                status_str = str(status).lower()
+                                status_enum = JobStatus(status_str)
+                            
+                            if status_enum not in [JobStatus.RUNNING, JobStatus.PENDING]:
+                                # Job has actually completed/failed, just not removed from current_jobs yet
+                                logger.debug(
+                                    f"Job {job_id} is in current_jobs but status is {status_enum.value}, "
+                                    f"so it's not stuck - likely just finished."
+                                )
+                                continue  # Skip this job, it's not stuck
+                        except (ValueError, AttributeError) as e:
+                            # If status conversion fails, log and continue with original logic
+                            logger.warning(f"Could not convert job {job_id} status '{status}' to JobStatus enum: {e}")
+                            # Default to treating as RUNNING if we can't determine
+                            active_running_jobs.append(job_data)
+                            continue
                     
                     check_time = updated_at or created_at
                     if check_time and check_time < stuck_job_threshold_24h:
@@ -176,17 +187,26 @@ class JobScheduler:
                     if current_job_status:
                         # Handle both enum and string status values
                         status = current_job_status.status
-                        status_value = status.value if hasattr(status, 'value') else str(status)
-                        status_enum = status if isinstance(status, JobStatus) else JobStatus(status_value)
-                        
-                        if status_enum in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
-                            # Job has actually completed/failed, just not removed from current_jobs yet (or already removed)
-                            # Don't mark it as stuck
-                            logger.debug(
-                                f"Job {job_id} is not in active jobs but status is {status_value}, "
-                                f"so it's not stuck - likely just finished."
-                            )
-                            continue  # Skip this job, it's not stuck
+                        try:
+                            if isinstance(status, JobStatus):
+                                status_enum = status
+                            else:
+                                # Try to convert string to enum
+                                status_str = str(status).lower()
+                                status_enum = JobStatus(status_str)
+                            
+                            if status_enum in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                # Job has actually completed/failed, just not removed from current_jobs yet (or already removed)
+                                # Don't mark it as stuck
+                                logger.debug(
+                                    f"Job {job_id} is not in active jobs but status is {status_enum.value}, "
+                                    f"so it's not stuck - likely just finished."
+                                )
+                                continue  # Skip this job, it's not stuck
+                        except (ValueError, AttributeError) as e:
+                            # If status conversion fails, log warning but don't mark as stuck
+                            logger.warning(f"Could not convert job {job_id} status '{status}' to JobStatus enum: {e}. Assuming job is still running.")
+                            # Continue with stuck check logic below
                     
                     # Check if it's been stuck for more than 1 hour
                     check_time = updated_at or created_at
