@@ -141,11 +141,21 @@ class MLSScraper:
             logger.error(f"Error starting background monitors for job {job.job_id}: {e}")
         
         try:
-            # Determine scrape type early (for scheduled jobs)
+            # Determine scrape type early (for scheduled jobs and forced scrapes)
             scrape_type = "full"  # Default for manual jobs
             scrape_type_details = None
             
-            if job.scheduled_job_id:
+            # First, check if force_full_scrape was set when triggering the job manually
+            force_full_scrape = self.job_run_flags.get(job.job_id, {}).get("force_full_scrape")
+            if force_full_scrape is not None:
+                # User explicitly chose full or incremental when triggering
+                if force_full_scrape:
+                    scrape_type = "full"
+                    scrape_type_details = "Forced full scrape (user selected)"
+                else:
+                    scrape_type = "incremental"
+                    scrape_type_details = "Forced incremental scrape (user selected)"
+            elif job.scheduled_job_id:
                 try:
                     scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
                     if scheduled_job:
