@@ -130,8 +130,9 @@ class ZipCodeService:
 
         city, state, zip_code = parsed
         if zip_code:
-            label = f"{city}, {state} {zip_code}"
-            return [{"locations": [label], "label": label, "split": False}]
+            # Use just the zip code for homeharvest (most precise format per documentation)
+            label = f"{city}, {state} {zip_code}"  # Keep full label for display
+            return [{"locations": [zip_code], "label": label, "split": False}]  # Use just zip code, e.g., "46201"
 
         zip_codes = self.get_zip_codes(city, state)
         if not zip_codes:
@@ -143,10 +144,11 @@ class ZipCodeService:
             return [{"locations": [location], "label": location, "split": False}]
 
         if not batch_size or batch_size <= 1:
+            # Use just the zip code for homeharvest (most precise format per documentation)
             return [
                 {
-                    "locations": [f"{city}, {state} {zip_code}"],
-                    "label": f"{city}, {state} {zip_code}",
+                    "locations": [zip_code],  # Just zip code, e.g., "46201"
+                    "label": f"{city}, {state} {zip_code}",  # Keep full label for display
                     "split": True,
                 }
                 for zip_code in zip_codes
@@ -156,7 +158,8 @@ class ZipCodeService:
         total = len(zip_codes)
         for idx in range(0, total, batch_size):
             chunk = zip_codes[idx : idx + batch_size]
-            chunk_locations = [f"{city}, {state} {zip_code}" for zip_code in chunk]
+            # Use just zip codes for homeharvest (most precise format per documentation)
+            chunk_locations = [zip_code for zip_code in chunk]  # Just zip codes, e.g., ["46201", "46202"]
             label = f"{city}, {state} ({len(chunk)} ZIPs)"
             chunks.append({"locations": chunk_locations, "label": label, "split": True})
         return chunks
@@ -172,8 +175,17 @@ class ZipCodeService:
         if not query:
             return []
 
-        normalized_query = _normalize_city(query)
-        state_filter = state.strip().upper() if state else None
+        # Parse the query to extract city and state if provided (e.g., "Indianapolis, IN")
+        parsed = self.parse_location(query)
+        if parsed:
+            city, parsed_state, _ = parsed
+            # Use parsed state if provided, otherwise use the state parameter
+            state_filter = parsed_state if parsed_state else (state.strip().upper() if state else None)
+            normalized_query = _normalize_city(city)
+        else:
+            # If parsing fails, treat the whole query as city name
+            normalized_query = _normalize_city(query)
+            state_filter = state.strip().upper() if state else None
 
         matches: List[Tuple[int, ZipLocation]] = []
         for (city_key, state_key), zip_codes in self._city_state_to_zips.items():

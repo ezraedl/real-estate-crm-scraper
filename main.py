@@ -1162,8 +1162,21 @@ async def trigger_existing_job(request: TriggerJobRequest):
             if request.priority:
                 scheduled_job.priority = request.priority
             
+            # Store force_full_scrape flag in job_run_flags for each job instance
+            # This will be checked in the scraper before the scheduled job's incremental logic
+            force_full_scrape = request.force_full_scrape
+            
             # Use scheduler's create_scheduled_job_instances to properly handle split_by_zip
             job_instances = await scheduler.create_scheduled_job_instances(scheduled_job)
+            
+            # Set the force_full_scrape flag for each job instance BEFORE starting them
+            # Initialize job_run_flags if needed and set the flag
+            if force_full_scrape is not None:
+                for job_instance in job_instances:
+                    if job_instance.job_id not in scraper.job_run_flags:
+                        scraper.job_run_flags[job_instance.job_id] = {}
+                    scraper.job_run_flags[job_instance.job_id]["force_full_scrape"] = force_full_scrape
+                    logger.info(f"Set force_full_scrape={force_full_scrape} for job {job_instance.job_id}")
             
             # Restore original past_days
             scheduled_job.past_days = original_past_days
