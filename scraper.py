@@ -1350,15 +1350,20 @@ class MLSScraper:
                 raise TimeoutError(error_msg)
             
             # Split properties by listing_type from the DataFrame
-            # HomeHarvest should include a 'listing_type' column in the DataFrame
+            # HomeHarvest should include a 'listing_type' column in the DataFrame when multiple types are requested
             properties_by_type: Dict[str, List[Property]] = {lt: [] for lt in listing_types}
             
             if properties_df is not None and not properties_df.empty:
+                # Log DataFrame columns for debugging
+                logger.debug(f"   [DEBUG] DataFrame columns: {list(properties_df.columns)}")
+                
                 # Check if DataFrame has a listing_type column
                 if 'listing_type' in properties_df.columns:
                     # Group by listing_type
+                    logger.debug(f"   [SPLIT] Splitting {len(properties_df)} properties by listing_type column")
                     for listing_type in listing_types:
                         type_df = properties_df[properties_df['listing_type'] == listing_type]
+                        logger.debug(f"   [SPLIT] Found {len(type_df)} properties for listing_type '{listing_type}'")
                         for index, row in type_df.iterrows():
                             try:
                                 property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
@@ -1368,28 +1373,32 @@ class MLSScraper:
                             except Exception as e:
                                 logger.error(f"Error converting property for {listing_type}: {e}")
                                 continue
+                    
+                    # Log summary of split
+                    total_split = sum(len(props) for props in properties_by_type.values())
+                    logger.info(f"   [SPLIT] Split {len(properties_df)} total properties into: {', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])} (total after split: {total_split})")
                 else:
-                    # No listing_type column - assume all properties are of the requested types
-                    # This shouldn't happen, but handle gracefully
-                    logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column, cannot split by type. Distributing evenly.")
-                    # Distribute properties evenly across listing types (fallback)
-                    properties_list = []
+                    # No listing_type column - this might happen if homeharvest doesn't include it
+                    # In this case, we can't reliably split by type, so we should log a warning
+                    # and potentially fall back to making separate calls, or mark all as the first type
+                    logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column! Cannot split {len(properties_df)} properties by type.")
+                    logger.warning(f"   [WARNING] This might indicate homeharvest doesn't return listing_type when requesting multiple types.")
+                    logger.warning(f"   [WARNING] All properties will be assigned to first listing type: {listing_types[0]}")
+                    
+                    # Assign all properties to the first listing type as fallback
+                    # This is not ideal but better than losing data
                     for index, row in properties_df.iterrows():
                         try:
-                            # Use first listing type as default
                             default_type = listing_types[0]
                             property_obj = self.convert_to_property_model(row, job.job_id, default_type, job.scheduled_job_id)
                             if default_type == "sold":
                                 property_obj.is_comp = True
-                            properties_list.append(property_obj)
+                            properties_by_type[default_type].append(property_obj)
                         except Exception as e:
                             logger.error(f"Error converting property: {e}")
                             continue
                     
-                    # Distribute evenly (simple round-robin)
-                    for i, prop in enumerate(properties_list):
-                        listing_type = listing_types[i % len(listing_types)]
-                        properties_by_type[listing_type].append(prop)
+                    logger.warning(f"   [WARNING] Assigned all {len(properties_by_type[listing_types[0]])} properties to '{listing_types[0]}' (other types will be empty)")
             
             return properties_by_type
             
