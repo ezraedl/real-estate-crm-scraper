@@ -1703,6 +1703,7 @@ async def create_scheduled_job(job_data: dict):
             limit=job_data.get('limit', 10000),
             split_by_zip=split_by_zip,  # Keep the flag for reference, but locations are already expanded
             zip_batch_size=zip_batch_size,
+            incremental_runs_before_full=job_data.get('incremental_runs_before_full'),  # New field for incremental scraping
             proxy_config=job_data.get('proxy_config'),
             user_agent=job_data.get('user_agent'),
             request_delay=job_data.get('request_delay', 1.0),
@@ -1794,6 +1795,10 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
             update_data['date_from'] = job_data['date_from']
         if 'date_to' in job_data:
             update_data['date_to'] = job_data['date_to']
+        if 'incremental_runs_before_full' in job_data:
+            update_data['incremental_runs_before_full'] = job_data['incremental_runs_before_full']
+            # Reset counter when config changes
+            update_data['incremental_runs_count'] = 0
         if 'radius' in job_data:
             update_data['radius'] = job_data['radius']
         if 'mls_only' in job_data:

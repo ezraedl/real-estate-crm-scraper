@@ -88,6 +88,21 @@ class ScheduledJob(BaseModel):
     last_run_job_id: Optional[str] = Field(None, description="Job ID of the last execution")
     next_run_at: Optional[datetime] = Field(None, description="Calculated next run time")
     
+    # Incremental scraping configuration
+    incremental_runs_before_full: Optional[int] = Field(
+        None, 
+        ge=1, 
+        description="Number of incremental runs before doing a full scrape. None = always incremental (if last_run_at exists), 0 = always full scrape"
+    )
+    incremental_runs_count: int = Field(
+        default=0, 
+        description="Counter: number of incremental runs since last full scrape"
+    )
+    last_full_scrape_at: Optional[datetime] = Field(
+        None, 
+        description="Timestamp of the last full scrape (used to determine when to do next full scrape)"
+    )
+    
     # Anti-bot configuration (defaults for job instances)
     proxy_config: Optional[Dict[str, Any]] = None
     user_agent: Optional[str] = None
@@ -510,6 +525,13 @@ class ScheduledScrapeRequest(BaseModel):
     # Scheduling
     scheduled_at: Optional[datetime] = None
     cron_expression: Optional[str] = None
+    
+    # Incremental scraping configuration
+    incremental_runs_before_full: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Number of incremental runs before doing a full scrape. None = always incremental (if last_run_at exists), 0 = always full scrape. Example: 5 = do 5 incremental scrapes, then 1 full scrape, then repeat"
+    )
 
 class TriggerJobRequest(BaseModel):
     """Request to trigger an existing job immediately"""
