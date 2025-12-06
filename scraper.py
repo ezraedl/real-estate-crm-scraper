@@ -24,6 +24,8 @@ class MLSScraper:
         self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
         # Use asyncio.Semaphore instead of ThreadPoolExecutor for enrichment to avoid event loop conflicts
         self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
+        # Track if job runs were full scrapes (keyed by job_id)
+        self.job_run_flags: Dict[str, Dict[str, Any]] = {}
     
     async def start(self):
         """Start the scraper service"""
@@ -101,6 +103,14 @@ class MLSScraper:
 
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
+        try:
+            # Update status to RUNNING immediately to prevent jobs from staying in PENDING
+            await db.update_job_status(job.job_id, JobStatus.RUNNING)
+            logger.info(f"Starting job {job.job_id} - status updated to RUNNING")
+        except Exception as e:
+            logger.error(f"Failed to update job {job.job_id} status to RUNNING: {e}")
+            # Continue anyway - we'll try again below
+        
         self.current_jobs[job.job_id] = job
         
         # Cancellation flag shared between main task and monitor
@@ -108,18 +118,24 @@ class MLSScraper:
         
         # Track if this job run was a full scrape (vs incremental)
         # This will be set in _scrape_listing_type and used when updating run history
-        job.was_full_scrape = None  # None = not determined yet, True/False = determined
+        # Store in class-level dictionary since ScrapingJob is a Pydantic model
+        self.job_run_flags[job.job_id] = {"was_full_scrape": None}  # None = not determined yet, True/False = determined
         
         # Track last property update time per location for timeout detection
         location_last_update = {}  # {location: datetime}
         
         # Start background cancellation monitor
-        monitor_task = asyncio.create_task(self.check_cancellation_loop(job.job_id, cancel_flag))
-        
-        # Start background location timeout monitor
-        location_timeout_monitor = asyncio.create_task(
-            self.check_location_timeout_loop(job.job_id, cancel_flag, location_last_update)
-        )
+        monitor_task = None
+        location_timeout_monitor = None
+        try:
+            monitor_task = asyncio.create_task(self.check_cancellation_loop(job.job_id, cancel_flag))
+            
+            # Start background location timeout monitor
+            location_timeout_monitor = asyncio.create_task(
+                self.check_location_timeout_loop(job.job_id, cancel_flag, location_last_update)
+            )
+        except Exception as e:
+            logger.error(f"Error starting background monitors for job {job.job_id}: {e}")
         
         try:
             # Initialize progress logs with new table format
@@ -418,14 +434,15 @@ class MLSScraper:
                         cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
                         next_run = cron.get_next(datetime)
                         
+                        was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
                         await db.update_scheduled_job_run_history(
                             job.scheduled_job_id,
                             job.job_id,
                             JobStatus.COMPLETED,
                             next_run_at=next_run,
-                            was_full_scrape=getattr(job, 'was_full_scrape', None)
+                            was_full_scrape=was_full_scrape
                         )
-                        logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id} (was_full_scrape={getattr(job, 'was_full_scrape', None)})")
+                        logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id} (was_full_scrape={was_full_scrape})")
                 
                 # Legacy: Update run history for old recurring jobs
                 elif job.original_job_id:
@@ -480,12 +497,13 @@ class MLSScraper:
                             cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
                             next_run = cron.get_next(datetime)
                             
+                            was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
                             await db.update_scheduled_job_run_history(
                                 job.scheduled_job_id,
                                 job.job_id,
                                 JobStatus.COMPLETED,
                                 next_run_at=next_run,
-                                was_full_scrape=getattr(job, 'was_full_scrape', None)
+                                was_full_scrape=was_full_scrape
                             )
                     elif job.original_job_id:
                         await db.update_recurring_job_run_history(
@@ -512,12 +530,13 @@ class MLSScraper:
                             cron = croniter.croniter(scheduled_job.cron_expression, datetime.utcnow())
                             next_run = cron.get_next(datetime)
                             
+                            was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
                             await db.update_scheduled_job_run_history(
                                 job.scheduled_job_id,
                                 job.job_id,
                                 JobStatus.FAILED,
                                 next_run_at=next_run,
-                                was_full_scrape=getattr(job, 'was_full_scrape', None)
+                                was_full_scrape=was_full_scrape
                             )
                             logger.debug(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
                     
@@ -535,13 +554,13 @@ class MLSScraper:
         finally:
             # Stop the cancellation and timeout monitors
             cancel_flag["cancelled"] = True  # Signal monitors to stop
-            if 'monitor_task' in locals():
+            if monitor_task is not None:
                 monitor_task.cancel()
                 try:
                     await monitor_task
                 except asyncio.CancelledError:
                     pass  # Expected
-            if 'location_timeout_monitor' in locals():
+            if location_timeout_monitor is not None:
                 location_timeout_monitor.cancel()
                 try:
                     await location_timeout_monitor
@@ -561,6 +580,8 @@ class MLSScraper:
                     # If status is already final, just remove from current_jobs
                     if job.job_id in self.current_jobs:
                         del self.current_jobs[job.job_id]
+                        # Clean up job run flags
+                        self.job_run_flags.pop(job.job_id, None)
                         status_str = current_job.status.value if hasattr(current_job.status, 'value') else str(current_job.status)
                         logger.debug(f"Removed job {job.job_id} from current_jobs (status: {status_str})")
                 elif cancel_flag.get("cancelled", False):
@@ -1190,8 +1211,10 @@ class MLSScraper:
                     logger.warning(f"   [WARNING] Could not fetch scheduled job for incremental update: {e}")
             
             # Set the flag for this job run (only set once, on first listing type)
-            if job.was_full_scrape is None:
-                job.was_full_scrape = should_do_full_scrape
+            if job.job_id not in self.job_run_flags:
+                self.job_run_flags[job.job_id] = {"was_full_scrape": None}
+            if self.job_run_flags[job.job_id]["was_full_scrape"] is None:
+                self.job_run_flags[job.job_id]["was_full_scrape"] = should_do_full_scrape
             
             # Use provided past_days or job past_days (only if not using incremental update)
             if not use_updated_since_last_run:
