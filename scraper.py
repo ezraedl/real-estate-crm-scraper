@@ -1378,27 +1378,69 @@ class MLSScraper:
                     total_split = sum(len(props) for props in properties_by_type.values())
                     logger.info(f"   [SPLIT] Split {len(properties_df)} total properties into: {', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])} (total after split: {total_split})")
                 else:
-                    # No listing_type column - this might happen if homeharvest doesn't include it
-                    # In this case, we can't reliably split by type, so we should log a warning
-                    # and potentially fall back to making separate calls, or mark all as the first type
-                    logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column! Cannot split {len(properties_df)} properties by type.")
-                    logger.warning(f"   [WARNING] This might indicate homeharvest doesn't return listing_type when requesting multiple types.")
-                    logger.warning(f"   [WARNING] All properties will be assigned to first listing type: {listing_types[0]}")
+                    # No listing_type column - infer listing type from status field
+                    logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column! Inferring listing type from 'status' field.")
+                    logger.debug(f"   [SPLIT] Attempting to split {len(properties_df)} properties by inferring listing_type from status field")
                     
-                    # Assign all properties to the first listing type as fallback
-                    # This is not ideal but better than losing data
+                    def infer_listing_type_from_status(status_value: Any, mls_status_value: Any = None) -> Optional[str]:
+                        """Infer listing type from status and mls_status fields"""
+                        if status_value is None:
+                            return None
+                        
+                        status_str = str(status_value).upper() if status_value else ""
+                        mls_status_str = str(mls_status_value).upper() if mls_status_value else ""
+                        
+                        # Check for sold properties first (most specific)
+                        if "SOLD" in status_str or "SOLD" in mls_status_str:
+                            return "sold"
+                        
+                        # Check for pending properties
+                        if "PENDING" in status_str or "PENDING" in mls_status_str or "CONTINGENT" in status_str:
+                            return "pending"
+                        
+                        # Check for rental properties
+                        if "RENT" in status_str or "FOR_RENT" in status_str:
+                            return "for_rent"
+                        
+                        # Check for for_sale properties (default for active listings)
+                        if "FOR_SALE" in status_str or "ACTIVE" in status_str or "LISTED" in status_str:
+                            return "for_sale"
+                        
+                        # Default fallback - return None to use first listing type
+                        return None
+                    
+                    # Split properties by inferred listing type
+                    inferred_count = {lt: 0 for lt in listing_types}
+                    unassigned_count = 0
+                    
                     for index, row in properties_df.iterrows():
                         try:
-                            default_type = listing_types[0]
-                            property_obj = self.convert_to_property_model(row, job.job_id, default_type, job.scheduled_job_id)
-                            if default_type == "sold":
+                            # Access DataFrame row values (pandas Series supports dict-style access)
+                            status_value = row.get('status') if 'status' in row.index else None
+                            mls_status_value = row.get('mls_status') if 'mls_status' in row.index else None
+                            
+                            inferred_type = infer_listing_type_from_status(status_value, mls_status_value)
+                            
+                            # Use inferred type if it's in our requested listing types, otherwise use first type as fallback
+                            if inferred_type and inferred_type in listing_types:
+                                listing_type = inferred_type
+                            else:
+                                listing_type = listing_types[0]  # Fallback to first type
+                                unassigned_count += 1
+                            
+                            property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
+                            if listing_type == "sold":
                                 property_obj.is_comp = True
-                            properties_by_type[default_type].append(property_obj)
+                            properties_by_type[listing_type].append(property_obj)
+                            inferred_count[listing_type] += 1
                         except Exception as e:
                             logger.error(f"Error converting property: {e}")
                             continue
                     
-                    logger.warning(f"   [WARNING] Assigned all {len(properties_by_type[listing_types[0]])} properties to '{listing_types[0]}' (other types will be empty)")
+                    # Log summary of inferred split
+                    total_split = sum(len(props) for props in properties_by_type.values())
+                    split_summary = ', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])
+                    logger.info(f"   [SPLIT] Inferred listing types from status field: {split_summary} (total: {total_split}, unassigned: {unassigned_count})")
             
             return properties_by_type
             
