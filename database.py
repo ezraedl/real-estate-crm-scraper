@@ -318,11 +318,12 @@ class Database:
         scheduled_job_id: str,
         run_job_id: str,
         status: JobStatus,
-        next_run_at: Optional[datetime] = None
+        next_run_at: Optional[datetime] = None,
+        was_full_scrape: Optional[bool] = None
     ) -> bool:
         """Update the run history of a scheduled job after execution"""
         try:
-            # Get current run_count
+            # Get current job data
             current_job = await self.scheduled_jobs_collection.find_one(
                 {"scheduled_job_id": scheduled_job_id}
             )
@@ -330,6 +331,8 @@ class Database:
                 return False
             
             current_run_count = current_job.get("run_count", 0)
+            incremental_config = current_job.get("incremental_runs_before_full")
+            current_incremental_count = current_job.get("incremental_runs_count", 0)
             
             update_data = {
                 "run_count": current_run_count + 1,
@@ -341,6 +344,16 @@ class Database:
             
             if next_run_at:
                 update_data["next_run_at"] = next_run_at
+            
+            # Update incremental scraping counters if was_full_scrape is provided
+            if was_full_scrape is not None and incremental_config is not None:
+                if was_full_scrape:
+                    # Full scrape: reset counter and update last_full_scrape_at
+                    update_data["incremental_runs_count"] = 0
+                    update_data["last_full_scrape_at"] = datetime.utcnow()
+                else:
+                    # Incremental scrape: increment counter
+                    update_data["incremental_runs_count"] = current_incremental_count + 1
             
             result = await self.scheduled_jobs_collection.update_one(
                 {"scheduled_job_id": scheduled_job_id},

@@ -106,6 +106,10 @@ class MLSScraper:
         # Cancellation flag shared between main task and monitor
         cancel_flag = {"cancelled": False}
         
+        # Track if this job run was a full scrape (vs incremental)
+        # This will be set in _scrape_listing_type and used when updating run history
+        job.was_full_scrape = None  # None = not determined yet, True/False = determined
+        
         # Track last property update time per location for timeout detection
         location_last_update = {}  # {location: datetime}
         
@@ -418,9 +422,10 @@ class MLSScraper:
                             job.scheduled_job_id,
                             job.job_id,
                             JobStatus.COMPLETED,
-                            next_run_at=next_run
+                            next_run_at=next_run,
+                            was_full_scrape=getattr(job, 'was_full_scrape', None)
                         )
-                        logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id}")
+                        logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id} (was_full_scrape={getattr(job, 'was_full_scrape', None)})")
                 
                 # Legacy: Update run history for old recurring jobs
                 elif job.original_job_id:
@@ -479,7 +484,8 @@ class MLSScraper:
                                 job.scheduled_job_id,
                                 job.job_id,
                                 JobStatus.COMPLETED,
-                                next_run_at=next_run
+                                next_run_at=next_run,
+                                was_full_scrape=getattr(job, 'was_full_scrape', None)
                             )
                     elif job.original_job_id:
                         await db.update_recurring_job_run_history(
@@ -510,7 +516,8 @@ class MLSScraper:
                                 job.scheduled_job_id,
                                 job.job_id,
                                 JobStatus.FAILED,
-                                next_run_at=next_run
+                                next_run_at=next_run,
+                                was_full_scrape=getattr(job, 'was_full_scrape', None)
                             )
                             logger.debug(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
                     
@@ -1102,26 +1109,110 @@ class MLSScraper:
             logger.debug(f"   [DEBUG] _scrape_listing_type called with listing_type: '{listing_type}' (type: {type(listing_type)})")
             
             # Prepare scraping parameters - remove all filtering for comprehensive data
+            # According to homeharvest docs, location accepts: zip code, city, "city, state", or full address
+            # Extract zip code if present for more precise matching (e.g., "Indianapolis, IN 46201" -> "46201")
+            zip_match = re.search(r'\b(\d{5})\b', location)
+            location_to_use = location  # Default to original location
+            
+            # If location contains a zip code, try using just the zip code for more precise results
+            # This may help avoid issues where "City, State ZIP" format might be interpreted broadly
+            if zip_match:
+                zip_code = zip_match.group(1)
+                # Option 1: Use just zip code (most precise)
+                # Option 2: Keep full format (may be interpreted as broader area)
+                # For now, keep the original format but log both options
+                logger.debug(f"   [LOCATION] Extracted zip code '{zip_code}' from location '{location}'")
+            
             scrape_params = {
-                "location": location,
+                "location": location_to_use,  # Use original format per homeharvest docs
                 "listing_type": listing_type,
                 "mls_only": False,  # Always use all sources for maximum data
                 "limit": limit or job.limit or 10000  # Use high limit for comprehensive scraping
             }
             
             # Add optional parameters if specified
+            # NOTE: According to docs, radius is for searching within radius of an address
+            # If radius is set, it might cause overlap between nearby zip codes
             if job.radius:
                 scrape_params["radius"] = job.radius
+                logger.warning(f"   [WARNING] Radius={job.radius} is set - this may cause overlap between nearby locations!")
             
-            # Use provided past_days or job past_days
-            if past_days:
-                scrape_params["past_days"] = past_days
-            elif job.past_days:
-                scrape_params["past_days"] = job.past_days
+            # Check if we should only get properties updated since last run
+            # This uses homeharvest's updated_in_past_hours or date_from parameter
+            use_updated_since_last_run = False
+            should_do_full_scrape = False
+            
+            if job.scheduled_job_id:
+                try:
+                    scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                    if scheduled_job:
+                        # Determine if we should do full or incremental scrape
+                        incremental_config = scheduled_job.incremental_runs_before_full
+                        incremental_count = scheduled_job.incremental_runs_count or 0
+                        
+                        if incremental_config is None:
+                            # None = always incremental (if last_run_at exists)
+                            should_do_full_scrape = False
+                        elif incremental_config == 0:
+                            # 0 = always full scrape
+                            should_do_full_scrape = True
+                        else:
+                            # > 0 = do incremental until count reaches config, then full scrape
+                            if incremental_count >= incremental_config:
+                                should_do_full_scrape = True
+                            else:
+                                should_do_full_scrape = False
+                        
+                        # If doing full scrape, skip incremental logic
+                        if should_do_full_scrape:
+                            logger.info(f"   [FULL SCRAPE] Doing full scrape (incremental count: {incremental_count}/{incremental_config if incremental_config else 'N/A'})")
+                        elif scheduled_job.last_run_at:
+                            # Do incremental scrape - calculate hours since last run
+                            time_since_last_run = datetime.utcnow() - scheduled_job.last_run_at
+                            hours_since_last_run = time_since_last_run.total_seconds() / 3600
+                            
+                            # Only use updated_in_past_hours if last run was within reasonable time (not more than 30 days)
+                            if 0 < hours_since_last_run <= (30 * 24):
+                                scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)  # Add 1 hour buffer
+                                use_updated_since_last_run = True
+                                logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                            elif hours_since_last_run > (30 * 24):
+                                # Last run was more than 30 days ago, use date_from instead
+                                # homeharvest accepts datetime objects for date_from
+                                scrape_params["date_from"] = scheduled_job.last_run_at
+                                use_updated_since_last_run = True
+                                logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                        else:
+                            # First run - no last_run_at, do full scrape
+                            should_do_full_scrape = True
+                            logger.info(f"   [FULL SCRAPE] First run for scheduled job {job.scheduled_job_id} - fetching all properties (no last_run_at)")
+                except Exception as e:
+                    logger.warning(f"   [WARNING] Could not fetch scheduled job for incremental update: {e}")
+            
+            # Set the flag for this job run (only set once, on first listing type)
+            if job.was_full_scrape is None:
+                job.was_full_scrape = should_do_full_scrape
+            
+            # Use provided past_days or job past_days (only if not using incremental update)
+            if not use_updated_since_last_run:
+                if past_days:
+                    scrape_params["past_days"] = past_days
+                elif job.past_days:
+                    scrape_params["past_days"] = job.past_days
+            
+            # Add sorting by last_update_date for better results (homeharvest 0.8.7+ feature)
+            # This ensures we get the most recently updated properties first
+            if use_updated_since_last_run:
+                scrape_params["sort_by"] = "last_update_date"
+                scrape_params["sort_direction"] = "desc"
             
             # Add proxy configuration if available
             if proxy_config:
                 scrape_params["proxy"] = proxy_config.get("proxy_url")
+            
+            # Log the exact parameters being passed to homeharvest for debugging
+            log_params = {k: v for k, v in scrape_params.items() if k != "proxy"}  # Don't log proxy URL
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property with {log_params}")
             
             # Remove all filtering parameters to get ALL properties
             # Note: We're not setting foreclosure=False, exclude_pending=False, etc.
@@ -1140,6 +1231,38 @@ class MLSScraper:
                     ),
                     timeout=timeout_seconds
                 )
+                
+                # Log the number of properties returned by homeharvest
+                num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
+                logger.info(f"   [HOMEHARVEST] Received {num_properties} properties for location='{location}', listing_type='{listing_type}'")
+                
+                # Extract expected zip code from location string (e.g., "Indianapolis, IN 46201" -> "46201")
+                zip_match = re.search(r'\b(\d{5})\b', location)
+                expected_zip = zip_match.group(1) if zip_match else None
+                
+                # Validate that returned properties match the requested location
+                if expected_zip and num_properties > 0:
+                    # Check zip codes in the returned data
+                    zip_codes_in_results = set()
+                    if 'zip_code' in properties_df.columns:
+                        zip_codes_in_results = set(properties_df['zip_code'].dropna().astype(str).str.zfill(5).unique())
+                    elif 'address' in properties_df.columns:
+                        # Try to extract from address column if it exists
+                        for addr in properties_df['address'].dropna():
+                            if isinstance(addr, str):
+                                zip_match = re.search(r'\b(\d{5})\b', addr)
+                                if zip_match:
+                                    zip_codes_in_results.add(zip_match.group(1).zfill(5))
+                    
+                    if zip_codes_in_results:
+                        matching_zips = [z for z in zip_codes_in_results if z == expected_zip.zfill(5)]
+                        if not matching_zips:
+                            logger.warning(
+                                f"   [WARNING] Location mismatch! Requested zip '{expected_zip}' but got zips: {sorted(zip_codes_in_results)[:10]}"
+                                f" (showing first 10 of {len(zip_codes_in_results)} unique zips)"
+                            )
+                        else:
+                            logger.debug(f"   [VALIDATION] All properties match requested zip code '{expected_zip}'")
             except asyncio.TimeoutError:
                 error_msg = f"Scraping {listing_type} properties in {location} timed out after {timeout_seconds} seconds"
                 logger.warning(f"   [TIMEOUT] {error_msg}")
