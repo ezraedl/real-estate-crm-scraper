@@ -882,7 +882,7 @@ class MLSScraper:
                                 if prop.property_id:
                                     found_property_ids.add(prop.property_id)
                             
-                                # Update running totals
+                            # Update running totals
                             running_totals["total_properties"] += len(properties)
                             running_totals["saved_properties"] += save_results["inserted"] + save_results["updated"]
                             running_totals["total_inserted"] += save_results["inserted"]
@@ -954,8 +954,6 @@ class MLSScraper:
                         properties_skipped=running_totals["total_skipped"],
                         progress_logs=progress_logs
                     )
-                    
-                    continue
             
             logger.info(f"   [TOTAL] Location complete: {location_total_found} found, {location_total_inserted} inserted, {location_total_updated} updated, {location_total_skipped} skipped")
             
