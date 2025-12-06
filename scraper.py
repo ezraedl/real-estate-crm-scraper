@@ -138,6 +138,40 @@ class MLSScraper:
             logger.error(f"Error starting background monitors for job {job.job_id}: {e}")
         
         try:
+            # Determine scrape type early (for scheduled jobs)
+            scrape_type = "full"  # Default for manual jobs
+            scrape_type_details = None
+            
+            if job.scheduled_job_id:
+                try:
+                    scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                    if scheduled_job:
+                        incremental_config = scheduled_job.incremental_runs_before_full
+                        incremental_count = scheduled_job.incremental_runs_count or 0
+                        
+                        if incremental_config is None:
+                            # None = always incremental (if last_run_at exists)
+                            if scheduled_job.last_run_at:
+                                scrape_type = "incremental"
+                                scrape_type_details = f"Always incremental (count: {incremental_count}/∞)"
+                            else:
+                                scrape_type = "full"
+                                scrape_type_details = "First run (no previous run)"
+                        elif incremental_config == 0:
+                            # 0 = always full scrape
+                            scrape_type = "full"
+                            scrape_type_details = "Always full scrape (config: 0)"
+                        else:
+                            # > 0 = do incremental until count reaches config, then full scrape
+                            if incremental_count >= incremental_config:
+                                scrape_type = "full"
+                                scrape_type_details = f"Full scrape (count: {incremental_count}/{incremental_config})"
+                            else:
+                                scrape_type = "incremental"
+                                scrape_type_details = f"Incremental scrape (count: {incremental_count}/{incremental_config})"
+                except Exception as e:
+                    logger.warning(f"Could not determine scrape type for scheduled job {job.scheduled_job_id}: {e}")
+            
             # Initialize progress logs with new table format
             progress_logs = {
                 "locations": [],
@@ -151,7 +185,9 @@ class MLSScraper:
                     "timestamp": datetime.utcnow().isoformat(),
                     "event": "job_started",
                     "message": f"Job started - Processing {len(job.locations)} location(s)",
-                    "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"]
+                    "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"],
+                    "scrape_type": scrape_type,
+                    "scrape_type_details": scrape_type_details
                 }
             }
             
@@ -376,13 +412,19 @@ class MLSScraper:
                 logger.info(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
             
             # Add completion info to summary
+            # Get the scrape type from job_started (or determine it again if not set)
+            scrape_type = progress_logs.get("job_started", {}).get("scrape_type", "full")
+            scrape_type_details = progress_logs.get("job_started", {}).get("scrape_type_details")
+            
             progress_logs["job_completed"] = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "event": "job_completed",
                 "message": completion_message,
                 "successful_locations": successful_locations,
                 "failed_locations": len(failed_locations),
-                "total_locations": len(job.locations)
+                "total_locations": len(job.locations),
+                "scrape_type": scrape_type,
+                "scrape_type_details": scrape_type_details
             }
             
             # CRITICAL: Update job status to COMPLETED FIRST - this is the most important step
