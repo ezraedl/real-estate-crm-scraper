@@ -50,6 +50,8 @@ class Settings:
     RATE_LIMIT_PER_MINUTE = int(get_required_env("RATE_LIMIT_PER_MINUTE", "60"))
     
     # DataImpulse Configuration - Optional
+    # Set USE_DATAIMPULSE=false to disable DataImpulse proxy even if credentials are provided
+    USE_DATAIMPULSE = os.getenv("USE_DATAIMPULSE", "true").lower() in ("true", "1", "yes", "on")
     DATAIMPULSE_LOGIN = get_required_env("DATAIMPULSE_LOGIN", "")
     DATAIMPULSE_PASSWORD = get_required_env("DATAIMPULSE_PASSWORD", "")
     DATAIMPULSE_ENDPOINT = get_required_env("DATAIMPULSE_ENDPOINT", "")

@@ -797,39 +797,36 @@ class MLSScraper:
                 1 for loc in progress_logs["locations"] if loc.get("status") == "in_progress"
             )
             
-            for listing_type in listing_types_to_scrape:
-                # Check if job was cancelled (checked every 2 seconds by background monitor)
-                if cancel_flag.get("cancelled", False):
-                    logger.info(f"   [CANCELLED] Job was cancelled, stopping listing type fetch")
-                    break  # Exit the listing type loop
-                
+            # Make a single API call with all listing types instead of 4 separate calls
+            # This is more efficient and reduces proxy usage
+            if cancel_flag.get("cancelled", False):
+                logger.info(f"   [CANCELLED] Job was cancelled, stopping fetch")
+            else:
                 try:
-                    # Rotate proxy for each listing type to avoid rate limiting
-                    # If job has a specific proxy_config, use it; otherwise rotate to a new proxy
+                    # Use the proxy that was fetched at the start of this location
+                    # Proxy is rotated once per location (not per listing type) to balance rate limiting and quota
                     if job.proxy_config:
-                        # Job has specific proxy config, use it for all listing types
+                        # Job has specific proxy config, use it
                         current_proxy_config = proxy_config
                     else:
-                        # Rotate to a new proxy for this listing type
-                        current_proxy_config = await self.get_proxy_config(job)
-                        if current_proxy_config:
-                            proxy_config = current_proxy_config  # Update for next iteration
-                            logger.debug(f"   [PROXY] Rotated to new proxy for {listing_type} in {location}")
-                        else:
-                            # No proxy available, use existing one or None
-                            current_proxy_config = proxy_config
+                        # Reuse the proxy that was fetched at the start of this location
+                        current_proxy_config = proxy_config
+                        if not current_proxy_config:
+                            # No proxy available, try to get one
+                            current_proxy_config = await self.get_proxy_config(job)
+                            if current_proxy_config:
+                                proxy_config = current_proxy_config  # Update for next location
                     
                     start_time = datetime.utcnow()
-                    logger.info(f"   [FETCH] Fetching {listing_type} properties from {location}...")
+                    logger.info(f"   [FETCH] Fetching all listing types ({', '.join(listing_types_to_scrape)}) from {location} in a single request...")
                     
                     # Update location_last_update when scraping starts (for timeout detection)
                     if location_last_update is not None:
                         location_last_update[location] = datetime.utcnow()
                     
-                    # Update location entry to show we're fetching this listing type
+                    # Update location entry to show we're fetching
                     if location_idx is not None and location_idx < len(progress_logs["locations"]):
                         progress_logs["locations"][location_idx]["timestamp"] = start_time.isoformat()
-                        # Update will happen after properties are found
                     
                     # Push to database immediately for real-time UI update
                     await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
@@ -837,75 +834,78 @@ class MLSScraper:
                     # Use job's limit (or None to get all properties)
                     # Wrap in timeout to prevent getting stuck
                     from config import settings
-                    scrape_timeout = min(settings.LOCATION_TIMEOUT_MINUTES * 60, 600)  # Max 10 minutes per listing type
+                    scrape_timeout = min(settings.LOCATION_TIMEOUT_MINUTES * 60, 600)  # Max 10 minutes per location
                     try:
-                        properties = await asyncio.wait_for(
-                            self._scrape_listing_type(
+                        # Make a single call with all listing types
+                        all_properties_by_type = await asyncio.wait_for(
+                            self._scrape_all_listing_types(
                                 location, 
                                 job, 
                                 current_proxy_config, 
-                                listing_type, 
+                                listing_types_to_scrape, 
                                 limit=job.limit if job.limit else None,
                                 past_days=job.past_days if job.past_days else 90
                             ),
                             timeout=scrape_timeout
                         )
                     except asyncio.TimeoutError:
-                        logger.warning(f"   [TIMEOUT] Scraping {listing_type} in {location} exceeded {scrape_timeout}s timeout, skipping this listing type")
-                        properties = []  # Continue with next listing type
+                        logger.warning(f"   [TIMEOUT] Scraping all listing types in {location} exceeded {scrape_timeout}s timeout")
+                        all_properties_by_type = {lt: [] for lt in listing_types_to_scrape}  # Empty results for all types
                     
                     end_time = datetime.utcnow()
                     duration = (end_time - start_time).total_seconds()
                     
-                    logger.info(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s")
-                    logger.debug(f"   [DEBUG] Properties type: {type(properties)}, truthy: {bool(properties)}, len: {len(properties)}")
+                    # Process each listing type's results
+                    for listing_type in listing_types_to_scrape:
+                        properties = all_properties_by_type.get(listing_type, [])
+                        logger.info(f"   [OK] Found {len(properties)} {listing_type} properties in {duration:.1f}s (from single request)")
+                        
+                        # Initialize save_results for use later
+                        save_results = {"inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
+                        
+                        # Save properties immediately after each listing type fetch
+                        if properties:
+                            logger.debug(f"   [DEBUG] Entering save block for {listing_type}...")
+                            save_results = await db.save_properties_batch(properties)
+                            location_total_found += len(properties)
+                            location_total_inserted += save_results["inserted"]
+                            location_total_updated += save_results["updated"]
+                            location_total_skipped += save_results["skipped"]
+                            location_total_errors += save_results["errors"]
+                            
+                            # Collect properties for enrichment (queued after location completes)
+                            if "enrichment_queue" in save_results:
+                                enrichment_queue.extend(save_results["enrichment_queue"])
+                            
+                            # Track property IDs found in this scrape
+                            for prop in properties:
+                                if prop.property_id:
+                                    found_property_ids.add(prop.property_id)
+                            
+                                # Update running totals
+                            running_totals["total_properties"] += len(properties)
+                            running_totals["saved_properties"] += save_results["inserted"] + save_results["updated"]
+                            running_totals["total_inserted"] += save_results["inserted"]
+                            running_totals["total_updated"] += save_results["updated"]
+                            running_totals["total_skipped"] += save_results["skipped"]
+                            
+                            # Update last property update time for this location (for timeout detection)
+                            if location_last_update is not None:
+                                location_last_update[location] = datetime.utcnow()
+                            
+                            logger.debug(f"   [SAVED] {listing_type}: {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
+                        
+                        # Update location entry's listing_types with completion stats
+                        if location_idx is not None and location_idx < len(progress_logs["locations"]):
+                            location_entry = progress_logs["locations"][location_idx]
+                            if listing_type in location_entry.get("listing_types", {}):
+                                location_entry["listing_types"][listing_type]["found"] = len(properties)
+                                location_entry["listing_types"][listing_type]["inserted"] = save_results.get("inserted", 0) if properties else 0
+                                location_entry["listing_types"][listing_type]["updated"] = save_results.get("updated", 0) if properties else 0
+                                location_entry["listing_types"][listing_type]["skipped"] = save_results.get("skipped", 0) if properties else 0
+                            location_entry["timestamp"] = end_time.isoformat()
                     
-                    # Initialize save_results for use later
-                    save_results = {"inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
-                    
-                    # Save properties immediately after each listing type fetch
-                    if properties:
-                        logger.debug(f"   [DEBUG] Entering save block...")
-                        save_results = await db.save_properties_batch(properties)
-                        location_total_found += len(properties)
-                        location_total_inserted += save_results["inserted"]
-                        location_total_updated += save_results["updated"]
-                        location_total_skipped += save_results["skipped"]
-                        location_total_errors += save_results["errors"]
-                        
-                        # Collect properties for enrichment (queued after location completes)
-                        if "enrichment_queue" in save_results:
-                            enrichment_queue.extend(save_results["enrichment_queue"])
-                        
-                        # Track property IDs found in this scrape
-                        for prop in properties:
-                            if prop.property_id:
-                                found_property_ids.add(prop.property_id)
-                        
-                        # Update running totals
-                        running_totals["total_properties"] += len(properties)
-                        running_totals["saved_properties"] += save_results["inserted"] + save_results["updated"]
-                        running_totals["total_inserted"] += save_results["inserted"]
-                        running_totals["total_updated"] += save_results["updated"]
-                        running_totals["total_skipped"] += save_results["skipped"]
-                        
-                        # Update last property update time for this location (for timeout detection)
-                        if location_last_update is not None:
-                            location_last_update[location] = datetime.utcnow()
-                        
-                        logger.debug(f"   [SAVED] {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
-                    
-                    # Update location entry's listing_types with completion stats
-                    if location_idx is not None and location_idx < len(progress_logs["locations"]):
-                        location_entry = progress_logs["locations"][location_idx]
-                        if listing_type in location_entry.get("listing_types", {}):
-                            location_entry["listing_types"][listing_type]["found"] = len(properties)
-                            location_entry["listing_types"][listing_type]["inserted"] = save_results.get("inserted", 0) if properties else 0
-                            location_entry["listing_types"][listing_type]["updated"] = save_results.get("updated", 0) if properties else 0
-                            location_entry["listing_types"][listing_type]["skipped"] = save_results.get("skipped", 0) if properties else 0
-                        location_entry["timestamp"] = end_time.isoformat()
-                    
-                    # Push to database immediately with updated job totals
+                    # Push to database immediately with updated job totals after processing all listing types
                     logger.debug(f"   [DB-UPDATE] Updating job counts: scraped={running_totals['total_properties']}, saved={running_totals['saved_properties']}, inserted={running_totals['total_inserted']}, updated={running_totals['total_updated']}")
                     await db.update_job_status(
                         job.job_id, 
@@ -923,22 +923,25 @@ class MLSScraper:
                     await asyncio.sleep(0.5)
                     
                 except Exception as e:
-                    logger.warning(f"   [WARNING] Error scraping {listing_type} properties: {e}")
-                    # Log the error
-                    error_log = {
-                        "listing_type": listing_type,
-                        "status": "error",
-                        "properties_found": 0,
-                        "error": str(e),
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                    listing_type_logs.append(error_log)
-                    
-                    # Update location entry with error
-                    if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
-                        location_entry = progress_logs["locations"][location_idx]
-                        location_entry["timestamp"] = datetime.utcnow().isoformat()
-                        # Error is logged but location continues with other listing types
+                    logger.warning(f"   [WARNING] Error scraping all listing types in {location}: {e}")
+                    # Log the error for all listing types
+                    for listing_type in listing_types_to_scrape:
+                        error_log = {
+                            "listing_type": listing_type,
+                            "status": "error",
+                            "properties_found": 0,
+                            "error": str(e),
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                        listing_type_logs.append(error_log)
+                        
+                        # Update location entry with error for this listing type
+                        if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                            location_entry = progress_logs["locations"][location_idx]
+                            if listing_type in location_entry.get("listing_types", {}):
+                                location_entry["listing_types"][listing_type]["found"] = 0
+                                location_entry["listing_types"][listing_type]["error"] = str(e)
+                            location_entry["timestamp"] = datetime.utcnow().isoformat()
                     
                     # Push to database immediately with current totals
                     await db.update_job_status(
@@ -1169,6 +1172,223 @@ class MLSScraper:
                         except Exception as e:
                             logger.error(f"Error updating job status with enrichment progress: {e}")
     
+    async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None) -> Dict[str, List[Property]]:
+        """Scrape properties for all listing types in a single request. Returns a dict mapping listing_type to properties."""
+        try:
+            logger.debug(f"   [DEBUG] _scrape_all_listing_types called with listing_types: {listing_types}")
+            
+            # Prepare scraping parameters - same logic as _scrape_listing_type but for all types
+            zip_match = re.search(r'\b(\d{5})\b', location)
+            if zip_match:
+                location_to_use = zip_match.group(1)
+                logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
+            else:
+                location_to_use = location
+                logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
+            
+            scrape_params = {
+                "location": location_to_use,
+                "listing_type": listing_types,  # Pass list of listing types for single request
+                "mls_only": False,
+                "limit": limit or job.limit or 10000
+            }
+            
+            # Add optional parameters if specified
+            if job.radius:
+                scrape_params["radius"] = job.radius
+                logger.warning(f"   [WARNING] Radius={job.radius} is set - this may cause overlap between nearby locations!")
+            
+            # Check if we should only get properties updated since last run (incremental logic)
+            use_updated_since_last_run = False
+            should_do_full_scrape = False
+            
+            # First, check if force_full_scrape was set when triggering the job manually
+            force_full_scrape = self.job_run_flags.get(job.job_id, {}).get("force_full_scrape")
+            if force_full_scrape is not None:
+                should_do_full_scrape = force_full_scrape
+                if force_full_scrape:
+                    logger.info(f"   [FULL SCRAPE] Forced full scrape (user selected when triggering job)")
+                else:
+                    logger.info(f"   [INCREMENTAL] Forced incremental scrape (user selected when triggering job)")
+                    if job.scheduled_job_id:
+                        try:
+                            scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                            if scheduled_job and scheduled_job.last_run_at:
+                                time_since_last_run = datetime.utcnow() - scheduled_job.last_run_at
+                                hours_since_last_run = time_since_last_run.total_seconds() / 3600
+                                
+                                if 0 < hours_since_last_run <= (30 * 24):
+                                    scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)
+                                    use_updated_since_last_run = True
+                                    logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at})")
+                                elif hours_since_last_run > (30 * 24):
+                                    scrape_params["date_from"] = scheduled_job.last_run_at
+                                    use_updated_since_last_run = True
+                                    logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago)")
+                                else:
+                                    logger.warning(f"   [INCREMENTAL] No valid last_run_at found, falling back to past_days")
+                            else:
+                                logger.warning(f"   [INCREMENTAL] No scheduled job or last_run_at found, falling back to past_days")
+                        except Exception as e:
+                            logger.warning(f"   [INCREMENTAL] Could not fetch scheduled job for incremental update: {e}, falling back to past_days")
+                    else:
+                        logger.warning(f"   [INCREMENTAL] No scheduled_job_id found, cannot determine last_run_at, falling back to past_days")
+            elif job.scheduled_job_id:
+                try:
+                    scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                    if scheduled_job:
+                        incremental_config = scheduled_job.incremental_runs_before_full
+                        incremental_count = scheduled_job.incremental_runs_count or 0
+                        
+                        if incremental_config is None:
+                            should_do_full_scrape = False
+                        elif incremental_config == 0:
+                            should_do_full_scrape = True
+                        else:
+                            if incremental_count >= incremental_config:
+                                should_do_full_scrape = True
+                            else:
+                                should_do_full_scrape = False
+                        
+                        if should_do_full_scrape:
+                            logger.info(f"   [FULL SCRAPE] Doing full scrape (incremental count: {incremental_count}/{incremental_config if incremental_config else 'N/A'})")
+                        elif scheduled_job.last_run_at:
+                            time_since_last_run = datetime.utcnow() - scheduled_job.last_run_at
+                            hours_since_last_run = time_since_last_run.total_seconds() / 3600
+                            
+                            if 0 < hours_since_last_run <= (30 * 24):
+                                scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)
+                                use_updated_since_last_run = True
+                                logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                            elif hours_since_last_run > (30 * 24):
+                                scrape_params["date_from"] = scheduled_job.last_run_at
+                                use_updated_since_last_run = True
+                                logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                        else:
+                            should_do_full_scrape = True
+                            logger.info(f"   [FULL SCRAPE] First run for scheduled job {job.scheduled_job_id} - fetching all properties (no last_run_at)")
+                except Exception as e:
+                    logger.warning(f"   [WARNING] Could not fetch scheduled job for incremental update: {e}")
+            
+            # Set the flag for this job run (only set once)
+            if job.job_id not in self.job_run_flags:
+                self.job_run_flags[job.job_id] = {"was_full_scrape": None}
+            if self.job_run_flags[job.job_id]["was_full_scrape"] is None:
+                self.job_run_flags[job.job_id]["was_full_scrape"] = should_do_full_scrape
+            
+            # Use provided past_days or job past_days (only if not using incremental update)
+            if not use_updated_since_last_run:
+                if past_days:
+                    scrape_params["past_days"] = past_days
+                elif job.past_days:
+                    scrape_params["past_days"] = job.past_days
+            
+            # Add sorting by last_update_date for better results
+            if use_updated_since_last_run:
+                scrape_params["sort_by"] = "last_update_date"
+                scrape_params["sort_direction"] = "desc"
+            
+            # Add proxy configuration if available
+            if proxy_config:
+                scrape_params["proxy"] = proxy_config.get("proxy_url")
+            
+            # Log the exact parameters being passed to homeharvest for debugging
+            log_params = {k: v for k, v in scrape_params.items() if k != "proxy"}
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property with {log_params}")
+            
+            # Scrape properties - Run blocking call in thread pool
+            timeout_seconds = 600  # 10 minutes timeout for all listing types combined
+            loop = asyncio.get_event_loop()
+            
+            try:
+                properties_df = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self.executor,
+                        lambda: scrape_property(**scrape_params)
+                    ),
+                    timeout=timeout_seconds
+                )
+                
+                num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
+                logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
+                
+                # Validate location if zip code was used
+                zip_match = re.search(r'\b(\d{5})\b', location)
+                expected_zip = zip_match.group(1) if zip_match else None
+                
+                if expected_zip and num_properties > 0:
+                    zip_codes_in_results = set()
+                    if 'zip_code' in properties_df.columns:
+                        zip_codes_in_results = set(properties_df['zip_code'].dropna().astype(str).str.zfill(5).unique())
+                    elif 'address' in properties_df.columns:
+                        for addr in properties_df['address'].dropna():
+                            if isinstance(addr, str):
+                                zip_match = re.search(r'\b(\d{5})\b', addr)
+                                if zip_match:
+                                    zip_codes_in_results.add(zip_match.group(1).zfill(5))
+                    
+                    if zip_codes_in_results:
+                        matching_zips = [z for z in zip_codes_in_results if z == expected_zip.zfill(5)]
+                        if not matching_zips:
+                            logger.warning(
+                                f"   [WARNING] Location mismatch! Requested zip '{expected_zip}' but got zips: {sorted(zip_codes_in_results)[:10]}"
+                                f" (showing first 10 of {len(zip_codes_in_results)} unique zips)"
+                            )
+                        else:
+                            logger.debug(f"   [VALIDATION] All properties match requested zip code '{expected_zip}'")
+            except asyncio.TimeoutError:
+                error_msg = f"Scraping all listing types in {location} timed out after {timeout_seconds} seconds"
+                logger.warning(f"   [TIMEOUT] {error_msg}")
+                raise TimeoutError(error_msg)
+            
+            # Split properties by listing_type from the DataFrame
+            # HomeHarvest should include a 'listing_type' column in the DataFrame
+            properties_by_type: Dict[str, List[Property]] = {lt: [] for lt in listing_types}
+            
+            if properties_df is not None and not properties_df.empty:
+                # Check if DataFrame has a listing_type column
+                if 'listing_type' in properties_df.columns:
+                    # Group by listing_type
+                    for listing_type in listing_types:
+                        type_df = properties_df[properties_df['listing_type'] == listing_type]
+                        for index, row in type_df.iterrows():
+                            try:
+                                property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
+                                if listing_type == "sold":
+                                    property_obj.is_comp = True
+                                properties_by_type[listing_type].append(property_obj)
+                            except Exception as e:
+                                logger.error(f"Error converting property for {listing_type}: {e}")
+                                continue
+                else:
+                    # No listing_type column - assume all properties are of the requested types
+                    # This shouldn't happen, but handle gracefully
+                    logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column, cannot split by type. Distributing evenly.")
+                    # Distribute properties evenly across listing types (fallback)
+                    properties_list = []
+                    for index, row in properties_df.iterrows():
+                        try:
+                            # Use first listing type as default
+                            default_type = listing_types[0]
+                            property_obj = self.convert_to_property_model(row, job.job_id, default_type, job.scheduled_job_id)
+                            if default_type == "sold":
+                                property_obj.is_comp = True
+                            properties_list.append(property_obj)
+                        except Exception as e:
+                            logger.error(f"Error converting property: {e}")
+                            continue
+                    
+                    # Distribute evenly (simple round-robin)
+                    for i, prop in enumerate(properties_list):
+                        listing_type = listing_types[i % len(listing_types)]
+                        properties_by_type[listing_type].append(prop)
+            
+            return properties_by_type
+            
+        except Exception as e:
+            logger.error(f"Error scraping all listing types in {location}: {e}")
+            return {lt: [] for lt in listing_types}
+    
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
         try:
@@ -1215,7 +1435,34 @@ class MLSScraper:
                 if force_full_scrape:
                     logger.info(f"   [FULL SCRAPE] Forced full scrape (user selected when triggering job)")
                 else:
+                    # Forced incremental - need to get last_run_at from scheduled job to calculate time window
                     logger.info(f"   [INCREMENTAL] Forced incremental scrape (user selected when triggering job)")
+                    if job.scheduled_job_id:
+                        try:
+                            scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
+                            if scheduled_job and scheduled_job.last_run_at:
+                                # Calculate hours since last run
+                                time_since_last_run = datetime.utcnow() - scheduled_job.last_run_at
+                                hours_since_last_run = time_since_last_run.total_seconds() / 3600
+                                
+                                # Only use updated_in_past_hours if last run was within reasonable time (not more than 30 days)
+                                if 0 < hours_since_last_run <= (30 * 24):
+                                    scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)  # Add 1 hour buffer
+                                    use_updated_since_last_run = True
+                                    logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at})")
+                                elif hours_since_last_run > (30 * 24):
+                                    # Last run was more than 30 days ago, use date_from instead
+                                    scrape_params["date_from"] = scheduled_job.last_run_at
+                                    use_updated_since_last_run = True
+                                    logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago)")
+                                else:
+                                    logger.warning(f"   [INCREMENTAL] No valid last_run_at found, falling back to past_days")
+                            else:
+                                logger.warning(f"   [INCREMENTAL] No scheduled job or last_run_at found, falling back to past_days")
+                        except Exception as e:
+                            logger.warning(f"   [INCREMENTAL] Could not fetch scheduled job for incremental update: {e}, falling back to past_days")
+                    else:
+                        logger.warning(f"   [INCREMENTAL] No scheduled_job_id found, cannot determine last_run_at, falling back to past_days")
             elif job.scheduled_job_id:
                 try:
                     scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
