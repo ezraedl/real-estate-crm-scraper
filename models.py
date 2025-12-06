@@ -537,6 +537,7 @@ class TriggerJobRequest(BaseModel):
     """Request to trigger an existing job immediately"""
     job_id: str = Field(..., description="ID of the existing job to trigger")
     priority: Optional[JobPriority] = Field(default=JobPriority.IMMEDIATE, description="Priority for the immediate run")
+    force_full_scrape: Optional[bool] = Field(default=None, description="Force full scrape (True) or incremental (False). None = use scheduled job's incremental_runs_before_full logic")
 
 class JobResponse(BaseModel):
     job_id: str

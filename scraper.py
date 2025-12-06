@@ -119,7 +119,10 @@ class MLSScraper:
         # Track if this job run was a full scrape (vs incremental)
         # This will be set in _scrape_listing_type and used when updating run history
         # Store in class-level dictionary since ScrapingJob is a Pydantic model
-        self.job_run_flags[job.job_id] = {"was_full_scrape": None}  # None = not determined yet, True/False = determined
+        # Preserve any existing flags (like force_full_scrape) that were set before process_job started
+        if job.job_id not in self.job_run_flags:
+            self.job_run_flags[job.job_id] = {}
+        self.job_run_flags[job.job_id]["was_full_scrape"] = None  # None = not determined yet, True/False = determined
         
         # Track last property update time per location for timeout detection
         location_last_update = {}  # {location: datetime}
@@ -1173,21 +1176,20 @@ class MLSScraper:
             
             # Prepare scraping parameters - remove all filtering for comprehensive data
             # According to homeharvest docs, location accepts: zip code, city, "city, state", or full address
-            # Extract zip code if present for more precise matching (e.g., "Indianapolis, IN 46201" -> "46201")
+            # For best precision, use just the zip code when available (e.g., "46201" instead of "Indianapolis, IN 46201")
+            # Extract zip code if present for more precise matching
             zip_match = re.search(r'\b(\d{5})\b', location)
-            location_to_use = location  # Default to original location
-            
-            # If location contains a zip code, try using just the zip code for more precise results
-            # This may help avoid issues where "City, State ZIP" format might be interpreted broadly
             if zip_match:
-                zip_code = zip_match.group(1)
-                # Option 1: Use just zip code (most precise)
-                # Option 2: Keep full format (may be interpreted as broader area)
-                # For now, keep the original format but log both options
-                logger.debug(f"   [LOCATION] Extracted zip code '{zip_code}' from location '{location}'")
+                # Use just the zip code for maximum precision (per homeharvest documentation)
+                location_to_use = zip_match.group(1)
+                logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
+            else:
+                # No zip code found, use the original location format (city, state, or full address)
+                location_to_use = location
+                logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
             
             scrape_params = {
-                "location": location_to_use,  # Use original format per homeharvest docs
+                "location": location_to_use,  # Use zip code if available, otherwise original format
                 "listing_type": listing_type,
                 "mls_only": False,  # Always use all sources for maximum data
                 "limit": limit or job.limit or 10000  # Use high limit for comprehensive scraping
@@ -1205,11 +1207,20 @@ class MLSScraper:
             use_updated_since_last_run = False
             should_do_full_scrape = False
             
-            if job.scheduled_job_id:
+            # First, check if force_full_scrape was set when triggering the job manually
+            force_full_scrape = self.job_run_flags.get(job.job_id, {}).get("force_full_scrape")
+            if force_full_scrape is not None:
+                # User explicitly chose full or incremental when triggering
+                should_do_full_scrape = force_full_scrape
+                if force_full_scrape:
+                    logger.info(f"   [FULL SCRAPE] Forced full scrape (user selected when triggering job)")
+                else:
+                    logger.info(f"   [INCREMENTAL] Forced incremental scrape (user selected when triggering job)")
+            elif job.scheduled_job_id:
                 try:
                     scheduled_job = await db.get_scheduled_job(job.scheduled_job_id)
                     if scheduled_job:
-                        # Determine if we should do full or incremental scrape
+                        # Determine if we should do full or incremental scrape based on scheduled job config
                         incremental_config = scheduled_job.incremental_runs_before_full
                         incremental_count = scheduled_job.incremental_runs_count or 0
                         
