@@ -12,9 +12,12 @@ REQUEST_DELAY=1.0
 MAX_RETRIES=3
 RATE_LIMIT_PER_MINUTE=60
 
-# DataImpulse Proxy Configuration
-DATAIMPULSE_API_KEY=your_dataimpulse_api_key_here
-DATAIMPULSE_ENDPOINT=https://api.dataimpulse.com/v1/proxies
+# DataImpulse Proxy Configuration (Optional)
+# Set USE_DATAIMPULSE=false to disable DataImpulse proxy even if credentials are provided
+USE_DATAIMPULSE=true
+DATAIMPULSE_LOGIN=your_dataimpulse_login_here
+DATAIMPULSE_PASSWORD=your_dataimpulse_password_here
+DATAIMPULSE_ENDPOINT=gw.dataimpulse.com:823
 
 # Logging
 LOG_LEVEL=INFO

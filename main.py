@@ -406,7 +406,9 @@ async def startup_event():
         
         # Initialize proxy manager with DataImpulse API key (optional)
         try:
-            if hasattr(settings, 'DATAIMPULSE_LOGIN') and settings.DATAIMPULSE_LOGIN:
+            if hasattr(settings, 'USE_DATAIMPULSE') and not settings.USE_DATAIMPULSE:
+                logger.info("DataImpulse proxy is disabled via USE_DATAIMPULSE configuration - running without proxy support")
+            elif hasattr(settings, 'DATAIMPULSE_LOGIN') and settings.DATAIMPULSE_LOGIN:
                 await proxy_manager.initialize_dataimpulse_proxies(settings.DATAIMPULSE_LOGIN)
                 logger.info("DataImpulse proxies initialized")
             else:
