@@ -731,6 +731,21 @@ class MLSScraper:
                     break  # Exit the listing type loop
                 
                 try:
+                    # Rotate proxy for each listing type to avoid rate limiting
+                    # If job has a specific proxy_config, use it; otherwise rotate to a new proxy
+                    if job.proxy_config:
+                        # Job has specific proxy config, use it for all listing types
+                        current_proxy_config = proxy_config
+                    else:
+                        # Rotate to a new proxy for this listing type
+                        current_proxy_config = await self.get_proxy_config(job)
+                        if current_proxy_config:
+                            proxy_config = current_proxy_config  # Update for next iteration
+                            logger.debug(f"   [PROXY] Rotated to new proxy for {listing_type} in {location}")
+                        else:
+                            # No proxy available, use existing one or None
+                            current_proxy_config = proxy_config
+                    
                     start_time = datetime.utcnow()
                     logger.info(f"   [FETCH] Fetching {listing_type} properties from {location}...")
                     
@@ -755,7 +770,7 @@ class MLSScraper:
                             self._scrape_listing_type(
                                 location, 
                                 job, 
-                                proxy_config, 
+                                current_proxy_config, 
                                 listing_type, 
                                 limit=job.limit if job.limit else None,
                                 past_days=job.past_days if job.past_days else 90
