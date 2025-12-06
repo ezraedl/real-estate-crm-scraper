@@ -1521,6 +1521,9 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
                 "exclude_pending": scheduled_job.exclude_pending,
                 "limit": scheduled_job.limit,
                 "priority": scheduled_job.priority,
+                "split_by_zip": scheduled_job.split_by_zip,
+                "zip_batch_size": scheduled_job.zip_batch_size,
+                "incremental_runs_before_full": scheduled_job.incremental_runs_before_full,
                 "run_count": scheduled_job.run_count,
                 "last_run_at": scheduled_job.last_run_at,
                 "last_run_status": scheduled_job.last_run_status,
@@ -1638,6 +1641,7 @@ async def list_scheduled_jobs(
                 "listing_type": job_data.get("listing_type"),  # Backward compatibility
                 "split_by_zip": job_data.get("split_by_zip", False),
                 "zip_batch_size": job_data.get("zip_batch_size"),
+                "incremental_runs_before_full": job_data.get("incremental_runs_before_full"),
                 "run_count": stats["run_count"],  # Use aggregated count
                 "has_running_job": stats["has_running_job"],  # Use aggregated flag
                 "last_run_at": job_data.get("last_run_at"),
