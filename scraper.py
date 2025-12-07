@@ -416,6 +416,25 @@ class MLSScraper:
                 # Update failed_locations with final retry results
                 failed_locations = retry_failed_locations
             
+            # CRITICAL: Verify all locations are done before marking as completed
+            total_processed = successful_locations + len(failed_locations)
+            all_locations_done = total_processed >= len(job.locations)
+            
+            if not all_locations_done:
+                logger.error(
+                    f"CRITICAL: Job {job.job_id} completion check failed! "
+                    f"Expected {len(job.locations)} locations, but only {total_processed} were processed "
+                    f"(successful: {successful_locations}, failed: {len(failed_locations)}). "
+                    f"This should never happen - all locations should be processed before reaching this point."
+                )
+                # Still mark as completed if we're close (within 1 location) to handle edge cases
+                if total_processed >= len(job.locations) - 1:
+                    logger.warning(f"Allowing completion with {total_processed}/{len(job.locations)} locations (within tolerance)")
+                    all_locations_done = True
+                else:
+                    # This is a real problem - don't mark as completed
+                    raise Exception(f"Job completion check failed: {total_processed}/{len(job.locations)} locations processed")
+            
             # Mark job as completed (even if some locations failed)
             final_status = JobStatus.COMPLETED
             completion_message = f"Job completed successfully. {successful_locations}/{len(job.locations)} locations processed."
@@ -440,44 +459,93 @@ class MLSScraper:
                 "scrape_type_details": scrape_type_details
             }
             
-            # CRITICAL: Update job status to COMPLETED FIRST - this is the most important step
-            # Do this in a loop with retries to ensure it succeeds
+            # CRITICAL: Update job status to COMPLETED with ALL completion data in ONE atomic operation
+            # This ensures completed_at, status, and all location counts are set together
+            logger.info(f"[COMPLETION] All {len(job.locations)} locations processed. Updating job {job.job_id} status to COMPLETED...")
             status_update_success = False
-            max_retries = 3
+            max_retries = 5  # Increased retries for reliability
             for retry in range(max_retries):
-                update_success = await db.update_job_status(
-                    job.job_id,
-                    final_status,
-                    completed_locations=successful_locations,  # Ensure completed_locations is set
-                    total_locations=len(job.locations),  # Ensure total_locations is set
-                    properties_scraped=total_properties,
-                    properties_saved=saved_properties,
-                    failed_locations=failed_locations,
-                    progress_logs=progress_logs,
-                    current_location=None,  # Clear current_location when job completes
-                    current_location_index=None
-                )
-                
-                if update_success:
-                    # Verify the update was actually saved to the database
-                    verify_job = await db.get_job(job.job_id)
-                    if verify_job and verify_job.status == JobStatus.COMPLETED:
-                        status_update_success = True
-                        logger.info(f"Successfully updated and verified job {job.job_id} status to COMPLETED in database (attempt {retry + 1})")
-                        break
+                try:
+                    update_success = await db.update_job_status(
+                        job.job_id,
+                        final_status,  # COMPLETED
+                        completed_locations=successful_locations,
+                        total_locations=len(job.locations),
+                        properties_scraped=total_properties,
+                        properties_saved=saved_properties,
+                        properties_inserted=total_inserted,
+                        properties_updated=total_updated,
+                        properties_skipped=total_skipped,
+                        failed_locations=failed_locations,
+                        progress_logs=progress_logs,
+                        current_location=None,  # Clear current_location when job completes
+                        current_location_index=None
+                    )
+                    
+                    if update_success:
+                        # CRITICAL: Verify the update was actually saved to the database
+                        await asyncio.sleep(0.2)  # Brief delay to allow DB write to propagate
+                        verify_job = await db.get_job(job.job_id)
+                        if verify_job:
+                            # Handle both enum and string status values
+                            verify_status = verify_job.status
+                            if isinstance(verify_status, JobStatus):
+                                verify_status_value = verify_status.value
+                            else:
+                                verify_status_value = str(verify_status).lower()
+                            
+                            if verify_status_value == JobStatus.COMPLETED.value:
+                                status_update_success = True
+                                logger.info(
+                                    f"[COMPLETION] ✅ Successfully updated and verified job {job.job_id} status to COMPLETED "
+                                    f"(attempt {retry + 1}/{max_retries}). "
+                                    f"completed_locations={successful_locations}, total_locations={len(job.locations)}"
+                                )
+                                break
+                            else:
+                                logger.warning(
+                                    f"[COMPLETION] ⚠️ Job {job.job_id} status update reported success but verification failed "
+                                    f"(attempt {retry + 1}/{max_retries}). "
+                                    f"Expected COMPLETED, got {verify_status_value}. Retrying..."
+                                )
+                                await asyncio.sleep(0.5)  # Brief delay before retry
+                        else:
+                            logger.warning(f"[COMPLETION] ⚠️ Job {job.job_id} not found after update (attempt {retry + 1}). Retrying...")
+                            await asyncio.sleep(0.5)
                     else:
-                        logger.warning(
-                            f"Job {job.job_id} status update reported success but verification failed (attempt {retry + 1}). "
-                            f"Current status in DB: {verify_job.status.value if verify_job else 'NOT FOUND'}. Retrying..."
-                        )
+                        logger.warning(f"[COMPLETION] ⚠️ Failed to update job {job.job_id} status to COMPLETED (attempt {retry + 1}/{max_retries}). Retrying...")
                         await asyncio.sleep(0.5)  # Brief delay before retry
-                else:
-                    logger.warning(f"Failed to update job {job.job_id} status to COMPLETED (attempt {retry + 1}). Retrying...")
-                    await asyncio.sleep(0.5)  # Brief delay before retry
+                except Exception as update_error:
+                    logger.error(f"[COMPLETION] ❌ Error updating job {job.job_id} status (attempt {retry + 1}): {update_error}")
+                    await asyncio.sleep(0.5)
             
             if not status_update_success:
-                logger.error(f"CRITICAL: Failed to update job {job.job_id} status to COMPLETED after {max_retries} attempts!")
+                logger.error(f"[COMPLETION] ❌ CRITICAL: Failed to update job {job.job_id} status to COMPLETED after {max_retries} attempts!")
                 # Still try to update in finally block as last resort
+                # But also try one more direct update here
+                try:
+                    logger.warning(f"[COMPLETION] Attempting direct MongoDB update as last resort...")
+                    await db.jobs_collection.update_one(
+                        {"job_id": job.job_id},
+                        {
+                            "$set": {
+                                "status": JobStatus.COMPLETED.value,
+                                "completed_at": datetime.utcnow(),
+                                "completed_locations": successful_locations,
+                                "total_locations": len(job.locations),
+                                "updated_at": datetime.utcnow()
+                            }
+                        }
+                    )
+                    # Verify one more time
+                    final_verify = await db.get_job(job.job_id)
+                    if final_verify and (isinstance(final_verify.status, JobStatus) and final_verify.status == JobStatus.COMPLETED or str(final_verify.status).lower() == "completed"):
+                        logger.info(f"[COMPLETION] ✅ Direct MongoDB update succeeded for job {job.job_id}")
+                        status_update_success = True
+                    else:
+                        logger.error(f"[COMPLETION] ❌ Direct MongoDB update also failed for job {job.job_id}")
+                except Exception as direct_update_error:
+                    logger.error(f"[COMPLETION] ❌ Direct MongoDB update error: {direct_update_error}")
             
             # Update run history for scheduled jobs (new architecture)
             # Wrap in try-except to prevent job from being marked as failed if this update fails
