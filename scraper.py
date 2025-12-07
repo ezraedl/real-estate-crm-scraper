@@ -448,6 +448,8 @@ class MLSScraper:
                 update_success = await db.update_job_status(
                     job.job_id,
                     final_status,
+                    completed_locations=successful_locations,  # Ensure completed_locations is set
+                    total_locations=len(job.locations),  # Ensure total_locations is set
                     properties_scraped=total_properties,
                     properties_saved=saved_properties,
                     failed_locations=failed_locations,
@@ -524,7 +526,13 @@ class MLSScraper:
                     f"CRITICAL: Job {job.job_id} status is {final_check.status.value} instead of COMPLETED! "
                     f"Force updating to COMPLETED..."
                 )
-                await db.update_job_status(job.job_id, JobStatus.COMPLETED, progress_logs=progress_logs)
+                await db.update_job_status(
+                    job.job_id, 
+                    JobStatus.COMPLETED, 
+                    completed_locations=successful_locations,
+                    total_locations=len(job.locations),
+                    progress_logs=progress_logs
+                )
                 # Verify one more time
                 verify_final = await db.get_job(job.job_id)
                 if verify_final and verify_final.status == JobStatus.COMPLETED:
@@ -659,10 +667,19 @@ class MLSScraper:
                             f"Updating status to COMPLETED in finally block (safety net)."
                         )
                         # Retry the status update with verification
+                        # Get completed_locations from progress_logs if not available
+                        if completed_locations == 0:
+                            # Try to get from progress_logs summary
+                            summary = progress_logs.get("summary", {})
+                            completed_locations = summary.get("completed_locations", 0)
+                            total_locations = summary.get("total_locations", total_locations)
+                        
                         for retry in range(3):
                             update_success = await db.update_job_status(
                                 job.job_id,
                                 JobStatus.COMPLETED,
+                                completed_locations=completed_locations,
+                                total_locations=total_locations,
                                 progress_logs=progress_logs
                             )
                             if update_success:
