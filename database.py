@@ -163,8 +163,12 @@ class Database:
                 if existing_job and not existing_job.get("started_at"):
                     update_data["started_at"] = datetime.utcnow()
             elif status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                # CRITICAL: Always set completed_at when status becomes final
+                # This ensures completed_at is set atomically with the status change
                 update_data["completed_at"] = datetime.utcnow()
+                logger.debug(f"Setting completed_at for job {job_id} with status {status.value}")
             
+            # Use atomic update to ensure status and completed_at are set together
             result = await self.jobs_collection.update_one(
                 {"job_id": job_id},
                 {"$set": update_data}
@@ -181,9 +185,21 @@ class Database:
                 if not job_exists:
                     logger.error(f"Job {job_id} does not exist in database!")
                 else:
-                    logger.warning(f"Job {job_id} exists but update did not modify it. Current status: {job_exists.get('status')}")
+                    current_status = job_exists.get('status')
+                    current_completed_at = job_exists.get('completed_at')
+                    logger.warning(
+                        f"Job {job_id} exists but update did not modify it. "
+                        f"Current status: {current_status}, completed_at: {current_completed_at}"
+                    )
+                    # If status is already what we want, consider it success
+                    if current_status == status.value:
+                        logger.info(f"Job {job_id} already has status {status.value}, considering update successful")
+                        success = True
             else:
-                logger.debug(f"Successfully updated job {job_id} status to {status.value}")
+                if status == JobStatus.COMPLETED:
+                    logger.info(f"✅ Successfully updated job {job_id} status to COMPLETED with completed_at timestamp")
+                else:
+                    logger.debug(f"Successfully updated job {job_id} status to {status.value}")
             
             return success
         except Exception as e:
