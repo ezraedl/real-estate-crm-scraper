@@ -1446,6 +1446,26 @@ class MLSScraper:
                 if 'listing_type' in properties_df.columns:
                     # Group by listing_type
                     logger.debug(f"   [SPLIT] Splitting {len(properties_df)} properties by listing_type column")
+                    
+                    # Check for unexpected listing types in the DataFrame
+                    unique_listing_types = properties_df['listing_type'].dropna().unique().tolist()
+                    unexpected_types = [lt for lt in unique_listing_types if lt not in listing_types]
+                    
+                    if unexpected_types:
+                        unexpected_count = len(properties_df[properties_df['listing_type'].isin(unexpected_types)])
+                        logger.warning(
+                            f"   [UNEXPECTED] Found {unexpected_count} properties with unexpected listing types: {unexpected_types} "
+                            f"(expected: {listing_types}). These will be skipped."
+                        )
+                        # Log examples of unexpected types
+                        for unexpected_type in unexpected_types:
+                            unexpected_df = properties_df[properties_df['listing_type'] == unexpected_type]
+                            logger.warning(f"   [UNEXPECTED]   - {len(unexpected_df)} properties with listing_type='{unexpected_type}'")
+                            # Show status values for these unexpected types
+                            if 'status' in unexpected_df.columns:
+                                status_counts = unexpected_df['status'].value_counts().head(5)
+                                logger.warning(f"   [UNEXPECTED]     Status breakdown: {dict(status_counts)}")
+                    
                     for listing_type in listing_types:
                         type_df = properties_df[properties_df['listing_type'] == listing_type]
                         logger.debug(f"   [SPLIT] Found {len(type_df)} properties for listing_type '{listing_type}'")
@@ -1461,7 +1481,13 @@ class MLSScraper:
                     
                     # Log summary of split
                     total_split = sum(len(props) for props in properties_by_type.values())
-                    logger.info(f"   [SPLIT] Split {len(properties_df)} total properties into: {', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])} (total after split: {total_split})")
+                    total_expected = len(properties_df[properties_df['listing_type'].isin(listing_types)])
+                    logger.info(
+                        f"   [SPLIT] Split {len(properties_df)} total properties into: "
+                        f"{', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])} "
+                        f"(total after split: {total_split}, expected: {total_expected}, "
+                        f"unexpected/skipped: {len(properties_df) - total_expected})"
+                    )
                 else:
                     # No listing_type column - infer listing type from status field
                     logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column! Inferring listing type from 'status' field.")
@@ -1497,12 +1523,24 @@ class MLSScraper:
                     # Split properties by inferred listing type
                     inferred_count = {lt: 0 for lt in listing_types}
                     unassigned_count = 0
+                    unassigned_properties = []  # Track unassigned properties for logging
                     
                     for index, row in properties_df.iterrows():
                         try:
                             # Access DataFrame row values (pandas Series supports dict-style access)
                             status_value = row.get('status') if 'status' in row.index else None
                             mls_status_value = row.get('mls_status') if 'mls_status' in row.index else None
+                            
+                            # Try to get property address for logging
+                            address_value = None
+                            if 'address' in row.index:
+                                addr = row.get('address')
+                                if isinstance(addr, str):
+                                    address_value = addr
+                                elif isinstance(addr, dict):
+                                    address_value = addr.get('formatted_address') or addr.get('street') or str(addr)
+                            elif 'street' in row.index:
+                                address_value = row.get('street')
                             
                             inferred_type = infer_listing_type_from_status(status_value, mls_status_value)
                             
@@ -1512,6 +1550,14 @@ class MLSScraper:
                             else:
                                 listing_type = listing_types[0]  # Fallback to first type
                                 unassigned_count += 1
+                                # Track unassigned property details for logging
+                                unassigned_properties.append({
+                                    'status': str(status_value) if status_value is not None else 'None',
+                                    'mls_status': str(mls_status_value) if mls_status_value is not None else 'None',
+                                    'inferred_type': inferred_type if inferred_type else 'None',
+                                    'address': address_value if address_value else 'Unknown',
+                                    'assigned_to': listing_type  # Show which type it was assigned to as fallback
+                                })
                             
                             property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
                             if listing_type == "sold":
@@ -1526,6 +1572,27 @@ class MLSScraper:
                     total_split = sum(len(props) for props in properties_by_type.values())
                     split_summary = ', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])
                     logger.info(f"   [SPLIT] Inferred listing types from status field: {split_summary} (total: {total_split}, unassigned: {unassigned_count})")
+                    
+                    # Log details of unassigned properties
+                    if unassigned_count > 0:
+                        logger.warning(f"   [UNASSIGNED] Found {unassigned_count} properties that don't match any of the 4 expected listing types:")
+                        # Group by status for cleaner logging
+                        status_groups = {}
+                        for prop in unassigned_properties:
+                            status_key = f"status='{prop['status']}', mls_status='{prop['mls_status']}'"
+                            if status_key not in status_groups:
+                                status_groups[status_key] = []
+                            status_groups[status_key].append(prop)
+                        
+                        # Log each unique status combination
+                        for status_key, props in status_groups.items():
+                            logger.warning(f"   [UNASSIGNED]   - {len(props)} property/properties with {status_key} (assigned to '{props[0]['assigned_to']}' as fallback)")
+                            # Log first few addresses as examples
+                            example_addresses = [p['address'] for p in props[:3]]
+                            if example_addresses:
+                                logger.warning(f"   [UNASSIGNED]     Examples: {', '.join(example_addresses)}")
+                                if len(props) > 3:
+                                    logger.warning(f"   [UNASSIGNED]     ... and {len(props) - 3} more with same status")
             
             return properties_by_type
             
