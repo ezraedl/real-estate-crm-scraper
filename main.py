@@ -1772,8 +1772,12 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
         if 'cron_expression' in job_data:
             update_data['cron_expression'] = job_data['cron_expression']
             # Recalculate next run time if cron changed
+            # Use last_run_at as base if available, otherwise use now
+            # This ensures the next run is calculated from when the job last ran,
+            # not from the current time, so missed runs are properly scheduled
             import croniter
-            cron = croniter.croniter(job_data['cron_expression'], datetime.utcnow())
+            base_time = existing_job.last_run_at if existing_job.last_run_at else datetime.utcnow()
+            cron = croniter.croniter(job_data['cron_expression'], base_time)
             update_data['next_run_at'] = cron.get_next(datetime)
         if 'timezone' in job_data:
             update_data['timezone'] = job_data['timezone']
