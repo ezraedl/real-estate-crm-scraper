@@ -154,12 +154,35 @@ class Database:
         logger = logging.getLogger(__name__)
         
         try:
+            # CRITICAL: Check current status to prevent downgrading from final states
+            existing_job = await self.jobs_collection.find_one({"job_id": job_id})
+            if existing_job:
+                current_status = existing_job.get('status')
+                final_states = [JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value]
+                
+                # Prevent downgrading from final states to RUNNING
+                if current_status in final_states and status == JobStatus.RUNNING:
+                    logger.warning(
+                        f"⚠️ Attempted to downgrade job {job_id} from {current_status} to RUNNING. "
+                        f"This is blocked to prevent background tasks from overwriting completion status. "
+                        f"Updating only non-status fields (progress_logs, etc.)"
+                    )
+                    # Remove status from update_data - only update other fields
+                    update_data = {"updated_at": datetime.utcnow()}
+                    update_data.update({k: v for k, v in kwargs.items() if k != "status"})
+                    
+                    # Update only non-status fields
+                    result = await self.jobs_collection.update_one(
+                        {"job_id": job_id},
+                        {"$set": update_data}
+                    )
+                    return result.modified_count > 0
+            
             update_data = {"status": status.value, "updated_at": datetime.utcnow()}
             update_data.update(kwargs)
             
             if status == JobStatus.RUNNING:
                 # Only set started_at if not already set (don't overwrite on progress updates)
-                existing_job = await self.jobs_collection.find_one({"job_id": job_id})
                 if existing_job and not existing_job.get("started_at"):
                     update_data["started_at"] = datetime.utcnow()
             elif status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:

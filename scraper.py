@@ -1259,9 +1259,21 @@ class MLSScraper:
                         enrichment_status["status"] = "completed"
                     
                     # Update job status periodically (every 10 completions to avoid too many DB writes)
+                    # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
                     if (completed + failed) % 10 == 0 or (completed + failed) >= total:
                         try:
-                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                            # Check current job status before updating
+                            current_job = await db.get_job(job_id)
+                            if current_job and current_job.status == JobStatus.RUNNING:
+                                await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                            else:
+                                # Job is already COMPLETED/FAILED/CANCELLED, only update progress_logs without changing status
+                                if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                    logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for enrichment")
+                                    await db.jobs_collection.update_one(
+                                        {"job_id": job_id},
+                                        {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
+                                    )
                         except Exception as e:
                             logger.error(f"Error updating job status with enrichment progress: {e}")
     
@@ -2288,7 +2300,17 @@ class MLSScraper:
                                 "off_market_found": off_market_count,
                                 "errors": error_count
                             }
-                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                            # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                            current_job = await db.get_job(job_id)
+                            if current_job and current_job.status == JobStatus.RUNNING:
+                                await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                            elif current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                # Job is already final, only update progress_logs without changing status
+                                logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check")
+                                await db.jobs_collection.update_one(
+                                    {"job_id": job_id},
+                                    {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
+                                )
                     except Exception as e:
                         logger.error(f"   [OFF-MARKET] Error updating progress logs: {e}")
                 
@@ -2403,7 +2425,17 @@ class MLSScraper:
                         location_entry["off_market_check"]["checked"] = total_checked
                         location_entry["off_market_check"]["found"] = off_market_count
                         location_entry["off_market_check"]["errors"] = error_count
-                        await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                        current_job = await db.get_job(job_id)
+                        if current_job and current_job.status == JobStatus.RUNNING:
+                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        elif current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                            # Job is already final, only update progress_logs without changing status
+                            logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check completion")
+                            await db.jobs_collection.update_one(
+                                {"job_id": job_id},
+                                {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
+                            )
                 except Exception as e:
                     logger.error(f"   [OFF-MARKET] Error updating final progress logs: {e}")
             
@@ -2558,7 +2590,17 @@ class MLSScraper:
                             "off_market_found": off_market_count,
                             "errors": error_count
                         }
-                        await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                        current_job = await db.get_job(job_id)
+                        if current_job and current_job.status == JobStatus.RUNNING:
+                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        elif current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                            # Job is already final, only update progress_logs without changing status
+                            logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check")
+                            await db.jobs_collection.update_one(
+                                {"job_id": job_id},
+                                {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
+                            )
                     except Exception as e:
                         logger.error(f"   [OFF-MARKET] Error updating progress logs: {e}")
                 
