@@ -121,6 +121,46 @@ class ContactService:
             print(f"Error batch creating/finding contacts via API: {e}")
             return {}
     
+    def _has_mobile_phone(self, contact: Dict[str, Any]) -> bool:
+        """Check if contact has an active mobile phone"""
+        if not contact or 'phones' not in contact:
+            return False
+        
+        phones = contact.get('phones', [])
+        if not isinstance(phones, list):
+            return False
+        
+        return any(
+            phone.get('type') == 'mobile' and phone.get('is_active') is True
+            for phone in phones
+            if isinstance(phone, dict)
+        )
+    
+    async def _trigger_phone_enrichment(
+        self,
+        contact_id: str,
+        agent_name: str,
+        agent_email: Optional[str] = None,
+        property_address: Optional[str] = None,
+        agent_id: Optional[str] = None
+    ) -> None:
+        """Trigger phone enrichment for an agent (non-blocking)"""
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{self.api_base}/contacts/enrich-phone",
+                    json={
+                        "contact_id": contact_id,
+                        "agent_name": agent_name,
+                        "agent_email": agent_email,
+                        "property_addresses": [property_address] if property_address else [],
+                        "agent_id": agent_id,
+                    }
+                )
+        except Exception as e:
+            # Silently fail - enrichment is optional and shouldn't block scraping
+            print(f"Error triggering phone enrichment (non-blocking): {e}")
+    
     async def process_property_contacts(self, property_data: Any) -> Dict[str, Optional[str]]:
         """
         Process all contacts for a property in parallel and return a dict with contact IDs.
@@ -137,6 +177,24 @@ class ContactService:
             'builder_id': None,
             'office_id': None
         }
+        
+        # Get property address for enrichment
+        property_address = None
+        if property_data.address and property_data.address.formatted_address:
+            property_address = property_data.address.formatted_address
+        elif property_data.address:
+            # Build address from components
+            address_parts = []
+            if property_data.address.street:
+                address_parts.append(property_data.address.street)
+            if property_data.address.city:
+                address_parts.append(property_data.address.city)
+            if property_data.address.state:
+                address_parts.append(property_data.address.state)
+            if property_data.address.zip_code:
+                address_parts.append(property_data.address.zip_code)
+            if address_parts:
+                property_address = ', '.join(address_parts)
         
         # Prepare all contact creation tasks to run in parallel
         tasks = []
@@ -232,7 +290,23 @@ class ContactService:
                     if isinstance(result, Exception):
                         print(f"Error processing {contact_type} contact: {result}")
                     elif result and result.get('_id'):
-                        contact_ids[f'{contact_type}_id'] = str(result['_id'])
+                        contact_id = str(result['_id'])
+                        contact_ids[f'{contact_type}_id'] = contact_id
+                        
+                        # Check if agent contact needs phone enrichment
+                        if contact_type == 'agent' and property_data.agent:
+                            # Check if contact has mobile phone
+                            if not self._has_mobile_phone(result):
+                                # Trigger enrichment asynchronously (non-blocking)
+                                asyncio.create_task(
+                                    self._trigger_phone_enrichment(
+                                        contact_id=contact_id,
+                                        agent_name=property_data.agent.agent_name,
+                                        agent_email=property_data.agent.agent_email,
+                                        property_address=property_address,
+                                        agent_id=property_data.agent.agent_id
+                                    )
+                                )
             except Exception as e:
                 print(f"Error processing contacts in parallel: {e}")
         
