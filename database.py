@@ -541,6 +541,12 @@ class Database:
                         property_data.last_scraped = datetime.utcnow()
                     
                     property_dict = property_data.dict(by_alias=True, exclude={"id"})
+                    
+                    # CRITICAL: Preserve crm_property_ids from existing property
+                    # This field is not in the Property model, so it gets lost during replace_one
+                    if existing_property.get("crm_property_ids"):
+                        property_dict["crm_property_ids"] = existing_property["crm_property_ids"]
+                    
                     result = await self.properties_collection.replace_one(
                         {"property_id": property_data.property_id},
                         property_dict,
@@ -905,6 +911,12 @@ class Database:
                                 prop.last_scraped = datetime.utcnow()
                             
                             property_dict = prop.dict(by_alias=True, exclude={"id"})
+                            
+                            # CRITICAL: Preserve crm_property_ids from existing property
+                            # This field is not in the Property model, so it gets lost during ReplaceOne
+                            if existing_prop.get("crm_property_ids"):
+                                property_dict["crm_property_ids"] = existing_prop["crm_property_ids"]
+                            
                             bulk_operations.append(ReplaceOne(
                                 {"property_id": prop.property_id},
                                 property_dict,
