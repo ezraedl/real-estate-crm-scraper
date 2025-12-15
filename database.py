@@ -142,6 +142,9 @@ class Database:
             job_data = await self.jobs_collection.find_one({"job_id": job_id})
             if job_data:
                 job_data["_id"] = str(job_data["_id"])
+                # Fix: Convert empty listing_types list to None to ensure proper defaults
+                if "listing_types" in job_data and isinstance(job_data["listing_types"], list) and len(job_data["listing_types"]) == 0:
+                    job_data["listing_types"] = None
                 return ScrapingJob(**job_data)
             return None
         except Exception as e:
@@ -268,6 +271,9 @@ class Database:
             jobs = []
             async for job_data in cursor:
                 job_data["_id"] = str(job_data["_id"])
+                # Fix: Convert empty listing_types list to None to ensure proper defaults
+                if "listing_types" in job_data and isinstance(job_data["listing_types"], list) and len(job_data["listing_types"]) == 0:
+                    job_data["listing_types"] = None
                 jobs.append(ScrapingJob(**job_data))
             
             return jobs
@@ -285,6 +291,9 @@ class Database:
             jobs = []
             async for job_data in cursor:
                 job_data["_id"] = str(job_data["_id"])
+                # Fix: Convert empty listing_types list to None to ensure proper defaults
+                if "listing_types" in job_data and isinstance(job_data["listing_types"], list) and len(job_data["listing_types"]) == 0:
+                    job_data["listing_types"] = None
                 jobs.append(ScrapingJob(**job_data))
             
             return jobs

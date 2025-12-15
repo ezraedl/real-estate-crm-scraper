@@ -351,12 +351,25 @@ class JobScheduler:
             timestamp = int(datetime.utcnow().timestamp())
             new_job_id = f"scheduled_{scheduled_job.scheduled_job_id}_{timestamp}_{uuid.uuid4().hex[:8]}"
 
+            # Ensure listing_types is not empty - use defaults if needed
+            effective_listing_types = scheduled_job.listing_types
+            # Handle both None and empty list cases
+            if effective_listing_types is None or (isinstance(effective_listing_types, list) and len(effective_listing_types) == 0):
+                # If listing_types is empty, check listing_type (backward compatibility)
+                if scheduled_job.listing_type:
+                    effective_listing_types = [scheduled_job.listing_type]
+                    logger.info(f"Scheduled job {scheduled_job.scheduled_job_id} has empty listing_types, using listing_type '{scheduled_job.listing_type}'")
+                else:
+                    # Default to all types if neither is set - explicitly set to None so scraper uses defaults
+                    effective_listing_types = None  # Will trigger default in scraper
+                    logger.warning(f"Scheduled job {scheduled_job.scheduled_job_id} has no listing_types or listing_type, will use defaults in scraper")
+
             new_job = ScrapingJob(
                 job_id=new_job_id,
                 priority=scheduled_job.priority,
                 scheduled_job_id=scheduled_job.scheduled_job_id,
                 locations=all_locations,
-                listing_types=scheduled_job.listing_types,
+                listing_types=effective_listing_types,
                 listing_type=scheduled_job.listing_type,
                 property_types=scheduled_job.property_types,
                 past_days=scheduled_job.past_days,

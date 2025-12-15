@@ -786,11 +786,21 @@ async def immediate_scrape(request: ImmediateScrapeRequest):
         # Create immediate job
         job_id = f"immediate_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:8]}"
         
+        # Ensure listing_types is set correctly
+        # If listing_types is provided, use it; otherwise use listing_type; otherwise default to all types
+        listing_types = getattr(request, 'listing_types', None)
+        if not listing_types or len(listing_types) == 0:
+            if request.listing_type:
+                listing_types = [request.listing_type]
+            else:
+                listing_types = None  # Will default to all types in scraper
+        
         job = ScrapingJob(
             job_id=job_id,
             priority=JobPriority.IMMEDIATE,
             locations=request.locations,
-            listing_type=request.listing_type,
+            listing_types=listing_types,
+            listing_type=request.listing_type,  # Keep for backward compatibility
             property_types=request.property_types,
             radius=request.radius,
             mls_only=request.mls_only,
@@ -969,48 +979,116 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
                     # Prioritize sold properties first, then others
                     listing_types = ["sold", "for_sale", "for_rent", "pending"]
                     
-                    for listing_type in listing_types:
-                        try:
-                            logger.info(f"Scraping {listing_type} properties directly...")
+                    # First, try without listing_type filter to get all properties at this address
+                    logger.info(f"First attempting to scrape all listing types at once for: {location}")
+                    try:
+                        scrape_params_all = {
+                            "location": location,
+                            "listing_type": listing_types,  # Pass all types at once
+                            "mls_only": False,
+                            "limit": temp_job.limit or 200
+                        }
+                        
+                        # Add past_days for sold properties
+                        if temp_job.past_days:
+                            scrape_params_all["past_days"] = temp_job.past_days
+                            logger.info(f"Focusing on properties from last {temp_job.past_days} days")
+                        
+                        properties_df_all = scrape_property(**scrape_params_all)
+                        
+                        if not properties_df_all.empty:
+                            logger.info(f"Found {len(properties_df_all)} total properties (all types combined)")
                             
-                            scrape_params = {
-                                "location": location,
-                                "listing_type": listing_type,
-                                "mls_only": False,
-                                "limit": temp_job.limit or 200
-                            }
-                            
-                            # Add past_days for sold properties to focus on recent sales
-                            if listing_type == "sold" and temp_job.past_days:
-                                scrape_params["past_days"] = temp_job.past_days
-                                logger.info(f"Focusing on sold properties from last {temp_job.past_days} days")
-                            
-                            properties_df = scrape_property(**scrape_params)
-                            
-                            if not properties_df.empty:
-                                logger.info(f"Found {len(properties_df)} {listing_type} properties")
-                                
-                                # Convert DataFrame to Property models
-                                for index, row in properties_df.iterrows():
+                            # Check if DataFrame has listing_type column
+                            if 'listing_type' in properties_df_all.columns:
+                                # Group by listing_type
+                                for listing_type in listing_types:
+                                    type_df = properties_df_all[properties_df_all['listing_type'] == listing_type]
+                                    if not type_df.empty:
+                                        logger.info(f"  - {listing_type}: {len(type_df)} properties")
+                                        for index, row in type_df.iterrows():
+                                            try:
+                                                property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
+                                                if listing_type == "sold":
+                                                    property_obj.is_comp = True
+                                                all_properties.append(property_obj)
+                                            except Exception as e:
+                                                logger.error(f"Error converting property: {e}")
+                                                continue
+                            else:
+                                # No listing_type column, process all properties
+                                logger.warning("DataFrame doesn't have listing_type column, processing all properties")
+                                for index, row in properties_df_all.iterrows():
                                     try:
+                                        # Try to infer listing type from status
+                                        status = row.get('status', '')
+                                        mls_status = row.get('mls_status', '')
+                                        
+                                        # Infer listing type
+                                        if 'SOLD' in str(status).upper() or 'SOLD' in str(mls_status).upper():
+                                            listing_type = "sold"
+                                        elif 'PENDING' in str(status).upper() or 'PENDING' in str(mls_status).upper():
+                                            listing_type = "pending"
+                                        elif 'RENT' in str(status).upper() or 'FOR_RENT' in str(status).upper():
+                                            listing_type = "for_rent"
+                                        else:
+                                            listing_type = "for_sale"
+                                        
                                         property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
                                         if listing_type == "sold":
                                             property_obj.is_comp = True
                                         all_properties.append(property_obj)
-                                        
-                                        # Check if this is 1707
-                                        if '1707' in property_obj.address.formatted_address:
-                                            logger.info(f"🎯 FOUND 1707: {property_obj.address.formatted_address}")
-                                            
                                     except Exception as e:
                                         logger.error(f"Error converting property: {e}")
                                         continue
-                            else:
-                                logger.info(f"No {listing_type} properties found")
+                    except Exception as e:
+                        logger.warning(f"Error scraping all types at once: {e}, falling back to individual types")
+                    
+                    # If we didn't get results, try each listing type individually
+                    if not all_properties:
+                        logger.info(f"No properties found with combined query, trying individual listing types...")
+                        for listing_type in listing_types:
+                            try:
+                                logger.info(f"Scraping {listing_type} properties directly...")
                                 
-                        except Exception as e:
-                            logger.error(f"Error scraping {listing_type} properties: {e}")
-                            continue
+                                scrape_params = {
+                                    "location": location,
+                                    "listing_type": listing_type,
+                                    "mls_only": False,
+                                    "limit": temp_job.limit or 200
+                                }
+                                
+                                # Add past_days for sold properties to focus on recent sales
+                                if listing_type == "sold" and temp_job.past_days:
+                                    scrape_params["past_days"] = temp_job.past_days
+                                    logger.info(f"Focusing on sold properties from last {temp_job.past_days} days")
+                                
+                                properties_df = scrape_property(**scrape_params)
+                                
+                                if not properties_df.empty:
+                                    logger.info(f"Found {len(properties_df)} {listing_type} properties")
+                                    
+                                    # Convert DataFrame to Property models
+                                    for index, row in properties_df.iterrows():
+                                        try:
+                                            property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
+                                            if listing_type == "sold":
+                                                property_obj.is_comp = True
+                                            all_properties.append(property_obj)
+                                            
+                                            # Check if this is 1707
+                                            if '1707' in property_obj.address.formatted_address:
+                                                logger.info(f"🎯 FOUND 1707: {property_obj.address.formatted_address}")
+                                                
+                                        except Exception as e:
+                                            logger.error(f"Error converting property: {e}")
+                                            continue
+                                else:
+                                    logger.info(f"No {listing_type} properties found")
+                                    
+                            except Exception as e:
+                                logger.error(f"Error scraping {listing_type} properties: {e}")
+                                continue
                     
                     properties = all_properties
                     logger.info(f"Direct scraping returned {len(properties)} properties for: {location}")
@@ -1224,13 +1302,19 @@ async def trigger_existing_job(request: TriggerJobRequest):
         else:
             past_days = existing_job.past_days  # Keep original for other types
         
+        # Ensure listing_types is set correctly from existing job
+        listing_types = existing_job.listing_types if (existing_job.listing_types and len(existing_job.listing_types) > 0) else None
+        if not listing_types and existing_job.listing_type:
+            listing_types = [existing_job.listing_type]
+        
         # Create new immediate job based on existing job
         immediate_job = ScrapingJob(
             job_id=immediate_job_id,
             priority=request.priority,
             scheduled_job_id=existing_job.scheduled_job_id,  # Preserve scheduled_job_id if exists
             locations=existing_job.locations,
-            listing_type=existing_job.listing_type,
+            listing_types=listing_types,
+            listing_type=existing_job.listing_type,  # Keep for backward compatibility
             property_types=existing_job.property_types,
             past_days=past_days,  # Use the calculated past_days
             date_from=existing_job.date_from,
@@ -1676,7 +1760,14 @@ async def create_scheduled_job(job_data: dict):
         # Default to all listing types if not specified
         listing_types = job_data.get('listing_types')
         if not listing_types or len(listing_types) == 0:
-            listing_types = ["for_sale", "sold", "for_rent", "pending"]
+            # Check if listing_type (singular) is provided for backward compatibility
+            listing_type = job_data.get('listing_type')
+            if listing_type:
+                listing_types = [listing_type]
+            else:
+                # Default to all types if neither is set
+                listing_types = ["for_sale", "sold", "for_rent", "pending"]
+                logger.info(f"No listing_types or listing_type provided, defaulting to all types: {listing_types}")
         
         # Get locations - ensure it's a list
         locations = job_data.get('locations', [])

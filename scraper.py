@@ -811,9 +811,18 @@ class MLSScraper:
             enrichment_queue = []  # Collect properties that need enrichment
             
             # Determine which listing types to scrape
-            if job.listing_types and len(job.listing_types) > 0:
+            # Handle empty list as None to ensure proper fallback to defaults
+            # Check both None and empty list cases explicitly
+            if job.listing_types is None:
+                effective_listing_types = None
+            elif isinstance(job.listing_types, list) and len(job.listing_types) == 0:
+                effective_listing_types = None  # Treat empty list as None
+            else:
+                effective_listing_types = job.listing_types
+            
+            if effective_listing_types:
                 # Use specified listing types
-                listing_types_to_scrape = job.listing_types
+                listing_types_to_scrape = effective_listing_types
                 logger.debug(f"   [TARGET] Scraping specified types in {location}: {listing_types_to_scrape}")
             elif job.listing_type:
                 # Backward compatibility: use single listing_type
@@ -822,7 +831,7 @@ class MLSScraper:
             else:
                 # Default: scrape all types for comprehensive data
                 listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent"]
-                logger.debug(f"   [TARGET] Scraping ALL property types in {location} (default)")
+                logger.info(f"   [TARGET] Scraping ALL property types in {location} (default - job.listing_types was empty/None)")
             
             # Enforce consistent order: for_sale, sold, pending, for_rent
             preferred_order = ["for_sale", "sold", "pending", "for_rent"]
@@ -925,6 +934,11 @@ class MLSScraper:
                     
                     # Push to database immediately for real-time UI update
                     await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    
+                    # Ensure listing_types_to_scrape is not empty
+                    if not listing_types_to_scrape or len(listing_types_to_scrape) == 0:
+                        logger.error(f"   [ERROR] listing_types_to_scrape is empty! This should not happen. Using default types.")
+                        listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent"]
                     
                     # Use job's limit (or None to get all properties)
                     # Wrap in timeout to prevent getting stuck
@@ -1283,13 +1297,28 @@ class MLSScraper:
             logger.debug(f"   [DEBUG] _scrape_all_listing_types called with listing_types: {listing_types}")
             
             # Prepare scraping parameters - same logic as _scrape_listing_type but for all types
-            zip_match = re.search(r'\b(\d{5})\b', location)
-            if zip_match:
-                location_to_use = zip_match.group(1)
-                logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
-            else:
+            # Check if this is a full street address (contains street number) vs city/state location
+            # Full addresses should be used as-is, city/state locations can use zip code extraction
+            is_full_address = bool(re.search(r'^\d+\s+', location.strip()))  # Starts with street number
+            
+            if is_full_address:
+                # This is a full street address - use it as-is for precise matching
                 location_to_use = location
-                logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
+                logger.debug(f"   [LOCATION] Detected full address, using as-is: '{location_to_use}'")
+            else:
+                # This is a city/state location - extract zip code if available for better matching
+                zip_match = re.search(r'\b(\d{5})\b', location)
+                if zip_match:
+                    location_to_use = zip_match.group(1)
+                    logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
+                else:
+                    location_to_use = location
+                    logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
+            
+            # Ensure listing_types is not empty
+            if not listing_types or len(listing_types) == 0:
+                logger.error(f"   [ERROR] listing_types is empty in _scrape_all_listing_types! This should not happen. Using default types.")
+                listing_types = ["for_sale", "sold", "pending", "for_rent"]
             
             scrape_params = {
                 "location": location_to_use,
@@ -1323,9 +1352,12 @@ class MLSScraper:
                                 hours_since_last_run = time_since_last_run.total_seconds() / 3600
                                 
                                 if 0 < hours_since_last_run <= (30 * 24):
-                                    scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)
+                                    # Use minimum of 24 hours to avoid filtering out all properties
+                                    # If last run was very recent (< 24 hours), use 24 hours instead
+                                    min_hours = 24 if hours_since_last_run < 24 else max(1, int(hours_since_last_run) + 1)
+                                    scrape_params["updated_in_past_hours"] = min_hours
                                     use_updated_since_last_run = True
-                                    logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at})")
+                                    logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, original: {hours_since_last_run:.2f}h)")
                                 elif hours_since_last_run > (30 * 24):
                                     scrape_params["date_from"] = scheduled_job.last_run_at
                                     use_updated_since_last_run = True
@@ -1362,9 +1394,12 @@ class MLSScraper:
                             hours_since_last_run = time_since_last_run.total_seconds() / 3600
                             
                             if 0 < hours_since_last_run <= (30 * 24):
-                                scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)
+                                # Use minimum of 24 hours to avoid filtering out all properties
+                                # If last run was very recent (< 24 hours), use 24 hours instead
+                                min_hours = 24 if hours_since_last_run < 24 else max(1, int(hours_since_last_run) + 1)
+                                scrape_params["updated_in_past_hours"] = min_hours
                                 use_updated_since_last_run = True
-                                logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                                logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, original: {hours_since_last_run:.2f}h, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
                             elif hours_since_last_run > (30 * 24):
                                 scrape_params["date_from"] = scheduled_job.last_run_at
                                 use_updated_since_last_run = True
@@ -1619,17 +1654,27 @@ class MLSScraper:
             
             # Prepare scraping parameters - remove all filtering for comprehensive data
             # According to homeharvest docs, location accepts: zip code, city, "city, state", or full address
-            # For best precision, use just the zip code when available (e.g., "46201" instead of "Indianapolis, IN 46201")
-            # Extract zip code if present for more precise matching
-            zip_match = re.search(r'\b(\d{5})\b', location)
-            if zip_match:
-                # Use just the zip code for maximum precision (per homeharvest documentation)
-                location_to_use = zip_match.group(1)
-                logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
-            else:
-                # No zip code found, use the original location format (city, state, or full address)
+            # For best precision:
+            # - Full street addresses should be used as-is
+            # - City/state locations can use zip code extraction for better matching
+            # Check if this is a full street address (contains street number) vs city/state location
+            is_full_address = bool(re.search(r'^\d+\s+', location.strip()))  # Starts with street number
+            
+            if is_full_address:
+                # This is a full street address - use it as-is for precise matching
                 location_to_use = location
-                logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
+                logger.debug(f"   [LOCATION] Detected full address, using as-is: '{location_to_use}'")
+            else:
+                # This is a city/state location - extract zip code if available for better matching
+                zip_match = re.search(r'\b(\d{5})\b', location)
+                if zip_match:
+                    # Use just the zip code for maximum precision (per homeharvest documentation)
+                    location_to_use = zip_match.group(1)
+                    logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
+                else:
+                    # No zip code found, use the original location format (city, state)
+                    location_to_use = location
+                    logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
             
             scrape_params = {
                 "location": location_to_use,  # Use zip code if available, otherwise original format
@@ -1670,9 +1715,12 @@ class MLSScraper:
                                 
                                 # Only use updated_in_past_hours if last run was within reasonable time (not more than 30 days)
                                 if 0 < hours_since_last_run <= (30 * 24):
-                                    scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)  # Add 1 hour buffer
+                                    # Use minimum of 24 hours to avoid filtering out all properties
+                                    # If last run was very recent (< 24 hours), use 24 hours instead
+                                    min_hours = 24 if hours_since_last_run < 24 else max(1, int(hours_since_last_run) + 1)
+                                    scrape_params["updated_in_past_hours"] = min_hours
                                     use_updated_since_last_run = True
-                                    logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at})")
+                                    logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, original: {hours_since_last_run:.2f}h)")
                                 elif hours_since_last_run > (30 * 24):
                                     # Last run was more than 30 days ago, use date_from instead
                                     scrape_params["date_from"] = scheduled_job.last_run_at
@@ -1717,9 +1765,12 @@ class MLSScraper:
                             
                             # Only use updated_in_past_hours if last run was within reasonable time (not more than 30 days)
                             if 0 < hours_since_last_run <= (30 * 24):
-                                scrape_params["updated_in_past_hours"] = max(1, int(hours_since_last_run) + 1)  # Add 1 hour buffer
+                                # Use minimum of 24 hours to avoid filtering out all properties
+                                # If last run was very recent (< 24 hours), use 24 hours instead
+                                min_hours = 24 if hours_since_last_run < 24 else max(1, int(hours_since_last_run) + 1)
+                                scrape_params["updated_in_past_hours"] = min_hours
                                 use_updated_since_last_run = True
-                                logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                                logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, original: {hours_since_last_run:.2f}h, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
                             elif hours_since_last_run > (30 * 24):
                                 # Last run was more than 30 days ago, use date_from instead
                                 # homeharvest accepts datetime objects for date_from
