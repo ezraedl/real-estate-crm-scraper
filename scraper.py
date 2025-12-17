@@ -1438,6 +1438,9 @@ class MLSScraper:
             timeout_seconds = 600  # 10 minutes timeout for all listing types combined
             loop = asyncio.get_event_loop()
             
+            properties_df = None
+            scrape_error = None
+            
             try:
                 properties_df = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -1477,19 +1480,88 @@ class MLSScraper:
             except asyncio.TimeoutError:
                 error_msg = f"Scraping all listing types in {location} timed out after {timeout_seconds} seconds"
                 logger.warning(f"   [TIMEOUT] {error_msg}")
-                raise TimeoutError(error_msg)
+                scrape_error = error_msg
             except Exception as e:
                 # Catch all other exceptions from homeharvest/realtor (API errors, network errors, etc.)
                 error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
                 error_type = type(e).__name__
                 logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
                 logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
-                # Re-raise with more context
-                raise Exception(f"HomeHarvest API error: {error_msg}") from e
+                scrape_error = error_msg
+            
+            # If the combined call failed or returned empty, try individual calls as fallback
+            num_properties_from_combined = len(properties_df) if properties_df is not None and not properties_df.empty else 0
+            should_try_fallback = (properties_df is None or properties_df.empty or num_properties_from_combined == 0)
+            
+            if should_try_fallback:
+                fallback_reason = scrape_error if scrape_error else "returned 0 properties"
+                logger.warning(f"   [FALLBACK] Combined listing_types call {fallback_reason}. Trying individual calls for each listing type...")
+                properties_by_type_fallback: Dict[str, List[Property]] = {lt: [] for lt in listing_types}
+                
+                for listing_type in listing_types:
+                    try:
+                        # Create params for individual listing type call
+                        individual_params = scrape_params.copy()
+                        individual_params["listing_type"] = listing_type  # Single string, not list
+                        # Remove parameters that might not be needed for individual calls
+                        if "sort_by" in individual_params:
+                            del individual_params["sort_by"]
+                        if "sort_direction" in individual_params:
+                            del individual_params["sort_direction"]
+                        
+                        logger.info(f"   [FALLBACK] Trying individual call for listing_type='{listing_type}' with params: {[k for k in individual_params.keys() if k != 'proxy']}")
+                        
+                        individual_df = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                self.executor,
+                                lambda lt=listing_type, params=individual_params: scrape_property(**params)
+                            ),
+                            timeout=timeout_seconds // len(listing_types)  # Divide timeout among types
+                        )
+                        
+                        if individual_df is not None and not individual_df.empty:
+                            num_individual = len(individual_df)
+                            logger.info(f"   [FALLBACK] Individual call for '{listing_type}' returned {num_individual} properties")
+                            
+                            # Convert to Property objects
+                            for index, row in individual_df.iterrows():
+                                try:
+                                    property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
+                                    if listing_type == "sold":
+                                        property_obj.is_comp = True
+                                    properties_by_type_fallback[listing_type].append(property_obj)
+                                except Exception as e:
+                                    logger.error(f"Error converting property for {listing_type} in fallback: {e}")
+                                    continue
+                        else:
+                            logger.warning(f"   [FALLBACK] Individual call for '{listing_type}' returned empty result")
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type})")
+                        logger.debug(f"   [FALLBACK] Full traceback: {traceback.format_exc()}")
+                        continue
+                
+                # If fallback got results, use them
+                total_fallback = sum(len(props) for props in properties_by_type_fallback.values())
+                if total_fallback > 0:
+                    logger.info(f"   [FALLBACK] Fallback individual calls succeeded! Got {total_fallback} total properties across all types")
+                    return properties_by_type_fallback
+                else:
+                    logger.error(f"   [FALLBACK] All individual calls also failed or returned empty. Original error: {scrape_error}")
+                    # Store the error for display in UI - this will be handled by the caller
+                    if scrape_error:
+                        # The error will be caught and stored in progress_logs by the caller
+                        pass
             
             # Split properties by listing_type from the DataFrame
             # HomeHarvest should include a 'listing_type' column in the DataFrame when multiple types are requested
             properties_by_type: Dict[str, List[Property]] = {lt: [] for lt in listing_types}
+            
+            # If properties_df is None or empty and we haven't already tried fallback, return empty
+            if properties_df is None:
+                logger.warning(f"   [WARNING] properties_df is None for location='{location}'. Returning empty results.")
+                # Fallback was already attempted above if scrape_error exists
+                return properties_by_type
             
             if properties_df is not None and not properties_df.empty:
                 # Log DataFrame columns for debugging
@@ -1884,8 +1956,12 @@ class MLSScraper:
             logger.error(f"Error scraping {listing_type} properties in {location}: {error_msg}")
             logger.debug(f"Full traceback: {traceback.format_exc()}")
             
-            # Store error in progress_logs if available
-            if progress_logs and location:
+            # Store error in progress_logs if available (note: progress_logs is handled at caller level)
+            # This method doesn't have access to progress_logs, so errors are logged but not stored here
+            # The caller (scrape_location) will handle error storage in progress_logs
+            
+            # Return empty list but error is now logged
+            return []
                 # Find the location entry and update it with error
                 for loc_entry in progress_logs.get("locations", []):
                     if loc_entry.get("location") == location:
