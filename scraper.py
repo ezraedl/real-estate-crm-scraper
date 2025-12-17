@@ -1488,6 +1488,7 @@ class MLSScraper:
                 logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
                 logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
                 scrape_error = error_msg
+                properties_df = None
             
             # If the combined call failed or returned empty, try individual calls as fallback
             num_properties_from_combined = len(properties_df) if properties_df is not None and not properties_df.empty else 0
@@ -1961,27 +1962,6 @@ class MLSScraper:
             # The caller (scrape_location) will handle error storage in progress_logs
             
             # Return empty list but error is now logged
-            return []
-                # Find the location entry and update it with error
-                for loc_entry in progress_logs.get("locations", []):
-                    if loc_entry.get("location") == location:
-                        if "listing_types" not in loc_entry:
-                            loc_entry["listing_types"] = {}
-                        if listing_type not in loc_entry["listing_types"]:
-                            loc_entry["listing_types"][listing_type] = {
-                                "found": 0,
-                                "inserted": 0,
-                                "updated": 0,
-                                "skipped": 0
-                            }
-                        loc_entry["listing_types"][listing_type]["error"] = error_msg
-                        loc_entry["listing_types"][listing_type]["error_type"] = error_type
-                        loc_entry["error"] = error_msg  # Also store at location level
-                        if loc_entry.get("status") != "failed":
-                            loc_entry["status"] = "failed"
-                        break
-            
-            # Return empty list but error is now stored in progress_logs
             return []
     
     def convert_to_property_model(self, prop_data: Any, job_id: str, listing_type: str = None, scheduled_job_id: Optional[str] = None) -> Property:
