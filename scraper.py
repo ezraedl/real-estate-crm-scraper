@@ -1360,9 +1360,11 @@ class MLSScraper:
                                     use_updated_since_last_run = True
                                     logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at})")
                                 elif hours_since_last_run > (30 * 24):
-                                    scrape_params["date_from"] = scheduled_job.last_run_at
-                                    use_updated_since_last_run = True
-                                    logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago)")
+                                    # If last run was more than 30 days ago, do a full scrape instead of using date_from
+                                    # date_from may not work correctly with homeharvest API for very old dates
+                                    should_do_full_scrape = True
+                                    use_updated_since_last_run = False
+                                    logger.info(f"   [FULL SCRAPE] Last run was {hours_since_last_run/24:.1f} days ago (>30 days) - doing full scrape instead of incremental")
                                 else:
                                     logger.warning(f"   [INCREMENTAL] No valid last_run_at found, falling back to past_days")
                             else:
@@ -1399,9 +1401,11 @@ class MLSScraper:
                                 use_updated_since_last_run = True
                                 logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
                             elif hours_since_last_run > (30 * 24):
-                                scrape_params["date_from"] = scheduled_job.last_run_at
-                                use_updated_since_last_run = True
-                                logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                                # If last run was more than 30 days ago, do a full scrape instead of using date_from
+                                # date_from may not work correctly with homeharvest API for very old dates
+                                should_do_full_scrape = True
+                                use_updated_since_last_run = False
+                                logger.info(f"   [FULL SCRAPE] Last run was {hours_since_last_run/24:.1f} days ago (>30 days) - doing full scrape instead of incremental (count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
                         else:
                             should_do_full_scrape = True
                             logger.info(f"   [FULL SCRAPE] First run for scheduled job {job.scheduled_job_id} - fetching all properties (no last_run_at)")
@@ -1415,11 +1419,16 @@ class MLSScraper:
                 self.job_run_flags[job.job_id]["was_full_scrape"] = should_do_full_scrape
             
             # Use provided past_days or job past_days (only if not using incremental update)
+            # If neither is set, use default of 90 days for full scrapes to ensure we get properties
             if not use_updated_since_last_run:
                 if past_days:
                     scrape_params["past_days"] = past_days
                 elif job.past_days:
                     scrape_params["past_days"] = job.past_days
+                else:
+                    # Default to 90 days if no past_days is specified for full scrapes
+                    scrape_params["past_days"] = 90
+                    logger.info(f"   [FULL SCRAPE] No past_days specified, using default of 90 days")
             
             # Add sorting by last_update_date for better results
             if use_updated_since_last_run:
@@ -1724,6 +1733,8 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"Error scraping all listing types in {location}: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return {lt: [] for lt in listing_types}
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
@@ -1788,10 +1799,11 @@ class MLSScraper:
                                     use_updated_since_last_run = True
                                     logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at})")
                                 elif hours_since_last_run > (30 * 24):
-                                    # Last run was more than 30 days ago, use date_from instead
-                                    scrape_params["date_from"] = scheduled_job.last_run_at
-                                    use_updated_since_last_run = True
-                                    logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago)")
+                                    # If last run was more than 30 days ago, do a full scrape instead of using date_from
+                                    # date_from may not work correctly with homeharvest API for very old dates
+                                    should_do_full_scrape = True
+                                    use_updated_since_last_run = False
+                                    logger.info(f"   [FULL SCRAPE] Last run was {hours_since_last_run/24:.1f} days ago (>30 days) - doing full scrape instead of incremental")
                                 else:
                                     logger.warning(f"   [INCREMENTAL] No valid last_run_at found, falling back to past_days")
                             else:
@@ -1835,11 +1847,11 @@ class MLSScraper:
                                 use_updated_since_last_run = True
                                 logger.info(f"   [INCREMENTAL] Only fetching properties updated in past {scrape_params['updated_in_past_hours']} hours (since last run at {scheduled_job.last_run_at}, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
                             elif hours_since_last_run > (30 * 24):
-                                # Last run was more than 30 days ago, use date_from instead
-                                # homeharvest accepts datetime objects for date_from
-                                scrape_params["date_from"] = scheduled_job.last_run_at
-                                use_updated_since_last_run = True
-                                logger.info(f"   [INCREMENTAL] Using date_from={scheduled_job.last_run_at} (last run was {hours_since_last_run/24:.1f} days ago, count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
+                                # If last run was more than 30 days ago, do a full scrape instead of using date_from
+                                # date_from may not work correctly with homeharvest API for very old dates
+                                should_do_full_scrape = True
+                                use_updated_since_last_run = False
+                                logger.info(f"   [FULL SCRAPE] Last run was {hours_since_last_run/24:.1f} days ago (>30 days) - doing full scrape instead of incremental (count: {incremental_count}/{incremental_config if incremental_config else '∞'})")
                         else:
                             # First run - no last_run_at, do full scrape
                             should_do_full_scrape = True
@@ -1854,11 +1866,16 @@ class MLSScraper:
                 self.job_run_flags[job.job_id]["was_full_scrape"] = should_do_full_scrape
             
             # Use provided past_days or job past_days (only if not using incremental update)
+            # If neither is set, use default of 90 days for full scrapes to ensure we get properties
             if not use_updated_since_last_run:
                 if past_days:
                     scrape_params["past_days"] = past_days
                 elif job.past_days:
                     scrape_params["past_days"] = job.past_days
+                else:
+                    # Default to 90 days if no past_days is specified for full scrapes
+                    scrape_params["past_days"] = 90
+                    logger.info(f"   [FULL SCRAPE] No past_days specified, using default of 90 days")
             
             # Add sorting by last_update_date for better results (homeharvest 0.8.7+ feature)
             # This ensures we get the most recently updated properties first

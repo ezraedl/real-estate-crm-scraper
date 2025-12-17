@@ -407,10 +407,18 @@ async def startup_event():
         # Initialize proxy manager with DataImpulse API key (optional)
         try:
             if hasattr(settings, 'USE_DATAIMPULSE') and not settings.USE_DATAIMPULSE:
-                logger.info("DataImpulse proxy is disabled via USE_DATAIMPULSE configuration - running without proxy support")
+                logger.warning("⚠️  DataImpulse proxy is DISABLED via USE_DATAIMPULSE=false - running without proxy support")
+                logger.warning("   This will cause 403 errors from Realtor.com. Set USE_DATAIMPULSE=true to enable.")
             elif hasattr(settings, 'DATAIMPULSE_LOGIN') and settings.DATAIMPULSE_LOGIN:
-                await proxy_manager.initialize_dataimpulse_proxies(settings.DATAIMPULSE_LOGIN)
-                logger.info("DataImpulse proxies initialized")
+                logger.info("🔄 Initializing DataImpulse proxies...")
+                success = await proxy_manager.initialize_dataimpulse_proxies(settings.DATAIMPULSE_LOGIN)
+                if success:
+                    proxy_count = len(proxy_manager.proxies)
+                    logger.info(f"✅ DataImpulse proxies initialized successfully ({proxy_count} proxy configurations)")
+                    logger.info(f"   Login: {settings.DATAIMPULSE_LOGIN}")
+                    logger.info(f"   Endpoint: {settings.DATAIMPULSE_ENDPOINT}")
+                else:
+                    logger.error("❌ Failed to initialize DataImpulse proxies - check your credentials")
             else:
                 logger.warning("No DataImpulse API key provided - running without proxy support")
         except Exception as proxy_error:
