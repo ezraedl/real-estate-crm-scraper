@@ -3,6 +3,7 @@ import random
 import re
 import time
 import logging
+import traceback
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -448,6 +449,25 @@ class MLSScraper:
             scrape_type = progress_logs.get("job_started", {}).get("scrape_type", "full")
             scrape_type_details = progress_logs.get("job_started", {}).get("scrape_type_details")
             
+            # Collect all errors from locations for error summary
+            all_errors = []
+            for loc_entry in progress_logs.get("locations", []):
+                if loc_entry.get("error"):
+                    all_errors.append({
+                        "location": loc_entry.get("location"),
+                        "error": loc_entry.get("error"),
+                        "error_type": loc_entry.get("error_type", "Unknown")
+                    })
+                # Also check listing_types for errors
+                for listing_type, data in loc_entry.get("listing_types", {}).items():
+                    if data.get("error"):
+                        all_errors.append({
+                            "location": loc_entry.get("location"),
+                            "listing_type": listing_type,
+                            "error": data.get("error"),
+                            "error_type": data.get("error_type", "Unknown")
+                        })
+            
             progress_logs["job_completed"] = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "event": "job_completed",
@@ -456,7 +476,10 @@ class MLSScraper:
                 "failed_locations": len(failed_locations),
                 "total_locations": len(job.locations),
                 "scrape_type": scrape_type,
-                "scrape_type_details": scrape_type_details
+                "scrape_type_details": scrape_type_details,
+                "has_errors": len(all_errors) > 0,
+                "error_count": len(all_errors),
+                "errors": all_errors if all_errors else None
             }
             
             # CRITICAL: Update job status to COMPLETED with ALL completion data in ONE atomic operation
@@ -1018,14 +1041,18 @@ class MLSScraper:
                     await asyncio.sleep(0.5)
                     
                 except Exception as e:
-                    logger.warning(f"   [WARNING] Error scraping all listing types in {location}: {e}")
+                    error_msg = str(e)
+                    error_type = type(e).__name__
+                    logger.warning(f"   [WARNING] Error scraping all listing types in {location}: {error_msg}")
+                    logger.debug(f"   [WARNING] Full traceback: {traceback.format_exc()}")
                     # Log the error for all listing types
                     for listing_type in listing_types_to_scrape:
                         error_log = {
                             "listing_type": listing_type,
                             "status": "error",
                             "properties_found": 0,
-                            "error": str(e),
+                            "error": error_msg,
+                            "error_type": error_type,
                             "timestamp": datetime.utcnow().isoformat()
                         }
                         listing_type_logs.append(error_log)
@@ -1035,7 +1062,13 @@ class MLSScraper:
                             location_entry = progress_logs["locations"][location_idx]
                             if listing_type in location_entry.get("listing_types", {}):
                                 location_entry["listing_types"][listing_type]["found"] = 0
-                                location_entry["listing_types"][listing_type]["error"] = str(e)
+                                location_entry["listing_types"][listing_type]["error"] = error_msg
+                                location_entry["listing_types"][listing_type]["error_type"] = error_type
+                            # Also store error at location level
+                            location_entry["error"] = error_msg
+                            location_entry["error_type"] = error_type
+                            if location_entry.get("status") != "failed":
+                                location_entry["status"] = "failed"
                             location_entry["timestamp"] = datetime.utcnow().isoformat()
                     
                     # Push to database immediately with current totals
@@ -1458,12 +1491,12 @@ class MLSScraper:
                 logger.warning(f"   [TIMEOUT] {error_msg}")
                 scrape_error = error_msg
             except Exception as e:
-                # Log the full exception for debugging
-                logger.error(f"   [ERROR] Exception calling scrape_property with listing_types list: {e}")
-                logger.error(f"   [ERROR] Exception type: {type(e).__name__}")
-                import traceback
-                logger.error(f"   [ERROR] Traceback: {traceback.format_exc()}")
-                scrape_error = str(e)
+                # Catch all other exceptions from homeharvest/realtor (API errors, network errors, etc.)
+                error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
+                error_type = type(e).__name__
+                logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
+                logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
+                scrape_error = error_msg
                 properties_df = None
             
             # If the combined call failed or returned empty, try individual calls as fallback
@@ -1513,7 +1546,9 @@ class MLSScraper:
                         else:
                             logger.warning(f"   [FALLBACK] Individual call for '{listing_type}' returned empty result")
                     except Exception as e:
-                        logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e}")
+                        error_type = type(e).__name__
+                        logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type})")
+                        logger.debug(f"   [FALLBACK] Full traceback: {traceback.format_exc()}")
                         continue
                 
                 # If fallback got results, use them
@@ -1523,6 +1558,10 @@ class MLSScraper:
                     return properties_by_type_fallback
                 else:
                     logger.error(f"   [FALLBACK] All individual calls also failed or returned empty. Original error: {scrape_error}")
+                    # Store the error for display in UI - this will be handled by the caller
+                    if scrape_error:
+                        # The error will be caught and stored in progress_logs by the caller
+                        pass
             
             # Split properties by listing_type from the DataFrame
             # HomeHarvest should include a 'listing_type' column in the DataFrame when multiple types are requested
@@ -1531,13 +1570,10 @@ class MLSScraper:
             # If properties_df is None or empty and we haven't already tried fallback, return empty
             if properties_df is None:
                 logger.warning(f"   [WARNING] properties_df is None for location='{location}'. Returning empty results.")
-                # Try fallback if we haven't already
-                if scrape_error:
-                    # Fallback was already attempted above, just return empty
-                    pass
+                # Fallback was already attempted above if scrape_error exists
                 return properties_by_type
             
-            if not properties_df.empty:
+            if properties_df is not None and not properties_df.empty:
                 # Log DataFrame columns for debugging
                 logger.debug(f"   [DEBUG] DataFrame columns: {list(properties_df.columns)}")
                 
@@ -1908,6 +1944,14 @@ class MLSScraper:
                 error_msg = f"Scraping {listing_type} properties in {location} timed out after {timeout_seconds} seconds"
                 logger.warning(f"   [TIMEOUT] {error_msg}")
                 raise TimeoutError(error_msg)
+            except Exception as e:
+                # Catch all other exceptions from homeharvest/realtor (API errors, network errors, etc.)
+                error_msg = f"HomeHarvest/Realtor error for {listing_type} in {location}: {str(e)}"
+                error_type = type(e).__name__
+                logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
+                logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
+                # Re-raise with more context
+                raise Exception(f"HomeHarvest API error: {error_msg}") from e
             
             # Convert DataFrame to our Property models
             properties = []
@@ -1925,7 +1969,16 @@ class MLSScraper:
             return properties
             
         except Exception as e:
-            logger.error(f"Error scraping {listing_type} properties in {location}: {e}")
+            error_msg = str(e)
+            error_type = type(e).__name__
+            logger.error(f"Error scraping {listing_type} properties in {location}: {error_msg}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            
+            # Store error in progress_logs if available (note: progress_logs is handled at caller level)
+            # This method doesn't have access to progress_logs, so errors are logged but not stored here
+            # The caller (scrape_location) will handle error storage in progress_logs
+            
+            # Return empty list but error is now logged
             return []
     
     def convert_to_property_model(self, prop_data: Any, job_id: str, listing_type: str = None, scheduled_job_id: Optional[str] = None) -> Property:
