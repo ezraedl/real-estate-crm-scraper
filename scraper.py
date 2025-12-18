@@ -373,21 +373,43 @@ class MLSScraper:
                     last_progress_log_time = now
                 
                 # Random delay between locations (even failed ones to avoid hammering)
+                # Increased delays to reduce blocking: 3-5 seconds between locations
                 if not location_failed:
-                    delay = job.request_delay + random.uniform(0, 1)
+                    delay = max(job.request_delay, 3.0) + random.uniform(0, 2)  # 3-5 seconds
+                    logger.debug(f"   [THROTTLE] Waiting {delay:.1f}s before next location to avoid blocking")
                     await asyncio.sleep(delay)
                 else:
-                    # Shorter delay after failures
-                    await asyncio.sleep(0.5)
+                    # Longer delay after failures to avoid immediate retry with same proxy
+                    delay = 2.0 + random.uniform(0, 1)  # 2-3 seconds
+                    logger.debug(f"   [THROTTLE] Waiting {delay:.1f}s after failure before next location")
+                    await asyncio.sleep(delay)
             
             # Retry failed locations once if there are any
             if failed_locations:
                 logger.info(f"[RETRY] Retrying {len(failed_locations)} failed location(s)...")
                 retry_failed_locations = []
                 
-                for failed_location_entry in failed_locations:
+                for idx, failed_location_entry in enumerate(failed_locations):
                     location = failed_location_entry["location"]
                     failed_location_entry["retry_count"] = failed_location_entry.get("retry_count", 0) + 1
+                    
+                    # Anti-blocking: Add delay before retry (exponential backoff)
+                    if idx > 0:
+                        retry_delay = random.uniform(5.0, 10.0)  # 5-10 seconds between retries
+                        logger.debug(f"[RETRY] Waiting {retry_delay:.1f}s before retrying location {location}")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        # First retry: shorter delay but still significant
+                        retry_delay = random.uniform(3.0, 6.0)  # 3-6 seconds
+                        logger.debug(f"[RETRY] Waiting {retry_delay:.1f}s before first retry")
+                        await asyncio.sleep(retry_delay)
+                    
+                    # Anti-blocking: Rotate proxy on retry to get a fresh session
+                    if getattr(settings, "USE_DATAIMPULSE", False):
+                        logger.info(f"[RETRY] Rotating proxy for retry of location {location}...")
+                        proxy_config = await self.get_proxy_config(job)
+                        if proxy_config:
+                            logger.info(f"[RETRY] Using new proxy: {proxy_config.get('proxy_host')}:{proxy_config.get('proxy_port')} username={proxy_config.get('proxy_username')}")
                     
                     # Reset timeout tracking for retry
                     location_last_update[location] = datetime.utcnow()
@@ -1108,8 +1130,10 @@ class MLSScraper:
                     )
                     logger.debug(f"   [DB-UPDATE] Job status updated successfully")
                     
-                    # Reduced delay for faster response
-                    await asyncio.sleep(0.5)
+                    # Anti-blocking: Increased delay after processing location to avoid rapid requests
+                    post_location_delay = random.uniform(1.0, 2.0)  # 1-2 seconds
+                    logger.debug(f"   [THROTTLE] Waiting {post_location_delay:.1f}s after processing location")
+                    await asyncio.sleep(post_location_delay)
                     
                 except Exception as e:
                     error_msg = str(e)
@@ -1519,6 +1543,11 @@ class MLSScraper:
             proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
             logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
             
+            # Anti-blocking: Add random delay (2-5 seconds) before scraping to avoid rapid-fire requests
+            pre_scrape_delay = random.uniform(2.0, 5.0)
+            logger.debug(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping to avoid blocking")
+            await asyncio.sleep(pre_scrape_delay)
+            
             # Scrape properties - Run blocking call in thread pool
             timeout_seconds = 600  # 10 minutes timeout for all listing types combined
             loop = asyncio.get_event_loop()
@@ -1582,13 +1611,30 @@ class MLSScraper:
             if should_try_fallback:
                 fallback_reason = scrape_error if scrape_error else "returned 0 properties"
                 logger.warning(f"   [FALLBACK] Combined listing_types call {fallback_reason}. Trying individual calls for each listing type...")
+                
+                # Anti-blocking: Rotate proxy on fallback retry to get a fresh session
+                if proxy_config:
+                    logger.info(f"   [FALLBACK] Rotating proxy for fallback retry...")
+                    proxy_config = await self.get_proxy_config(job)
+                    if proxy_config:
+                        logger.info(f"   [FALLBACK] Using new proxy: {proxy_config.get('proxy_host')}:{proxy_config.get('proxy_port')} username={proxy_config.get('proxy_username')}")
+                
                 properties_by_type_fallback: Dict[str, List[Property]] = {lt: [] for lt in listing_types}
                 
-                for listing_type in listing_types:
+                for idx, listing_type in enumerate(listing_types):
                     try:
+                        # Anti-blocking: Add delay between fallback calls (except before first)
+                        if idx > 0:
+                            fallback_delay = random.uniform(3.0, 6.0)  # 3-6 seconds between calls
+                            logger.debug(f"   [THROTTLE] Waiting {fallback_delay:.1f}s before fallback call for '{listing_type}'")
+                            await asyncio.sleep(fallback_delay)
+                        
                         # Create params for individual listing type call
                         individual_params = scrape_params.copy()
                         individual_params["listing_type"] = listing_type  # Single string, not list
+                        # Update proxy if we rotated it
+                        if proxy_config:
+                            individual_params["proxy"] = proxy_config.get("proxy_url")
                         # Remove parameters that might not be needed for individual calls
                         if "sort_by" in individual_params:
                             del individual_params["sort_by"]
@@ -1623,8 +1669,16 @@ class MLSScraper:
                             logger.warning(f"   [FALLBACK] Individual call for '{listing_type}' returned empty result")
                     except Exception as e:
                         error_type = type(e).__name__
-                        logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type})")
+                        blocked_by_realtor = _is_realtor_block_exception(e)
+                        logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type}, Blocked: {blocked_by_realtor})")
                         logger.debug(f"   [FALLBACK] Full traceback: {traceback.format_exc()}")
+                        
+                        # Anti-blocking: If blocked, add exponential backoff before next fallback call
+                        if blocked_by_realtor and idx < len(listing_types) - 1:
+                            backoff_delay = min(10.0 * (2 ** idx), 60.0)  # Exponential backoff, max 60s
+                            logger.warning(f"   [THROTTLE] Blocked by Realtor.com, waiting {backoff_delay:.1f}s before next fallback call")
+                            await asyncio.sleep(backoff_delay)
+                        
                         continue
                 
                 # If fallback got results, use them
