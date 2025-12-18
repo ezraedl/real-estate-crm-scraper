@@ -8,14 +8,15 @@ import os
 from pathlib import Path
 
 # Add current directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+project_root = Path(__file__).resolve().parent
+sys.path.insert(0, str(project_root))
 
 try:
     from config import settings
     from proxy_manager import proxy_manager
     import asyncio
 except ImportError as e:
-    print(f"❌ Failed to import required modules: {e}")
+    print(f"[ERR] Failed to import required modules: {e}")
     sys.exit(1)
 
 async def check_proxy_config():
@@ -37,19 +38,19 @@ async def check_proxy_config():
     password = getattr(settings, 'DATAIMPULSE_PASSWORD', '')
     endpoint = getattr(settings, 'DATAIMPULSE_ENDPOINT', '')
     
-    print(f"\n2. DATAIMPULSE_LOGIN: {'✅ Set' if login else '❌ Missing'}")
+    print(f"\n2. DATAIMPULSE_LOGIN: {'[OK] Set' if login else '[ERR] Missing'}")
     if login:
         print(f"   Value: {login[:10]}..." if len(login) > 10 else f"   Value: {login}")
     else:
         print("   ⚠️  Set DATAIMPULSE_LOGIN in your .env file")
     
-    print(f"\n3. DATAIMPULSE_PASSWORD: {'✅ Set' if password else '❌ Missing'}")
+    print(f"\n3. DATAIMPULSE_PASSWORD: {'[OK] Set' if password else '[ERR] Missing'}")
     if password:
         print(f"   Value: {'*' * min(len(password), 10)}...")
     else:
         print("   ⚠️  Set DATAIMPULSE_PASSWORD in your .env file")
     
-    print(f"\n4. DATAIMPULSE_ENDPOINT: {'✅ Set' if endpoint else '❌ Missing'}")
+    print(f"\n4. DATAIMPULSE_ENDPOINT: {'[OK] Set' if endpoint else '[ERR] Missing'}")
     if endpoint:
         print(f"   Value: {endpoint}")
     else:
@@ -57,7 +58,7 @@ async def check_proxy_config():
     
     # Check if all required fields are set
     if not login or not password or not endpoint:
-        print("\n❌ Configuration incomplete. Please set all required DataImpulse variables:")
+        print("\n[ERR] Configuration incomplete. Please set all required DataImpulse variables:")
         print("   DATAIMPULSE_LOGIN=your_login")
         print("   DATAIMPULSE_PASSWORD=your_password")
         print("   DATAIMPULSE_ENDPOINT=gw.dataimpulse.com:823")
@@ -70,7 +71,7 @@ async def check_proxy_config():
         success = await proxy_manager.initialize_dataimpulse_proxies(login)
         if success:
             proxy_count = len(proxy_manager.proxies)
-            print(f"   ✅ Successfully initialized {proxy_count} proxy configurations")
+            print(f"   [OK] Successfully initialized {proxy_count} proxy configurations")
             
             # Show proxy details
             print("\n   Proxy configurations:")
@@ -81,24 +82,24 @@ async def check_proxy_config():
             print("\n6. Testing proxy retrieval...")
             test_proxy = proxy_manager.get_next_proxy()
             if test_proxy:
-                print(f"   ✅ Successfully retrieved proxy: {test_proxy.username}@{test_proxy.host}:{test_proxy.port}")
+                print(f"   [OK] Successfully retrieved proxy: {test_proxy.username}@{test_proxy.host}:{test_proxy.port}")
                 
                 # Build proxy URL
                 proxy_url = f"http://{test_proxy.username}:{test_proxy.password}@{test_proxy.host}:{test_proxy.port}"
                 print(f"   Proxy URL format: http://{test_proxy.username}:****@{test_proxy.host}:{test_proxy.port}")
             else:
-                print("   ❌ Failed to retrieve proxy")
+                print("   [ERR] Failed to retrieve proxy")
                 return False
             
             print("\n" + "="*80)
-            print("✅ DataImpulse proxy is properly configured and ready to use!")
+            print("[OK] DataImpulse proxy is properly configured and ready to use!")
             print("="*80)
             return True
         else:
-            print("   ❌ Failed to initialize proxies")
+            print("   [ERR] Failed to initialize proxies")
             return False
     except Exception as e:
-        print(f"   ❌ Error initializing proxies: {e}")
+        print(f"   [ERR] Error initializing proxies: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -112,7 +113,7 @@ def main():
         print("\n\nInterrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"\n[ERR] Unexpected error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
