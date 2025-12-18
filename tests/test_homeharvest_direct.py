@@ -18,7 +18,8 @@ if sys.platform == 'win32':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Add current directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
 
 try:
     from homeharvest import scrape_property

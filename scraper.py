@@ -4,6 +4,19 @@ import re
 import time
 import logging
 import traceback
+import secrets
+
+def _is_realtor_block_exception(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "retryerror" in name or "retryerror" in msg:
+        return True
+    if "403" in msg or "forbidden" in msg:
+        return True
+    if "realtor" in msg and ("blocked" in msg or "forbidden" in msg):
+        return True
+    return False
+
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -934,6 +947,47 @@ class MLSScraper:
                             current_proxy_config = await self.get_proxy_config(job)
                             if current_proxy_config:
                                 proxy_config = current_proxy_config  # Update for next location
+                    # Proxy enforcement + sanitized logging
+                    from config import settings
+                    proxy_url = (current_proxy_config or {}).get("proxy_url")
+                    proxy_host = (current_proxy_config or {}).get("proxy_host")
+                    proxy_port = (current_proxy_config or {}).get("proxy_port")
+                    proxy_username = (current_proxy_config or {}).get("proxy_username")
+                    proxy_used = bool(proxy_url)
+
+                    if getattr(settings, "USE_DATAIMPULSE", False) and not proxy_used:
+                        # Don't crash the job; mark this location/types as failed and continue.
+                        error_msg = "USE_DATAIMPULSE=true but no proxy_url could be resolved for this location."
+                        error_type = "ProxyMissing"
+                        logger.error(f"   [PROXY ERROR] {error_msg}")
+
+                        if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                            location_entry = progress_logs["locations"][location_idx]
+                            location_entry["status"] = "failed"
+                            location_entry["error"] = error_msg
+                            location_entry["error_type"] = error_type
+                            location_entry["proxy_used"] = False
+                            location_entry["proxy_username"] = proxy_username
+                            location_entry["timestamp"] = datetime.utcnow().isoformat()
+                            for lt in listing_types_to_scrape:
+                                if lt in location_entry.get("listing_types", {}):
+                                    location_entry["listing_types"][lt]["error"] = error_msg
+                                    location_entry["listing_types"][lt]["error_type"] = error_type
+
+                        await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        return {
+                            "inserted": 0,
+                            "updated": 0,
+                            "skipped": 0,
+                            "enriched": 0,
+                            "off_market": 0,
+                            "failed": True,
+                            "error": error_msg,
+                        }
+
+                    if proxy_used:
+                        logger.info(f"   [PROXY] Using proxy {proxy_host}:{proxy_port} username={proxy_username}")
+
                     
                     start_time = datetime.utcnow()
                     logger.info(f"   [FETCH] Fetching all listing types ({', '.join(listing_types_to_scrape)}) from {location} in a single request...")
@@ -971,6 +1025,23 @@ class MLSScraper:
                         all_properties_by_type = {lt: [] for lt in listing_types_to_scrape}  # Empty results for all types
                     
                     end_time = datetime.utcnow()
+                    location_total_found = sum(len(v) for v in all_properties_by_type.values())
+                    was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
+                    if was_full_scrape is True and location_total_found == 0:
+                        error_msg = "COMPLETED_WITH_ERRORS: Full scrape returned 0 properties for this location."
+                        error_type = "ZeroResultsFullScrape"
+                        logger.warning(f"   [ZERO] {error_msg}")
+                        if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                            le = progress_logs["locations"][location_idx]
+                            le["status"] = "failed"
+                            le["error"] = error_msg
+                            le["error_type"] = error_type
+                            le["timestamp"] = datetime.utcnow().isoformat()
+                            for lt in listing_types_to_scrape:
+                                if lt in le.get("listing_types", {}):
+                                    le["listing_types"][lt]["error"] = error_msg
+                                    le["listing_types"][lt]["error_type"] = error_type
+                        await db.update_job_status(job.job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                     duration = (end_time - start_time).total_seconds()
                     
                     # Process each listing type's results
@@ -1043,6 +1114,7 @@ class MLSScraper:
                 except Exception as e:
                     error_msg = str(e)
                     error_type = type(e).__name__
+                    blocked_by_realtor = _is_realtor_block_exception(e)
                     logger.warning(f"   [WARNING] Error scraping all listing types in {location}: {error_msg}")
                     logger.debug(f"   [WARNING] Full traceback: {traceback.format_exc()}")
                     # Log the error for all listing types
@@ -1053,6 +1125,7 @@ class MLSScraper:
                             "properties_found": 0,
                             "error": error_msg,
                             "error_type": error_type,
+                            "blocked_by_realtor": blocked_by_realtor,
                             "timestamp": datetime.utcnow().isoformat()
                         }
                         listing_type_logs.append(error_log)
@@ -1441,7 +1514,10 @@ class MLSScraper:
             
             # Log the exact parameters being passed to homeharvest for debugging
             log_params = {k: v for k, v in scrape_params.items() if k != "proxy"}
-            logger.info(f"   [HOMEHARVEST] Calling scrape_property with {log_params}")
+            proxy_enabled = bool(scrape_params.get("proxy"))
+            proxy_host = (proxy_config or {}).get("proxy_host") if proxy_enabled else None
+            proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
             
             # Scrape properties - Run blocking call in thread pool
             timeout_seconds = 600  # 10 minutes timeout for all listing types combined
@@ -1889,7 +1965,10 @@ class MLSScraper:
             
             # Log the exact parameters being passed to homeharvest for debugging
             log_params = {k: v for k, v in scrape_params.items() if k != "proxy"}  # Don't log proxy URL
-            logger.info(f"   [HOMEHARVEST] Calling scrape_property with {log_params}")
+            proxy_enabled = bool(scrape_params.get("proxy"))
+            proxy_host = (proxy_config or {}).get("proxy_host") if proxy_enabled else None
+            proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
             
             # Remove all filtering parameters to get ALL properties
             # Note: We're not setting foreclosure=False, exclude_pending=False, etc.
@@ -2194,15 +2273,22 @@ class MLSScraper:
                 return None
             
             # Build proxy URL
-            if proxy.username and proxy.password:
-                proxy_url = f"http://{proxy.username}:{proxy.password}@{proxy.host}:{proxy.port}"
+            # Build proxy URL
+            proxy_username = proxy.username
+            # DataImpulse: add a random session per location/run so successive requests don't share the same session.
+            # This is best-effort rotation and helps reduce Realtor.com blocking.
+            if proxy_username and 'session.' not in proxy_username:
+                proxy_username = f"{proxy_username};session.{secrets.randbelow(1_000_000)}"
+
+            if proxy_username and proxy.password:
+                proxy_url = f"http://{proxy_username}:{proxy.password}@{proxy.host}:{proxy.port}"
             else:
                 proxy_url = f"http://{proxy.host}:{proxy.port}"
-            
             return {
                 "proxy_url": proxy_url,
                 "proxy_host": proxy.host,
-                "proxy_port": proxy.port
+                "proxy_port": proxy.port,
+                "proxy_username": proxy_username,
             }
             
         except Exception as e:
