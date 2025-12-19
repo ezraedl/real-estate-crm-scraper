@@ -40,6 +40,178 @@ class MLSScraper:
         self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
         # Track if job runs were full scrapes (keyed by job_id)
         self.job_run_flags: Dict[str, Dict[str, Any]] = {}
+        # Store cookies per proxy session to maintain session state (key: proxy_username, value: cookies dict)
+        self.session_cookies: Dict[str, Dict[str, str]] = {}
+    
+    def _get_browser_headers(self) -> Dict[str, str]:
+        """Get random browser headers to avoid anti-bot detection"""
+        from proxy_manager import proxy_manager
+        random_headers = proxy_manager.get_random_headers()
+        # Add Referer to make it look like navigation from Realtor.com
+        random_headers["Referer"] = "https://www.realtor.com/"
+        
+        # Ensure Sec-Fetch headers are present for modern browsers (Chrome/Edge)
+        if "Chrome" in random_headers.get("User-Agent", "") and "Sec-Fetch-Dest" not in random_headers:
+            random_headers["Sec-Fetch-Dest"] = "document"
+            random_headers["Sec-Fetch-Mode"] = "navigate"
+            random_headers["Sec-Fetch-Site"] = "same-origin"
+            random_headers["Sec-Fetch-User"] = "?1"
+        
+        # Add viewport-related headers for better mobile/desktop consistency
+        if "Mobile" not in random_headers.get("User-Agent", ""):
+            # Desktop browser - add viewport width hint
+            random_headers["Viewport-Width"] = str(random.choice([1920, 2560, 1440, 1366, 1536]))
+        
+        return random_headers
+    
+    def _patch_requests_with_headers(self, headers: Dict[str, str], cookies: Optional[Dict[str, str]] = None):
+        """Monkey-patch requests library to add browser headers, cookies, and TLS fingerprinting"""
+        try:
+            # Try to use curl_cffi first for TLS fingerprinting (mimics real browser TLS)
+            # curl_cffi provides requests-compatible API with real browser TLS fingerprints
+            try:
+                from curl_cffi import requests as curl_requests
+                import requests
+                
+                # curl_cffi has requests-compatible API with TLS fingerprinting
+                # Use it to replace requests for better anti-bot evasion
+                original_get = requests.get
+                original_post = requests.post
+                original_request = requests.request
+                
+                # Determine browser type from User-Agent for TLS fingerprint
+                user_agent = headers.get("User-Agent", "")
+                if "Chrome" in user_agent:
+                    impersonate = "chrome120"  # Chrome 120 TLS fingerprint
+                elif "Firefox" in user_agent:
+                    impersonate = "firefox120"  # Firefox 120 TLS fingerprint
+                elif "Safari" in user_agent:
+                    impersonate = "safari17_0"  # Safari 17 TLS fingerprint
+                else:
+                    impersonate = "chrome120"  # Default to Chrome
+                
+                # Create a session-like cookie jar for this request
+                cookie_jar = requests.cookies.RequestsCookieJar()
+                if cookies:
+                    for name, value in cookies.items():
+                        cookie_jar.set(name, value, domain='.realtor.com', path='/')
+                
+                def patched_get(*args, **kwargs):
+                    if 'headers' not in kwargs:
+                        kwargs['headers'] = {}
+                    kwargs['headers'].update(headers)
+                    # Merge cookies if not already provided
+                    if 'cookies' not in kwargs and cookie_jar:
+                        if isinstance(kwargs.get('cookies'), dict):
+                            kwargs['cookies'].update(dict(cookie_jar))
+                        else:
+                            kwargs['cookies'] = cookie_jar
+                    # Use curl_cffi with TLS fingerprinting
+                    kwargs['impersonate'] = impersonate
+                    return curl_requests.get(*args, **kwargs)
+                
+                def patched_post(*args, **kwargs):
+                    if 'headers' not in kwargs:
+                        kwargs['headers'] = {}
+                    kwargs['headers'].update(headers)
+                    # Merge cookies if not already provided
+                    if 'cookies' not in kwargs and cookie_jar:
+                        if isinstance(kwargs.get('cookies'), dict):
+                            kwargs['cookies'].update(dict(cookie_jar))
+                        else:
+                            kwargs['cookies'] = cookie_jar
+                    # Use curl_cffi with TLS fingerprinting
+                    kwargs['impersonate'] = impersonate
+                    return curl_requests.post(*args, **kwargs)
+                
+                def patched_request(*args, **kwargs):
+                    if 'headers' not in kwargs:
+                        kwargs['headers'] = {}
+                    kwargs['headers'].update(headers)
+                    # Merge cookies if not already provided
+                    if 'cookies' not in kwargs and cookie_jar:
+                        if isinstance(kwargs.get('cookies'), dict):
+                            kwargs['cookies'].update(dict(cookie_jar))
+                        else:
+                            kwargs['cookies'] = cookie_jar
+                    # Use curl_cffi with TLS fingerprinting
+                    kwargs['impersonate'] = impersonate
+                    return curl_requests.request(*args, **kwargs)
+                
+                # Apply patches
+                requests.get = patched_get
+                requests.post = patched_post
+                requests.request = patched_request
+                
+                logger.debug(f"   [TLS] Using curl_cffi with {impersonate} TLS fingerprint for better anti-bot evasion")
+                return (original_get, original_post, original_request)
+                
+            except ImportError:
+                # Fallback to regular requests if curl_cffi not available
+                import requests
+                from http.cookiejar import CookieJar
+                
+                original_get = requests.get
+                original_post = requests.post
+                original_request = requests.request
+                
+                # Create a session-like cookie jar for this request
+                cookie_jar = requests.cookies.RequestsCookieJar()
+                if cookies:
+                    for name, value in cookies.items():
+                        cookie_jar.set(name, value, domain='.realtor.com', path='/')
+                
+                def patched_get(*args, **kwargs):
+                    if 'headers' not in kwargs:
+                        kwargs['headers'] = {}
+                    kwargs['headers'].update(headers)
+                    # Merge cookies if not already provided
+                    if 'cookies' not in kwargs and cookie_jar:
+                        if isinstance(kwargs.get('cookies'), dict):
+                            kwargs['cookies'].update(dict(cookie_jar))
+                        else:
+                            kwargs['cookies'] = cookie_jar
+                    return original_get(*args, **kwargs)
+                
+                def patched_post(*args, **kwargs):
+                    if 'headers' not in kwargs:
+                        kwargs['headers'] = {}
+                    kwargs['headers'].update(headers)
+                    # Merge cookies if not already provided
+                    if 'cookies' not in kwargs and cookie_jar:
+                        if isinstance(kwargs.get('cookies'), dict):
+                            kwargs['cookies'].update(dict(cookie_jar))
+                        else:
+                            kwargs['cookies'] = cookie_jar
+                    return original_post(*args, **kwargs)
+                
+                def patched_request(*args, **kwargs):
+                    if 'headers' not in kwargs:
+                        kwargs['headers'] = {}
+                    kwargs['headers'].update(headers)
+                    # Merge cookies if not already provided
+                    if 'cookies' not in kwargs and cookie_jar:
+                        if isinstance(kwargs.get('cookies'), dict):
+                            kwargs['cookies'].update(dict(cookie_jar))
+                        else:
+                            kwargs['cookies'] = cookie_jar
+                    return original_request(*args, **kwargs)
+                
+                # Apply patches
+                requests.get = patched_get
+                requests.post = patched_post
+                requests.request = patched_request
+                
+                logger.warning(f"   [TLS] curl_cffi not available, using regular requests (install curl-cffi for TLS fingerprinting)")
+                return (original_get, original_post, original_request)
+        except ImportError:
+            return None
+    
+    def _restore_requests(self, original_funcs):
+        """Restore original requests functions"""
+        if original_funcs:
+            import requests
+            requests.get, requests.post, requests.request = original_funcs
     
     async def start(self):
         """Start the scraper service"""
@@ -235,8 +407,15 @@ class MLSScraper:
             successful_locations = 0
             last_progress_log_time = datetime.utcnow()
             
+            # Anti-blocking: Randomize location order to avoid predictable patterns
+            # This makes the scraper look less like an automated bot
+            locations_to_process = job.locations.copy()
+            if len(locations_to_process) > 1:
+                random.shuffle(locations_to_process)
+                logger.info(f"[ANTI-BOT] Randomized order of {len(locations_to_process)} locations to avoid detection")
+            
             # Process each location
-            for i, location in enumerate(job.locations):
+            for i, location in enumerate(locations_to_process):
                 # Check if job has been cancelled (via background monitor)
                 if cancel_flag.get("cancelled", False):
                     logger.info(f"Job {job.job_id} was cancelled, stopping execution")
@@ -320,7 +499,6 @@ class MLSScraper:
                         location_failed = True
                         location_error = str(e)
                         logger.error(f"Error scraping location {location}: {e}")
-                        import traceback
                         error_traceback = traceback.format_exc()
                         logger.debug(f"Traceback: {error_traceback}")
                 
@@ -372,16 +550,21 @@ class MLSScraper:
                     )
                     last_progress_log_time = now
                 
-                # Random delay between locations (even failed ones to avoid hammering)
-                # Increased delays to reduce blocking: 3-5 seconds between locations
+                # Random delay between locations with human-like variation
+                # Increased delays significantly to reduce blocking: 10-20 seconds between locations
+                # Add variation: sometimes user "reads" results (longer), sometimes quick navigation (shorter)
                 if not location_failed:
-                    delay = max(job.request_delay, 3.0) + random.uniform(0, 2)  # 3-5 seconds
-                    logger.debug(f"   [THROTTLE] Waiting {delay:.1f}s before next location to avoid blocking")
+                    if random.random() < 0.2:  # 20% chance of "reading" delay
+                        delay = random.uniform(15.0, 25.0)  # User reviewing results
+                    else:
+                        delay = max(job.request_delay, 10.0) + random.uniform(0, 5)  # 10-15 seconds normal
+                    logger.info(f"   [THROTTLE] Waiting {delay:.1f}s before next location (human-like pattern)")
                     await asyncio.sleep(delay)
                 else:
                     # Longer delay after failures to avoid immediate retry with same proxy
-                    delay = 2.0 + random.uniform(0, 1)  # 2-3 seconds
-                    logger.debug(f"   [THROTTLE] Waiting {delay:.1f}s after failure before next location")
+                    # Add jitter to make it less predictable
+                    delay = 5.0 + random.uniform(0, 5)  # 5-10 seconds (increased from 5-8)
+                    logger.info(f"   [THROTTLE] Waiting {delay:.1f}s after failure before next location")
                     await asyncio.sleep(delay)
             
             # Retry failed locations once if there are any
@@ -394,14 +577,23 @@ class MLSScraper:
                     failed_location_entry["retry_count"] = failed_location_entry.get("retry_count", 0) + 1
                     
                     # Anti-blocking: Add delay before retry (exponential backoff)
+                    # Increased delays significantly for better blocking resistance
                     if idx > 0:
-                        retry_delay = random.uniform(5.0, 10.0)  # 5-10 seconds between retries
-                        logger.debug(f"[RETRY] Waiting {retry_delay:.1f}s before retrying location {location}")
+                        # Retry with exponential backoff and human-like variation
+                        # Add variation to make retries less predictable
+                        if random.random() < 0.3:  # 30% chance of longer "cooldown" delay
+                            retry_delay = random.uniform(20.0, 30.0)  # Extended cooldown
+                        else:
+                            retry_delay = random.uniform(15.0, 25.0)  # 15-25 seconds between retries
+                        logger.info(f"[RETRY] Waiting {retry_delay:.1f}s before retrying location {location} (human-like backoff)")
                         await asyncio.sleep(retry_delay)
                     else:
-                        # First retry: shorter delay but still significant
-                        retry_delay = random.uniform(3.0, 6.0)  # 3-6 seconds
-                        logger.debug(f"[RETRY] Waiting {retry_delay:.1f}s before first retry")
+                        # First retry: longer delay to let proxy/IP cool down with variation
+                        if random.random() < 0.25:  # 25% chance of longer initial cooldown
+                            retry_delay = random.uniform(12.0, 18.0)  # Extended initial cooldown
+                        else:
+                            retry_delay = random.uniform(10.0, 15.0)  # 10-15 seconds normal
+                        logger.info(f"[RETRY] Waiting {retry_delay:.1f}s before first retry (human-like)")
                         await asyncio.sleep(retry_delay)
                     
                     # Anti-blocking: Rotate proxy on retry to get a fresh session
@@ -1130,9 +1322,13 @@ class MLSScraper:
                     )
                     logger.debug(f"   [DB-UPDATE] Job status updated successfully")
                     
-                    # Anti-blocking: Increased delay after processing location to avoid rapid requests
-                    post_location_delay = random.uniform(1.0, 2.0)  # 1-2 seconds
-                    logger.debug(f"   [THROTTLE] Waiting {post_location_delay:.1f}s after processing location")
+                    # Anti-blocking: Increased delay after processing location with human-like variation
+                    # Add variation: sometimes user "processes" results (longer), sometimes quick (shorter)
+                    if random.random() < 0.15:  # 15% chance of longer "processing" delay
+                        post_location_delay = random.uniform(6.0, 10.0)  # User "processing" results
+                    else:
+                        post_location_delay = random.uniform(3.0, 6.0)  # Normal post-processing
+                    logger.info(f"   [THROTTLE] Waiting {post_location_delay:.1f}s after processing location (human-like)")
                     await asyncio.sleep(post_location_delay)
                     
                 except Exception as e:
@@ -1307,7 +1503,6 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"Error scraping location {location}: {e}")
-            import traceback
             error_traceback = traceback.format_exc()
             logger.debug(f"Traceback: {error_traceback}")
             
@@ -1536,16 +1731,26 @@ class MLSScraper:
             if proxy_config:
                 scrape_params["proxy"] = proxy_config.get("proxy_url")
             
+            # Anti-blocking: Add realistic browser headers to avoid detection
+            # Realtor.com uses Kasada anti-bot protection that checks headers
+            browser_headers = self._get_browser_headers()
+            
             # Log the exact parameters being passed to homeharvest for debugging
             log_params = {k: v for k, v in scrape_params.items() if k != "proxy"}
             proxy_enabled = bool(scrape_params.get("proxy"))
             proxy_host = (proxy_config or {}).get("proxy_host") if proxy_enabled else None
             proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
-            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
+            user_agent = browser_headers.get("User-Agent", "N/A")[:50]
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} user_agent={user_agent}... params={log_params}")
             
-            # Anti-blocking: Add random delay (2-5 seconds) before scraping to avoid rapid-fire requests
-            pre_scrape_delay = random.uniform(2.0, 5.0)
-            logger.debug(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping to avoid blocking")
+            # Anti-blocking: Add random delay with human-like variation before scraping
+            # Use a more realistic delay pattern: sometimes faster (3-7s), sometimes slower (8-15s)
+            # This mimics real user behavior better than uniform delays
+            if random.random() < 0.3:  # 30% chance of slower "reading" delay
+                pre_scrape_delay = random.uniform(8.0, 15.0)  # User "reading" the page
+            else:
+                pre_scrape_delay = random.uniform(3.0, 7.0)  # Quick navigation
+            logger.info(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping (human-like delay)")
             await asyncio.sleep(pre_scrape_delay)
             
             # Scrape properties - Run blocking call in thread pool
@@ -1554,6 +1759,16 @@ class MLSScraper:
             
             properties_df = None
             scrape_error = None
+            
+            # Get or create session cookies for this proxy to maintain session state
+            proxy_username = (proxy_config or {}).get("proxy_username", "default")
+            session_cookies = self.session_cookies.get(proxy_username, {})
+            
+            # Monkey-patch requests library to add browser headers and cookies (homeharvest uses requests internally)
+            # This makes requests look like they come from a real browser with session cookies
+            original_funcs = self._patch_requests_with_headers(browser_headers, cookies=session_cookies if session_cookies else None)
+            if original_funcs:
+                logger.debug(f"   [HEADERS] Patched requests library with browser headers and cookies")
             
             try:
                 properties_df = await asyncio.wait_for(
@@ -1603,6 +1818,10 @@ class MLSScraper:
                 logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
                 scrape_error = error_msg
                 properties_df = None
+            finally:
+                # Restore original functions
+                if original_funcs:
+                    self._restore_requests(original_funcs)
             
             # If the combined call failed or returned empty, try individual calls as fallback
             num_properties_from_combined = len(properties_df) if properties_df is not None and not properties_df.empty else 0
@@ -1623,10 +1842,15 @@ class MLSScraper:
                 
                 for idx, listing_type in enumerate(listing_types):
                     try:
-                        # Anti-blocking: Add delay between fallback calls (except before first)
+                        # Anti-blocking: Add delay between fallback calls with human-like variation
+                        # Increased from 3-6s to 8-15s for better blocking resistance
+                        # Add variation to mimic user behavior
                         if idx > 0:
-                            fallback_delay = random.uniform(3.0, 6.0)  # 3-6 seconds between calls
-                            logger.debug(f"   [THROTTLE] Waiting {fallback_delay:.1f}s before fallback call for '{listing_type}'")
+                            if random.random() < 0.25:  # 25% chance of longer delay
+                                fallback_delay = random.uniform(12.0, 18.0)  # User "thinking" or "reading"
+                            else:
+                                fallback_delay = random.uniform(8.0, 12.0)  # Normal navigation
+                            logger.info(f"   [THROTTLE] Waiting {fallback_delay:.1f}s before fallback call for '{listing_type}' (human-like)")
                             await asyncio.sleep(fallback_delay)
                         
                         # Create params for individual listing type call
@@ -1673,10 +1897,13 @@ class MLSScraper:
                         logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type}, Blocked: {blocked_by_realtor})")
                         logger.debug(f"   [FALLBACK] Full traceback: {traceback.format_exc()}")
                         
-                        # Anti-blocking: If blocked, add exponential backoff before next fallback call
+                        # Anti-blocking: If blocked, add exponential backoff with human-like jitter before next fallback call
                         if blocked_by_realtor and idx < len(listing_types) - 1:
-                            backoff_delay = min(10.0 * (2 ** idx), 60.0)  # Exponential backoff, max 60s
-                            logger.warning(f"   [THROTTLE] Blocked by Realtor.com, waiting {backoff_delay:.1f}s before next fallback call")
+                            base_backoff = min(15.0 * (2 ** idx), 120.0)  # Exponential backoff, max 120s (increased from 60s)
+                            # Add jitter (±20%) to make backoff less predictable
+                            jitter = base_backoff * 0.2 * (random.random() * 2 - 1)  # ±20% variation
+                            backoff_delay = max(5.0, base_backoff + jitter)  # Ensure minimum 5s
+                            logger.warning(f"   [THROTTLE] Blocked by Realtor.com, waiting {backoff_delay:.1f}s before next fallback call (exponential backoff with jitter)")
                             await asyncio.sleep(backoff_delay)
                         
                         continue
@@ -1863,7 +2090,6 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"Error scraping all listing types in {location}: {e}")
-            import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return {lt: [] for lt in listing_types}
     
@@ -2017,12 +2243,16 @@ class MLSScraper:
             if proxy_config:
                 scrape_params["proxy"] = proxy_config.get("proxy_url")
             
+            # Anti-blocking: Add realistic browser headers to avoid detection
+            browser_headers = self._get_browser_headers()
+            
             # Log the exact parameters being passed to homeharvest for debugging
             log_params = {k: v for k, v in scrape_params.items() if k != "proxy"}  # Don't log proxy URL
             proxy_enabled = bool(scrape_params.get("proxy"))
             proxy_host = (proxy_config or {}).get("proxy_host") if proxy_enabled else None
             proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
-            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
+            user_agent = browser_headers.get("User-Agent", "N/A")[:50]
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} user_agent={user_agent}... params={log_params}")
             
             # Remove all filtering parameters to get ALL properties
             # Note: We're not setting foreclosure=False, exclude_pending=False, etc.
@@ -2032,6 +2262,13 @@ class MLSScraper:
             # Add timeout to prevent locations from getting stuck (default 5 minutes per listing type)
             timeout_seconds = 300  # 5 minutes timeout per listing type
             loop = asyncio.get_event_loop()
+            
+            # Get or create session cookies for this proxy to maintain session state
+            proxy_username = (proxy_config or {}).get("proxy_username", "default")
+            session_cookies = self.session_cookies.get(proxy_username, {})
+            
+            # Patch requests with browser headers and cookies
+            original_funcs = self._patch_requests_with_headers(browser_headers, cookies=session_cookies if session_cookies else None)
             
             try:
                 properties_df = await asyncio.wait_for(
@@ -2085,6 +2322,10 @@ class MLSScraper:
                 logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
                 # Re-raise with more context
                 raise Exception(f"HomeHarvest API error: {error_msg}") from e
+            finally:
+                # Restore original functions
+                if original_funcs:
+                    self._restore_requests(original_funcs)
             
             # Convert DataFrame to our Property models
             properties = []
@@ -2386,9 +2627,19 @@ class MLSScraper:
             if proxy_config:
                 scrape_params["proxy"] = proxy_config.get("proxy_url")
             
+            # Anti-blocking: Add realistic browser headers to avoid detection
+            browser_headers = self._get_browser_headers()
+            
+            # Get or create session cookies for this proxy to maintain session state
+            proxy_username = (proxy_config or {}).get("proxy_username", "default")
+            session_cookies = self.session_cookies.get(proxy_username, {})
+            
             # Scrape property - Run blocking call in thread pool
             loop = asyncio.get_event_loop()
             timeout_seconds = 30  # 30 second timeout for direct address query
+            
+            # Patch requests with browser headers and cookies
+            original_funcs = self._patch_requests_with_headers(browser_headers, cookies=session_cookies if session_cookies else None)
             
             try:
                 properties_df = await asyncio.wait_for(
@@ -2401,6 +2652,10 @@ class MLSScraper:
             except asyncio.TimeoutError:
                 print(f"   [TIMEOUT] Querying {formatted_address} timed out")
                 return None
+            finally:
+                # Restore original functions
+                if original_funcs:
+                    self._restore_requests(original_funcs)
             
             # Convert DataFrame to Property model
             if properties_df is not None and not properties_df.empty:
@@ -2742,7 +2997,6 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"   [OFF-MARKET] Error in off-market detection: {e}")
-            import traceback
             logger.debug(f"Traceback: {traceback.format_exc()}")
             return {
                 "missing_checked": 0,
@@ -3015,7 +3269,6 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"   [OFF-MARKET] Error in off-market detection (location-based): {e}")
-            import traceback
             logger.debug(traceback.format_exc())
             return {
                 "missing_checked": 0,
