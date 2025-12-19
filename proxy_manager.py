@@ -30,28 +30,65 @@ class ProxyManager:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
         ]
-        self.headers_templates = [
+        # Browser-specific header templates for better consistency
+        # Headers must match User-Agent to avoid detection
+        self.chrome_headers = [
+            {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Cache-Control": "max-age=0",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Upgrade-Insecure-Requests": "1",
+                "Connection": "keep-alive",
+            },
             {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
+            }
+        ]
+        
+        self.firefox_headers = [
+            {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
                 "Accept-Encoding": "gzip, deflate, br",
                 "DNT": "1",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
-            },
-            {
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "none",
                 "Sec-Fetch-User": "?1",
+            }
+        ]
+        
+        self.safari_headers = [
+            {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             }
         ]
+        
+        # Legacy templates for backward compatibility
+        self.headers_templates = self.chrome_headers
     
     async def initialize_dataimpulse_proxies(self, login: str, password: str = None, endpoint: str = None):
         """Initialize DataImpulse proxies using their direct proxy format"""
@@ -85,46 +122,48 @@ class ProxyManager:
                 port = 823  # Default DataImpulse port
             
             # Create multiple proxy configurations with different targeting
-            # This simulates having multiple proxies by using different targeting parameters
+            # DataImpulse provides RESIDENTIAL proxies by default (__cr.us = country routing = residential)
+            # Residential proxies use real ISP-assigned IPs, making them much harder to detect than datacenter proxies
             
-            # 1. Default proxy (US targeting)
+            # 1. Default residential proxy (US targeting) - RESIDENTIAL
             proxy_us = ProxyConfig(
                 host=host,
                 port=port,
-                username=f"{login}__cr.us",
+                username=f"{login}__cr.us",  # Country routing US = residential proxy
                 password=password
             )
             self.proxies.append(proxy_us)
             
-            # 2. Indianapolis specific proxy
+            # 2. Indianapolis specific residential proxy - RESIDENTIAL
             proxy_indy = ProxyConfig(
                 host=host,
                 port=port,
-                username=f"{login}__cr.us;city.indianapolis",
+                username=f"{login}__cr.us;city.indianapolis",  # City-specific residential
                 password=password
             )
             self.proxies.append(proxy_indy)
             
-            # 3. Anonymous proxy
+            # 3. Anonymous residential proxy - RESIDENTIAL
             proxy_anon = ProxyConfig(
                 host=host,
                 port=port,
-                username=f"{login}__anonymous",
+                username=f"{login}__anonymous",  # Anonymous residential
                 password=password
             )
             self.proxies.append(proxy_anon)
             
-            # 4. Another US proxy with different session
+            # 4. Another US residential proxy with different session - RESIDENTIAL
             proxy_us2 = ProxyConfig(
                 host=host,
                 port=port,
-                username=f"{login}__cr.us;session.2",
+                username=f"{login}__cr.us;session.2",  # Session-based residential
                 password=password
             )
             self.proxies.append(proxy_us2)
             
-            print(f"Initialized {len(self.proxies)} DataImpulse proxy configurations")
+            print(f"Initialized {len(self.proxies)} DataImpulse RESIDENTIAL proxy configurations")
             print(f"Using DataImpulse host: {host}:{port}")
+            print(f"Proxy type: RESIDENTIAL (country routing US)")
             print(f"Proxy targeting: US, Indianapolis, Anonymous, US+Session2")
             return True
                     
@@ -171,9 +210,22 @@ class ProxyManager:
         return random.choice(self.user_agents)
     
     def get_random_headers(self) -> Dict[str, str]:
-        """Get random headers"""
-        headers = random.choice(self.headers_templates).copy()
-        headers["User-Agent"] = self.get_random_user_agent()
+        """Get random headers that match the User-Agent for consistency"""
+        user_agent = self.get_random_user_agent()
+        headers = {}
+        
+        # Match headers to User-Agent type for better anti-bot evasion
+        if "Chrome" in user_agent:
+            headers = random.choice(self.chrome_headers).copy()
+        elif "Firefox" in user_agent or "Gecko" in user_agent:
+            headers = random.choice(self.firefox_headers).copy()
+        elif "Safari" in user_agent and "Chrome" not in user_agent:
+            headers = random.choice(self.safari_headers).copy()
+        else:
+            # Default to Chrome headers
+            headers = random.choice(self.chrome_headers).copy()
+        
+        headers["User-Agent"] = user_agent
         return headers
     
     def mark_proxy_success(self, proxy: ProxyConfig):
