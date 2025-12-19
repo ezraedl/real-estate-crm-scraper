@@ -5,6 +5,18 @@ import time
 import logging
 import traceback
 import secrets
+import os
+
+# Ensure curl_cffi is available and configured for anti-bot measures
+# homeharvest should automatically use curl_cffi if available
+_curl_cffi_available = False
+try:
+    import curl_cffi
+    _curl_cffi_available = True
+    # Set environment variable to ensure curl_cffi is used (if homeharvest checks for it)
+    os.environ.setdefault("HOMEHARVEST_USE_CURL_CFFI", "true")
+except ImportError:
+    _curl_cffi_available = False
 
 def _is_realtor_block_exception(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -30,6 +42,12 @@ from proxy_manager import proxy_manager
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# Log curl_cffi availability at module load
+if _curl_cffi_available:
+    logger.info("✅ curl_cffi is available - TLS fingerprinting should be enabled for anti-bot measures")
+else:
+    logger.warning("⚠️  curl_cffi is not available - anti-bot measures may be limited. Install with: pip install curl-cffi")
 
 class MLSScraper:
     def __init__(self):
@@ -1140,7 +1158,11 @@ class MLSScraper:
                     error_type = type(e).__name__
                     blocked_by_realtor = _is_realtor_block_exception(e)
                     logger.warning(f"   [WARNING] Error scraping all listing types in {location}: {error_msg}")
-                    logger.debug(f"   [WARNING] Full traceback: {traceback.format_exc()}")
+                    try:
+                        import traceback as tb
+                        logger.debug(f"   [WARNING] Full traceback: {tb.format_exc()}")
+                    except Exception:
+                        logger.debug(f"   [WARNING] Could not format traceback")
                     # Log the error for all listing types
                     for listing_type in listing_types_to_scrape:
                         error_log = {
@@ -1541,7 +1563,8 @@ class MLSScraper:
             proxy_enabled = bool(scrape_params.get("proxy"))
             proxy_host = (proxy_config or {}).get("proxy_host") if proxy_enabled else None
             proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
-            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
+            curl_cffi_status = "✅ enabled" if _curl_cffi_available else "❌ not available"
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} curl_cffi={curl_cffi_status} params={log_params}")
             
             # Anti-blocking: Add random delay (2-5 seconds) before scraping to avoid rapid-fire requests
             pre_scrape_delay = random.uniform(2.0, 5.0)
@@ -1600,7 +1623,12 @@ class MLSScraper:
                 error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
                 error_type = type(e).__name__
                 logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
-                logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
+                try:
+                    import traceback as tb
+                    logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {tb.format_exc()}")
+                except Exception:
+                    # Fallback if traceback import fails
+                    logger.debug(f"   [HOMEHARVEST ERROR] Could not format traceback")
                 scrape_error = error_msg
                 properties_df = None
             
@@ -1671,7 +1699,11 @@ class MLSScraper:
                         error_type = type(e).__name__
                         blocked_by_realtor = _is_realtor_block_exception(e)
                         logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type}, Blocked: {blocked_by_realtor})")
-                        logger.debug(f"   [FALLBACK] Full traceback: {traceback.format_exc()}")
+                        try:
+                            import traceback as tb
+                            logger.debug(f"   [FALLBACK] Full traceback: {tb.format_exc()}")
+                        except Exception:
+                            logger.debug(f"   [FALLBACK] Could not format traceback")
                         
                         # Anti-blocking: If blocked, add exponential backoff before next fallback call
                         if blocked_by_realtor and idx < len(listing_types) - 1:
@@ -2022,7 +2054,8 @@ class MLSScraper:
             proxy_enabled = bool(scrape_params.get("proxy"))
             proxy_host = (proxy_config or {}).get("proxy_host") if proxy_enabled else None
             proxy_port = (proxy_config or {}).get("proxy_port") if proxy_enabled else None
-            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} params={log_params}")
+            curl_cffi_status = "✅ enabled" if _curl_cffi_available else "❌ not available"
+            logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} curl_cffi={curl_cffi_status} params={log_params}")
             
             # Remove all filtering parameters to get ALL properties
             # Note: We're not setting foreclosure=False, exclude_pending=False, etc.
@@ -2082,7 +2115,11 @@ class MLSScraper:
                 error_msg = f"HomeHarvest/Realtor error for {listing_type} in {location}: {str(e)}"
                 error_type = type(e).__name__
                 logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
-                logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {traceback.format_exc()}")
+                try:
+                    import traceback as tb
+                    logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {tb.format_exc()}")
+                except Exception:
+                    logger.debug(f"   [HOMEHARVEST ERROR] Could not format traceback")
                 # Re-raise with more context
                 raise Exception(f"HomeHarvest API error: {error_msg}") from e
             
@@ -2105,7 +2142,11 @@ class MLSScraper:
             error_msg = str(e)
             error_type = type(e).__name__
             logger.error(f"Error scraping {listing_type} properties in {location}: {error_msg}")
-            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            try:
+                import traceback as tb
+                logger.debug(f"Full traceback: {tb.format_exc()}")
+            except Exception:
+                logger.debug(f"Could not format traceback")
             
             # Store error in progress_logs if available (note: progress_logs is handled at caller level)
             # This method doesn't have access to progress_logs, so errors are logged but not stored here
@@ -2742,8 +2783,11 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"   [OFF-MARKET] Error in off-market detection: {e}")
-            import traceback
-            logger.debug(f"Traceback: {traceback.format_exc()}")
+            try:
+                import traceback as tb
+                logger.debug(f"Traceback: {tb.format_exc()}")
+            except Exception:
+                logger.debug(f"Could not format traceback")
             return {
                 "missing_checked": 0,
                 "off_market_found": 0,
@@ -3015,8 +3059,11 @@ class MLSScraper:
             
         except Exception as e:
             logger.error(f"   [OFF-MARKET] Error in off-market detection (location-based): {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            try:
+                import traceback as tb
+                logger.debug(tb.format_exc())
+            except Exception:
+                logger.debug(f"Could not format traceback")
             return {
                 "missing_checked": 0,
                 "off_market_found": 0,
