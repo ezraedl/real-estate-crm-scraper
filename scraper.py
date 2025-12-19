@@ -1068,8 +1068,31 @@ class MLSScraper:
                     location_total_found = sum(len(v) for v in all_properties_by_type.values())
                     was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
                     if was_full_scrape is True and location_total_found == 0:
-                        error_msg = "COMPLETED_WITH_ERRORS: Full scrape returned 0 properties for this location."
-                        error_type = "ZeroResultsFullScrape"
+                        # Check if there were 403 errors that caused the zero results
+                        has_403_error = False
+                        if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                            le = progress_logs["locations"][location_idx]
+                            # Check location-level error
+                            location_error = le.get("error", "")
+                            if "403" in str(location_error) or "forbidden" in str(location_error).lower() or "Received 403" in str(location_error):
+                                has_403_error = True
+                            # Check listing_type-level errors
+                            for lt in listing_types_to_scrape:
+                                if lt in le.get("listing_types", {}):
+                                    lt_error = le["listing_types"][lt].get("error", "")
+                                    if "403" in str(lt_error) or "forbidden" in str(lt_error).lower() or "Received 403" in str(lt_error):
+                                        has_403_error = True
+                        
+                        # Also check if curl_cffi is available to provide better diagnostics
+                        curl_cffi_info = f"curl_cffi: {'available' if _curl_cffi_available else 'NOT available'}"
+                        
+                        if has_403_error:
+                            error_msg = f"COMPLETED_WITH_ERRORS: Full scrape returned 0 properties due to 403 Forbidden (anti-bot blocking). Realtor.com is blocking requests. {curl_cffi_info}. Check proxy configuration and ensure homeharvest is using TLS fingerprinting."
+                            error_type = "BlockedByAntiBot"
+                        else:
+                            error_msg = f"COMPLETED_WITH_ERRORS: Full scrape returned 0 properties for this location. {curl_cffi_info}"
+                            error_type = "ZeroResultsFullScrape"
+                        
                         logger.warning(f"   [ZERO] {error_msg}")
                         if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
                             le = progress_logs["locations"][location_idx]
