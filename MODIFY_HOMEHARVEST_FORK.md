@@ -135,3 +135,4 @@ homeharvest @ git+https://github.com/YOUR_USERNAME/homeharvest.git@v0.8.11-curl-
 3. **Adapter Issues:** HTTPAdapter might need different initialization with curl_cffi
 
 
+
