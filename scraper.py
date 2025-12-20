@@ -49,6 +49,20 @@ if _curl_cffi_available:
 else:
     logger.warning("⚠️  curl_cffi is not available - anti-bot measures may be limited. Install with: pip install curl-cffi")
 
+# Verify homeharvest's curl_cffi status after import
+try:
+    from homeharvest.core.scrapers import USE_CURL_CFFI, DEFAULT_IMPERSONATE
+    if USE_CURL_CFFI:
+        logger.info(f"✅ [HOMEHARVEST] curl_cffi is enabled in homeharvest with impersonate={DEFAULT_IMPERSONATE}")
+    else:
+        logger.warning(f"⚠️  [HOMEHARVEST] curl_cffi is NOT enabled in homeharvest (DEFAULT_IMPERSONATE={DEFAULT_IMPERSONATE})")
+        if _curl_cffi_available:
+            logger.error("❌ [HOMEHARVEST] curl_cffi is available in scraper.py but NOT in homeharvest! This indicates an import issue.")
+except ImportError as e:
+    logger.warning(f"⚠️  [HOMEHARVEST] Could not check curl_cffi status in homeharvest: {e}")
+except Exception as e:
+    logger.warning(f"⚠️  [HOMEHARVEST] Error checking curl_cffi status in homeharvest: {e}")
+
 class MLSScraper:
     def __init__(self):
         self.is_running = False
