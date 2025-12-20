@@ -1077,10 +1077,16 @@ class MLSScraper:
                         # First check the error returned from _scrape_all_listing_types
                         if scrape_error_info:
                             error_text_lower = str(scrape_error_info).lower()
-                            logger.debug(f"   [403-CHECK] Checking scrape_error_info: {scrape_error_info[:200]}")
-                            if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot"]):
+                            error_text_original = str(scrape_error_info)
+                            logger.info(f"   [403-CHECK] Checking scrape_error_info for 403 patterns: {scrape_error_info[:200]}")
+                            # Check for various 403 error patterns
+                            if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot", "access denied"]):
                                 has_403_error = True
                                 logger.warning(f"   [403-DETECT] ✅ Found 403 error in scrape_error_info: {scrape_error_info[:200]}")
+                            # Also check the original case-sensitive version for "Received 403" (common homeharvest error)
+                            elif "Received 403" in error_text_original or "403 Forbidden" in error_text_original:
+                                has_403_error = True
+                                logger.warning(f"   [403-DETECT] ✅ Found 403 error (case-sensitive check) in scrape_error_info: {scrape_error_info[:200]}")
                         
                         # Also check progress_logs for errors (in case they were stored there)
                         if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
@@ -1089,21 +1095,29 @@ class MLSScraper:
                             location_error = le.get("error", "")
                             if location_error:
                                 error_text_lower = str(location_error).lower()
-                                logger.debug(f"   [403-CHECK] Checking location error: {location_error[:200]}")
-                                if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot"]):
+                                error_text_original = str(location_error)
+                                logger.info(f"   [403-CHECK] Checking location error for 403 patterns: {location_error[:200]}")
+                                if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot", "access denied"]):
                                     has_403_error = True
                                     logger.warning(f"   [403-DETECT] ✅ Found 403 error in location error: {location_error[:200]}")
+                                elif "Received 403" in error_text_original or "403 Forbidden" in error_text_original:
+                                    has_403_error = True
+                                    logger.warning(f"   [403-DETECT] ✅ Found 403 error (case-sensitive) in location error: {location_error[:200]}")
                             # Check listing_type-level errors
                             for lt in listing_types_to_scrape:
                                 if lt in le.get("listing_types", {}):
                                     lt_error = le["listing_types"][lt].get("error", "")
                                     if lt_error:
                                         error_text_lower = str(lt_error).lower()
-                                        if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot"]):
+                                        error_text_original = str(lt_error)
+                                        if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot", "access denied"]):
                                             has_403_error = True
                                             logger.warning(f"   [403-DETECT] ✅ Found 403 error in listing_type {lt} error: {lt_error[:200]}")
+                                        elif "Received 403" in error_text_original or "403 Forbidden" in error_text_original:
+                                            has_403_error = True
+                                            logger.warning(f"   [403-DETECT] ✅ Found 403 error (case-sensitive) in listing_type {lt} error: {lt_error[:200]}")
                         
-                        logger.debug(f"   [403-CHECK] Final result: has_403_error={has_403_error}, scrape_error_info={'present' if scrape_error_info else 'None'}")
+                        logger.info(f"   [403-CHECK] Final result: has_403_error={has_403_error}, scrape_error_info={'present' if scrape_error_info else 'None'}")
                         
                         # Also check if curl_cffi is available to provide better diagnostics
                         curl_cffi_info = f"curl_cffi: {'available' if _curl_cffi_available else 'NOT available'}"
