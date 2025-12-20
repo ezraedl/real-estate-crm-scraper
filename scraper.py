@@ -1047,9 +1047,10 @@ class MLSScraper:
                     # Wrap in timeout to prevent getting stuck
                     from config import settings
                     scrape_timeout = min(settings.LOCATION_TIMEOUT_MINUTES * 60, 600)  # Max 10 minutes per location
+                    scrape_error_info = None
                     try:
                         # Make a single call with all listing types
-                        all_properties_by_type = await asyncio.wait_for(
+                        all_properties_by_type, scrape_error_info = await asyncio.wait_for(
                             self._scrape_all_listing_types(
                                 location, 
                                 job, 
@@ -1063,6 +1064,7 @@ class MLSScraper:
                     except asyncio.TimeoutError:
                         logger.warning(f"   [TIMEOUT] Scraping all listing types in {location} exceeded {scrape_timeout}s timeout")
                         all_properties_by_type = {lt: [] for lt in listing_types_to_scrape}  # Empty results for all types
+                        scrape_error_info = f"Timeout after {scrape_timeout}s"
                     
                     end_time = datetime.utcnow()
                     location_total_found = sum(len(v) for v in all_properties_by_type.values())
@@ -1070,18 +1072,38 @@ class MLSScraper:
                     if was_full_scrape is True and location_total_found == 0:
                         # Check if there were 403 errors that caused the zero results
                         has_403_error = False
+                        error_text_to_check = ""
+                        
+                        # First check the error returned from _scrape_all_listing_types
+                        if scrape_error_info:
+                            error_text_lower = str(scrape_error_info).lower()
+                            logger.debug(f"   [403-CHECK] Checking scrape_error_info: {scrape_error_info[:200]}")
+                            if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot"]):
+                                has_403_error = True
+                                logger.warning(f"   [403-DETECT] ✅ Found 403 error in scrape_error_info: {scrape_error_info[:200]}")
+                        
+                        # Also check progress_logs for errors (in case they were stored there)
                         if location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
                             le = progress_logs["locations"][location_idx]
                             # Check location-level error
                             location_error = le.get("error", "")
-                            if "403" in str(location_error) or "forbidden" in str(location_error).lower() or "Received 403" in str(location_error):
-                                has_403_error = True
+                            if location_error:
+                                error_text_lower = str(location_error).lower()
+                                logger.debug(f"   [403-CHECK] Checking location error: {location_error[:200]}")
+                                if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot"]):
+                                    has_403_error = True
+                                    logger.warning(f"   [403-DETECT] ✅ Found 403 error in location error: {location_error[:200]}")
                             # Check listing_type-level errors
                             for lt in listing_types_to_scrape:
                                 if lt in le.get("listing_types", {}):
                                     lt_error = le["listing_types"][lt].get("error", "")
-                                    if "403" in str(lt_error) or "forbidden" in str(lt_error).lower() or "Received 403" in str(lt_error):
-                                        has_403_error = True
+                                    if lt_error:
+                                        error_text_lower = str(lt_error).lower()
+                                        if any(pattern in error_text_lower for pattern in ["403", "forbidden", "received 403", "blocked", "anti-bot", "anti bot"]):
+                                            has_403_error = True
+                                            logger.warning(f"   [403-DETECT] ✅ Found 403 error in listing_type {lt} error: {lt_error[:200]}")
+                        
+                        logger.debug(f"   [403-CHECK] Final result: has_403_error={has_403_error}, scrape_error_info={'present' if scrape_error_info else 'None'}")
                         
                         # Also check if curl_cffi is available to provide better diagnostics
                         curl_cffi_info = f"curl_cffi: {'available' if _curl_cffi_available else 'NOT available'}"
@@ -1452,8 +1474,8 @@ class MLSScraper:
                         except Exception as e:
                             logger.error(f"Error updating job status with enrichment progress: {e}")
     
-    async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None) -> Dict[str, List[Property]]:
-        """Scrape properties for all listing types in a single request. Returns a dict mapping listing_type to properties."""
+    async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None) -> Tuple[Dict[str, List[Property]], Optional[str]]:
+        """Scrape properties for all listing types in a single request. Returns a tuple of (dict mapping listing_type to properties, error_message if any)."""
         try:
             logger.debug(f"   [DEBUG] _scrape_all_listing_types called with listing_types: {listing_types}")
             
@@ -1740,13 +1762,11 @@ class MLSScraper:
                 total_fallback = sum(len(props) for props in properties_by_type_fallback.values())
                 if total_fallback > 0:
                     logger.info(f"   [FALLBACK] Fallback individual calls succeeded! Got {total_fallback} total properties across all types")
-                    return properties_by_type_fallback
+                    return properties_by_type_fallback, None  # No error, got results
                 else:
                     logger.error(f"   [FALLBACK] All individual calls also failed or returned empty. Original error: {scrape_error}")
-                    # Store the error for display in UI - this will be handled by the caller
-                    if scrape_error:
-                        # The error will be caught and stored in progress_logs by the caller
-                        pass
+                    # Return the error so caller can detect 403 blocking
+                    return properties_by_type_fallback, scrape_error
             
             # Split properties by listing_type from the DataFrame
             # HomeHarvest should include a 'listing_type' column in the DataFrame when multiple types are requested
@@ -1756,7 +1776,7 @@ class MLSScraper:
             if properties_df is None:
                 logger.warning(f"   [WARNING] properties_df is None for location='{location}'. Returning empty results.")
                 # Fallback was already attempted above if scrape_error exists
-                return properties_by_type
+                return properties_by_type, scrape_error
             
             if properties_df is not None and not properties_df.empty:
                 # Log DataFrame columns for debugging
@@ -1914,13 +1934,17 @@ class MLSScraper:
                                 if len(props) > 3:
                                     logger.warning(f"   [UNASSIGNED]     ... and {len(props) - 3} more with same status")
             
-            return properties_by_type
+            return properties_by_type, None  # No error, got results
             
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"Error scraping all listing types in {location}: {e}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return {lt: [] for lt in listing_types}
+            try:
+                import traceback as tb
+                logger.error(f"Full traceback: {tb.format_exc()}")
+            except Exception:
+                logger.error(f"Could not format traceback")
+            return {lt: [] for lt in listing_types}, error_msg
     
     async def _scrape_listing_type(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_type: str, limit: Optional[int] = None, past_days: Optional[int] = None) -> List[Property]:
         """Scrape properties for a specific listing type"""
