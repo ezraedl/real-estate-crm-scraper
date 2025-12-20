@@ -2237,7 +2237,7 @@ class MLSScraper:
             def safe_get(key, default=None):
                 try:
                     value = prop_data.get(key, default)
-                    # Convert pandas NaN to None
+                    # Convert pandas NaN/NA to None
                     if pd.isna(value):
                         return None
                     # Handle None values
@@ -2246,6 +2246,37 @@ class MLSScraper:
                     return value
                 except:
                     return default
+            
+            # Helper function to safely get boolean values (handles pandas NA properly)
+            def safe_get_bool(key, default=None):
+                try:
+                    value = prop_data.get(key, default)
+                    # Check for pandas NA types first (before any boolean operations)
+                    # This prevents "boolean value of NA is ambiguous" errors
+                    # Use pd.isna() which handles all pandas NA types (NaN, NA, NaT)
+                    if pd.isna(value):
+                        return None
+                    # Handle None values
+                    if value is None:
+                        return None
+                    # Check for pandas NA singleton (pandas 1.0+)
+                    if hasattr(pd, 'NA') and value is pd.NA:
+                        return None
+                    # Convert to boolean, handling string representations
+                    if isinstance(value, str):
+                        return value.lower() in ('true', '1', 'yes', 'on')
+                    # Use explicit boolean conversion that handles pandas/numpy types
+                    if isinstance(value, (bool, np.bool_)):
+                        return bool(value)
+                    # For numeric values, convert to bool (0/1, etc.)
+                    try:
+                        return bool(value) if value is not None else None
+                    except (ValueError, TypeError):
+                        return None
+                except Exception:
+                    # Catch all exceptions (including "boolean value of NA is ambiguous")
+                    # to prevent property conversion from failing
+                    return None
             
             # Extract address information
             address = PropertyAddress(
@@ -2407,7 +2438,7 @@ class MLSScraper:
                 primary_photo=safe_get('primary_photo'),
                 alt_photos=alt_photos_list,
                 days_on_mls=safe_get('days_on_mls'),
-                new_construction=safe_get('new_construction'),
+                new_construction=safe_get_bool('new_construction'),
                 monthly_fees=safe_get('monthly_fees'),
                 one_time_fees=safe_get('one_time_fees'),
                 tax_history=safe_get('tax_history'),
