@@ -10,6 +10,7 @@ This script:
 Tracked fields:
 - financial.list_price → financial.list_price_old
 - financial.original_list_price → financial.original_list_price_old
+- financial.price_per_sqft → financial.price_per_sqft_old
 - status → status_old
 - mls_status → mls_status_old
 - listing_type → listing_type_old
@@ -132,6 +133,7 @@ async def migrate_properties(dry_run: bool = False, batch_size: int = 100, limit
                 financial = property_doc.get("financial", {})
                 current_list_price = financial.get("list_price")
                 current_original_list_price = financial.get("original_list_price")
+                current_price_per_sqft = financial.get("price_per_sqft")
                 current_status = property_doc.get("status")
                 current_mls_status = property_doc.get("mls_status")
                 current_listing_type = property_doc.get("listing_type")
@@ -143,6 +145,7 @@ async def migrate_properties(dry_run: bool = False, batch_size: int = 100, limit
                 # Check if we need to update (at least one _old value is missing)
                 needs_update = (
                     (current_list_price is not None and not financial.get("list_price_old")) or
+                    (current_price_per_sqft is not None and not financial.get("price_per_sqft_old")) or
                     (current_status is not None and not property_doc.get("status_old")) or
                     not property_doc.get("_old_values_scraped_at")
                 )
@@ -160,6 +163,9 @@ async def migrate_properties(dry_run: bool = False, batch_size: int = 100, limit
                 
                 if current_original_list_price is not None and not financial.get("original_list_price_old"):
                     update_fields["financial.original_list_price_old"] = current_original_list_price
+                
+                if current_price_per_sqft is not None and not financial.get("price_per_sqft_old"):
+                    update_fields["financial.price_per_sqft_old"] = current_price_per_sqft
                 
                 if current_status is not None and not property_doc.get("status_old"):
                     update_fields["status_old"] = current_status
