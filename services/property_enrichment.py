@@ -67,6 +67,26 @@ class PropertyEnrichmentPipeline:
             property_doc = await self._get_property_dict(property_id)
             old_property = self._extract_old_values(property_doc) if property_doc else None
             
+            # If no _old values exist, try to use current values from DB as baseline
+            # This ensures we can detect changes even if _old values weren't set properly
+            if old_property is None and property_doc:
+                # Extract current values from property_doc as baseline
+                financial = property_doc.get('financial', {})
+                old_property = {
+                    'financial': {
+                        'list_price': financial.get('list_price'),
+                        'original_list_price': financial.get('original_list_price'),
+                        'price_per_sqft': financial.get('price_per_sqft')
+                    },
+                    'status': property_doc.get('status'),
+                    'mls_status': property_doc.get('mls_status'),
+                    'listing_type': property_doc.get('listing_type')
+                }
+                # Only use as baseline if we have at least one meaningful value
+                if (old_property['financial'].get('list_price') is None and 
+                    old_property.get('status') is None):
+                    old_property = None
+            
             # Step 2: Detect changes (compare current vs _old values)
             changes = self.property_differ.detect_changes(old_property, property_dict)
             
@@ -697,10 +717,12 @@ class PropertyEnrichmentPipeline:
             return None
         
         # Build old_property dict matching PropertyDiffer expected format
+        # Include all tracked fields to ensure proper change detection
         old_property = {
             'financial': {
                 'list_price': financial.get('list_price_old'),
-                'original_list_price': financial.get('original_list_price_old')
+                'original_list_price': financial.get('original_list_price_old'),
+                'price_per_sqft': financial.get('price_per_sqft_old')
             },
             'status': property_doc.get('status_old'),
             'mls_status': property_doc.get('mls_status_old'),
@@ -736,10 +758,11 @@ class PropertyEnrichmentPipeline:
                 scraped_at = datetime.utcnow()
             
             # Prepare update fields
+            # Copy current to _old for all tracked fields
             update_fields = {
-                # Copy current to _old
                 'financial.list_price_old': financial.get('list_price'),
                 'financial.original_list_price_old': financial.get('original_list_price'),
+                'financial.price_per_sqft_old': financial.get('price_per_sqft'),
                 'status_old': property_dict.get('status'),
                 'mls_status_old': property_dict.get('mls_status'),
                 'listing_type_old': property_dict.get('listing_type'),
