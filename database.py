@@ -358,7 +358,10 @@ class Database:
         run_job_id: str,
         status: JobStatus,
         next_run_at: Optional[datetime] = None,
-        was_full_scrape: Optional[bool] = None
+        was_full_scrape: Optional[bool] = None,
+        error_message: Optional[str] = None,
+        properties_scraped: Optional[int] = None,
+        properties_saved: Optional[int] = None
     ) -> bool:
         """Update the run history of a scheduled job after execution"""
         try:
@@ -383,6 +386,14 @@ class Database:
             
             if next_run_at:
                 update_data["next_run_at"] = next_run_at
+            
+            # Add error message and property counts if provided
+            if error_message is not None:
+                update_data["last_run_error_message"] = error_message
+            if properties_scraped is not None:
+                update_data["last_run_properties_scraped"] = properties_scraped
+            if properties_saved is not None:
+                update_data["last_run_properties_saved"] = properties_saved
             
             # Update incremental scraping counters if was_full_scrape is provided
             if was_full_scrape is not None and incremental_config is not None:

@@ -86,6 +86,9 @@ class ScheduledJob(BaseModel):
     last_run_at: Optional[datetime] = Field(None, description="When this job last ran")
     last_run_status: Optional[JobStatus] = Field(None, description="Status of the last run")
     last_run_job_id: Optional[str] = Field(None, description="Job ID of the last execution")
+    last_run_error_message: Optional[str] = Field(None, description="Error message from the last run (if failed)")
+    last_run_properties_scraped: Optional[int] = Field(None, description="Number of properties scraped in the last run")
+    last_run_properties_saved: Optional[int] = Field(None, description="Number of properties saved in the last run")
     next_run_at: Optional[datetime] = Field(None, description="Calculated next run time")
     
     # Incremental scraping configuration

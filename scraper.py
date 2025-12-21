@@ -503,14 +503,6 @@ class MLSScraper:
                     # This is a real problem - don't mark as completed
                     raise Exception(f"Job completion check failed: {total_processed}/{len(job.locations)} locations processed")
             
-            # Mark job as completed (even if some locations failed)
-            final_status = JobStatus.COMPLETED
-            completion_message = f"Job completed successfully. {successful_locations}/{len(job.locations)} locations processed."
-            
-            if failed_locations:
-                completion_message += f" {len(failed_locations)} location(s) failed after retry."
-                logger.info(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
-            
             # Add completion info to summary
             # Get the scrape type from job_started (or determine it again if not set)
             scrape_type = progress_logs.get("job_started", {}).get("scrape_type", "full")
@@ -518,22 +510,70 @@ class MLSScraper:
             
             # Collect all errors from locations for error summary
             all_errors = []
+            has_403_errors = False
             for loc_entry in progress_logs.get("locations", []):
                 if loc_entry.get("error"):
+                    error_text = str(loc_entry.get("error", "")).lower()
+                    error_type = loc_entry.get("error_type", "Unknown")
                     all_errors.append({
                         "location": loc_entry.get("location"),
                         "error": loc_entry.get("error"),
-                        "error_type": loc_entry.get("error_type", "Unknown")
+                        "error_type": error_type
                     })
+                    # Check for 403/anti-bot errors
+                    if "403" in error_text or "forbidden" in error_text or "anti-bot" in error_text or "blocked" in error_text:
+                        has_403_errors = True
                 # Also check listing_types for errors
                 for listing_type, data in loc_entry.get("listing_types", {}).items():
                     if data.get("error"):
+                        error_text = str(data.get("error", "")).lower()
+                        error_type = data.get("error_type", "Unknown")
                         all_errors.append({
                             "location": loc_entry.get("location"),
                             "listing_type": listing_type,
                             "error": data.get("error"),
-                            "error_type": data.get("error_type", "Unknown")
+                            "error_type": error_type
                         })
+                        # Check for 403/anti-bot errors
+                        if "403" in error_text or "forbidden" in error_text or "anti-bot" in error_text or "blocked" in error_text:
+                            has_403_errors = True
+            
+            # Determine final status based on results and errors
+            # Get final property counts from running_totals
+            total_properties = running_totals.get("total_properties", 0)
+            saved_properties = running_totals.get("saved_properties", 0)
+            
+            # Determine if job should be marked as FAILED
+            should_fail = False
+            error_message = None
+            
+            # Check conditions for failure:
+            # 1. Zero properties AND errors present
+            if total_properties == 0 and saved_properties == 0 and len(all_errors) > 0:
+                should_fail = True
+                if has_403_errors:
+                    error_message = f"Job failed: 0 properties scraped due to 403 Forbidden (anti-bot blocking). {successful_locations}/{len(job.locations)} locations processed. {len(all_errors)} error(s) occurred. Realtor.com is blocking requests - check proxy configuration and TLS fingerprinting."
+                else:
+                    error_message = f"Job failed: 0 properties scraped with {len(all_errors)} error(s). {successful_locations}/{len(job.locations)} locations processed successfully."
+            # 2. All locations failed
+            elif successful_locations == 0 and len(failed_locations) > 0:
+                should_fail = True
+                error_message = f"Job failed: All {len(failed_locations)} location(s) failed. {total_properties} properties scraped, {saved_properties} saved."
+            # 3. Critical errors (403 blocking) even if some properties were found
+            elif has_403_errors and total_properties == 0:
+                should_fail = True
+                error_message = f"Job failed: 403 Forbidden errors detected. 0 properties scraped. {successful_locations}/{len(job.locations)} locations processed. Realtor.com is blocking requests - check proxy configuration."
+            
+            if should_fail:
+                final_status = JobStatus.FAILED
+                completion_message = f"Job failed. {successful_locations}/{len(job.locations)} locations processed. {total_properties} properties scraped, {saved_properties} saved."
+                logger.warning(f"[COMPLETION] Job {job.job_id} marked as FAILED: {error_message}")
+            else:
+                final_status = JobStatus.COMPLETED
+                completion_message = f"Job completed successfully. {successful_locations}/{len(job.locations)} locations processed."
+                if failed_locations:
+                    completion_message += f" {len(failed_locations)} location(s) failed after retry."
+                    logger.info(f"[SUMMARY] Job {job.job_id} completed with {len(failed_locations)} failed location(s) out of {len(job.locations)} total")
             
             progress_logs["job_completed"] = {
                 "timestamp": datetime.utcnow().isoformat(),
@@ -546,19 +586,22 @@ class MLSScraper:
                 "scrape_type_details": scrape_type_details,
                 "has_errors": len(all_errors) > 0,
                 "error_count": len(all_errors),
-                "errors": all_errors if all_errors else None
+                "errors": all_errors if all_errors else None,
+                "total_properties": total_properties,
+                "saved_properties": saved_properties
             }
             
-            # CRITICAL: Update job status to COMPLETED with ALL completion data in ONE atomic operation
+            # CRITICAL: Update job status (COMPLETED or FAILED) with ALL completion data in ONE atomic operation
             # This ensures completed_at, status, and all location counts are set together
-            logger.info(f"[COMPLETION] All {len(job.locations)} locations processed. Updating job {job.job_id} status to COMPLETED...")
+            status_label = "COMPLETED" if final_status == JobStatus.COMPLETED else "FAILED"
+            logger.info(f"[COMPLETION] All {len(job.locations)} locations processed. Updating job {job.job_id} status to {status_label}...")
             status_update_success = False
             max_retries = 5  # Increased retries for reliability
             for retry in range(max_retries):
                 try:
                     update_success = await db.update_job_status(
                         job.job_id,
-                        final_status,  # COMPLETED
+                        final_status,  # COMPLETED or FAILED
                         completed_locations=successful_locations,
                         total_locations=len(job.locations),
                         properties_scraped=total_properties,
@@ -568,6 +611,7 @@ class MLSScraper:
                         properties_skipped=total_skipped,
                         failed_locations=failed_locations,
                         progress_logs=progress_logs,
+                        error_message=error_message,  # Include error message if status is FAILED
                         current_location=None,  # Clear current_location when job completes
                         current_location_index=None
                     )
@@ -584,10 +628,10 @@ class MLSScraper:
                             else:
                                 verify_status_value = str(verify_status).lower()
                             
-                            if verify_status_value == JobStatus.COMPLETED.value:
+                            if verify_status_value == final_status.value:
                                 status_update_success = True
                                 logger.info(
-                                    f"[COMPLETION] ✅ Successfully updated and verified job {job.job_id} status to COMPLETED "
+                                    f"[COMPLETION] ✅ Successfully updated and verified job {job.job_id} status to {status_label} "
                                     f"(attempt {retry + 1}/{max_retries}). "
                                     f"completed_locations={successful_locations}, total_locations={len(job.locations)}"
                                 )
@@ -596,7 +640,7 @@ class MLSScraper:
                                 logger.warning(
                                     f"[COMPLETION] ⚠️ Job {job.job_id} status update reported success but verification failed "
                                     f"(attempt {retry + 1}/{max_retries}). "
-                                    f"Expected COMPLETED, got {verify_status_value}. Retrying..."
+                                    f"Expected {status_label}, got {verify_status_value}. Retrying..."
                                 )
                                 await asyncio.sleep(0.5)  # Brief delay before retry
                         else:
@@ -610,30 +654,35 @@ class MLSScraper:
                     await asyncio.sleep(0.5)
             
             if not status_update_success:
-                logger.error(f"[COMPLETION] ❌ CRITICAL: Failed to update job {job.job_id} status to COMPLETED after {max_retries} attempts!")
+                logger.error(f"[COMPLETION] ❌ CRITICAL: Failed to update job {job.job_id} status to {status_label} after {max_retries} attempts!")
                 # Still try to update in finally block as last resort
                 # But also try one more direct update here
                 try:
                     logger.warning(f"[COMPLETION] Attempting direct MongoDB update as last resort...")
+                    update_doc = {
+                        "status": final_status.value,
+                        "completed_at": datetime.utcnow(),
+                        "completed_locations": successful_locations,
+                        "total_locations": len(job.locations),
+                        "updated_at": datetime.utcnow()
+                    }
+                    if error_message:
+                        update_doc["error_message"] = error_message
                     await db.jobs_collection.update_one(
                         {"job_id": job.job_id},
-                        {
-                            "$set": {
-                                "status": JobStatus.COMPLETED.value,
-                                "completed_at": datetime.utcnow(),
-                                "completed_locations": successful_locations,
-                                "total_locations": len(job.locations),
-                                "updated_at": datetime.utcnow()
-                            }
-                        }
+                        {"$set": update_doc}
                     )
                     # Verify one more time
                     final_verify = await db.get_job(job.job_id)
-                    if final_verify and (isinstance(final_verify.status, JobStatus) and final_verify.status == JobStatus.COMPLETED or str(final_verify.status).lower() == "completed"):
-                        logger.info(f"[COMPLETION] ✅ Direct MongoDB update succeeded for job {job.job_id}")
-                        status_update_success = True
+                    if final_verify:
+                        verify_status_val = final_verify.status.value if isinstance(final_verify.status, JobStatus) else str(final_verify.status).lower()
+                        if verify_status_val == final_status.value:
+                            logger.info(f"[COMPLETION] ✅ Direct MongoDB update succeeded for job {job.job_id}")
+                            status_update_success = True
+                        else:
+                            logger.error(f"[COMPLETION] ❌ Direct MongoDB update also failed for job {job.job_id} - expected {final_status.value}, got {verify_status_val}")
                     else:
-                        logger.error(f"[COMPLETION] ❌ Direct MongoDB update also failed for job {job.job_id}")
+                        logger.error(f"[COMPLETION] ❌ Direct MongoDB update failed - job {job.job_id} not found")
                 except Exception as direct_update_error:
                     logger.error(f"[COMPLETION] ❌ Direct MongoDB update error: {direct_update_error}")
             
@@ -653,20 +702,23 @@ class MLSScraper:
                         await db.update_scheduled_job_run_history(
                             job.scheduled_job_id,
                             job.job_id,
-                            JobStatus.COMPLETED,
+                            final_status,  # Use final_status (COMPLETED or FAILED)
                             next_run_at=next_run,
-                            was_full_scrape=was_full_scrape
+                            was_full_scrape=was_full_scrape,
+                            error_message=error_message,  # Include error message if status is FAILED
+                            properties_scraped=total_properties,  # Include property counts
+                            properties_saved=saved_properties
                         )
-                        logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id} (was_full_scrape={was_full_scrape})")
+                        logger.debug(f"Updated run history for scheduled job: {job.scheduled_job_id} (was_full_scrape={was_full_scrape}, status={status_label}, properties={total_properties} scraped, {saved_properties} saved)")
                 
                 # Legacy: Update run history for old recurring jobs
                 elif job.original_job_id:
                     await db.update_recurring_job_run_history(
                         job.original_job_id,
                         job.job_id,
-                        JobStatus.COMPLETED
+                        final_status  # Use final_status (COMPLETED or FAILED)
                     )
-                    logger.debug(f"Updated run history for legacy recurring job: {job.original_job_id}")
+                    logger.debug(f"Updated run history for legacy recurring job: {job.original_job_id} (status={status_label})")
             except Exception as run_history_error:
                 # Log the error but don't fail the job - the job itself completed successfully
                 logger.warning(
@@ -674,40 +726,42 @@ class MLSScraper:
                     f"but job completed successfully: {run_history_error}"
                 )
             
-            logger.info(f"Job {job.job_id} completed: {saved_properties} properties saved")
+            logger.info(f"Job {job.job_id} {status_label.lower()}: {saved_properties} properties saved")
             
-            # FINAL SAFETY CHECK: Ensure status is COMPLETED before exiting try block
+            # FINAL SAFETY CHECK: Ensure status matches final_status before exiting try block
             # This is the last chance to fix it if something went wrong
             final_check = await db.get_job(job.job_id)
-            if final_check and final_check.status != JobStatus.COMPLETED:
+            if final_check and final_check.status != final_status:
                 logger.error(
-                    f"CRITICAL: Job {job.job_id} status is {final_check.status.value} instead of COMPLETED! "
-                    f"Force updating to COMPLETED..."
+                    f"CRITICAL: Job {job.job_id} status is {final_check.status.value} instead of {status_label}! "
+                    f"Force updating to {status_label}..."
                 )
                 await db.update_job_status(
                     job.job_id, 
-                    JobStatus.COMPLETED, 
+                    final_status,  # Use final_status (COMPLETED or FAILED)
                     completed_locations=successful_locations,
                     total_locations=len(job.locations),
-                    progress_logs=progress_logs
+                    progress_logs=progress_logs,
+                    error_message=error_message
                 )
                 # Verify one more time
                 verify_final = await db.get_job(job.job_id)
-                if verify_final and verify_final.status == JobStatus.COMPLETED:
-                    logger.info(f"Successfully force-updated job {job.job_id} to COMPLETED")
+                if verify_final and verify_final.status == final_status:
+                    logger.info(f"Successfully force-updated job {job.job_id} to {status_label}")
                 else:
-                    logger.error(f"FAILED to force-update job {job.job_id} to COMPLETED! Status: {verify_final.status.value if verify_final else 'NOT FOUND'}")
+                    logger.error(f"FAILED to force-update job {job.job_id} to {status_label}! Status: {verify_final.status.value if verify_final else 'NOT FOUND'}")
             
         except Exception as e:
             logger.error(f"Error processing job {job.job_id}: {e}")
             
-            # Check if job was already marked as COMPLETED before overwriting with FAILED
-            # This prevents successful jobs from being marked as failed due to post-completion errors
+            # Check if job was already marked as COMPLETED or FAILED before overwriting
+            # This prevents jobs from being marked as failed due to post-completion errors
             current_job = await db.get_job(job.job_id)
-            if current_job and current_job.status == JobStatus.COMPLETED:
+            if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED]:
+                status_str = current_job.status.value
                 logger.warning(
-                    f"Job {job.job_id} encountered an error after completion, "
-                    f"but keeping status as COMPLETED since all locations finished successfully. Error: {e}"
+                    f"Job {job.job_id} encountered an error after {status_str}, "
+                    f"but keeping status as {status_str} since job already finished. Error: {e}"
                 )
                 # Still try to update run history, but don't change job status
                 try:
@@ -719,12 +773,21 @@ class MLSScraper:
                             next_run = cron.get_next(datetime)
                             
                             was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
+                            # Try to get property counts from the job if available
+                            properties_scraped = None
+                            properties_saved = None
+                            if current_job:
+                                properties_scraped = current_job.get("properties_scraped") if isinstance(current_job, dict) else (current_job.properties_scraped if hasattr(current_job, 'properties_scraped') else None)
+                                properties_saved = current_job.get("properties_saved") if isinstance(current_job, dict) else (current_job.properties_saved if hasattr(current_job, 'properties_saved') else None)
                             await db.update_scheduled_job_run_history(
                                 job.scheduled_job_id,
                                 job.job_id,
                                 JobStatus.COMPLETED,
                                 next_run_at=next_run,
-                                was_full_scrape=was_full_scrape
+                                was_full_scrape=was_full_scrape,
+                                error_message=str(e) if e else None,  # Include error message even for completed jobs
+                                properties_scraped=properties_scraped,
+                                properties_saved=properties_saved
                             )
                     elif job.original_job_id:
                         await db.update_recurring_job_run_history(
@@ -752,12 +815,21 @@ class MLSScraper:
                             next_run = cron.get_next(datetime)
                             
                             was_full_scrape = self.job_run_flags.get(job.job_id, {}).get("was_full_scrape")
+                            # Try to get property counts from the job if available (might be partial)
+                            properties_scraped = None
+                            properties_saved = None
+                            if current_job:
+                                properties_scraped = current_job.get("properties_scraped") if isinstance(current_job, dict) else (current_job.properties_scraped if hasattr(current_job, 'properties_scraped') else None)
+                                properties_saved = current_job.get("properties_saved") if isinstance(current_job, dict) else (current_job.properties_saved if hasattr(current_job, 'properties_saved') else None)
                             await db.update_scheduled_job_run_history(
                                 job.scheduled_job_id,
                                 job.job_id,
                                 JobStatus.FAILED,
                                 next_run_at=next_run,
-                                was_full_scrape=was_full_scrape
+                                was_full_scrape=was_full_scrape,
+                                error_message=str(e),  # Include error message for failed jobs
+                                properties_scraped=properties_scraped,
+                                properties_saved=properties_saved
                             )
                             logger.debug(f"Updated run history for scheduled job (failed): {job.scheduled_job_id}")
                     
@@ -818,11 +890,26 @@ class MLSScraper:
                     completed_locations = current_job.completed_locations or 0
                     total_locations = current_job.total_locations or len(job.locations)
                     
-                    # Only mark as COMPLETED if we have explicit completion signal
+                    # Only mark as COMPLETED/FAILED if we have explicit completion signal
                     if job_completed and completed_locations >= total_locations and total_locations > 0:
+                        # Check job_completed data to determine if it should be FAILED
+                        job_completed_data = progress_logs.get("job_completed", {})
+                        has_errors = job_completed_data.get("has_errors", False)
+                        error_count = job_completed_data.get("error_count", 0)
+                        total_props = job_completed_data.get("total_properties", current_job.properties_scraped or 0)
+                        saved_props = job_completed_data.get("saved_properties", current_job.properties_saved or 0)
+                        
+                        # Determine status: FAILED if zero properties with errors, otherwise COMPLETED
+                        final_status_safety = JobStatus.COMPLETED
+                        error_message_safety = None
+                        if (total_props == 0 and saved_props == 0 and error_count > 0) or (completed_locations == 0 and total_locations > 0):
+                            final_status_safety = JobStatus.FAILED
+                            error_message_safety = f"Job failed: 0 properties scraped with {error_count} error(s). {completed_locations}/{total_locations} locations processed."
+                        
+                        status_label_safety = "COMPLETED" if final_status_safety == JobStatus.COMPLETED else "FAILED"
                         logger.warning(
                             f"Job {job.job_id} was still in RUNNING status but has completion signal. "
-                            f"Updating status to COMPLETED in finally block (safety net)."
+                            f"Updating status to {status_label_safety} in finally block (safety net)."
                         )
                         # Retry the status update with verification
                         # Get completed_locations from progress_logs if not available
@@ -835,23 +922,24 @@ class MLSScraper:
                         for retry in range(3):
                             update_success = await db.update_job_status(
                                 job.job_id,
-                                JobStatus.COMPLETED,
+                                final_status_safety,  # Use determined status (COMPLETED or FAILED)
                                 completed_locations=completed_locations,
                                 total_locations=total_locations,
-                                progress_logs=progress_logs
+                                progress_logs=progress_logs,
+                                error_message=error_message_safety
                             )
                             if update_success:
                                 verify_job = await db.get_job(job.job_id)
-                                if verify_job and verify_job.status == JobStatus.COMPLETED:
+                                if verify_job and verify_job.status == final_status_safety:
                                     current_job = verify_job
-                                    logger.info(f"Successfully updated job {job.job_id} to COMPLETED in finally block (attempt {retry + 1})")
+                                    logger.info(f"Successfully updated job {job.job_id} to {status_label_safety} in finally block (attempt {retry + 1})")
                                     break
                                 else:
                                     await asyncio.sleep(0.5)
                             else:
                                 await asyncio.sleep(0.5)
                         else:
-                            logger.error(f"Failed to update job {job.job_id} to COMPLETED in finally block after 3 attempts")
+                            logger.error(f"Failed to update job {job.job_id} to {status_label_safety} in finally block after 3 attempts")
                     
                     # Now remove from current_jobs only if status is final
                     if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
