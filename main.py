@@ -320,10 +320,20 @@ async def handle_stuck_jobs():
                         )
                         # Update scheduled job history if applicable
                         if job.scheduled_job_id:
+                            # Try to get property counts from the job if available
+                            properties_scraped = None
+                            properties_saved = None
+                            if hasattr(job, 'properties_scraped'):
+                                properties_scraped = job.properties_scraped
+                            if hasattr(job, 'properties_saved'):
+                                properties_saved = job.properties_saved
                             await db.update_scheduled_job_run_history(
                                 job.scheduled_job_id,
                                 job.job_id,
-                                JobStatus.FAILED
+                                JobStatus.FAILED,
+                                error_message="Job stuck in running status after service restart. Max retries exceeded.",
+                                properties_scraped=properties_scraped,
+                                properties_saved=properties_saved
                             )
                 else:
                     # Create ONE retry job with ALL remaining locations from ALL stuck jobs
@@ -1557,8 +1567,11 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
                 "incremental_runs_before_full": scheduled_job.incremental_runs_before_full,
                 "run_count": scheduled_job.run_count,
                 "last_run_at": scheduled_job.last_run_at,
-                "last_run_status": scheduled_job.last_run_status,
+                "last_run_status": scheduled_job.last_run_status.value if scheduled_job.last_run_status else None,
                 "last_run_job_id": scheduled_job.last_run_job_id,
+                "last_run_error_message": scheduled_job.last_run_error_message,
+                "last_run_properties_scraped": scheduled_job.last_run_properties_scraped,
+                "last_run_properties_saved": scheduled_job.last_run_properties_saved,
                 "next_run_at": scheduled_job.next_run_at,
                 "created_at": scheduled_job.created_at,
                 "updated_at": scheduled_job.updated_at
@@ -1677,6 +1690,10 @@ async def list_scheduled_jobs(
                 "has_running_job": stats["has_running_job"],  # Use aggregated flag
                 "last_run_at": job_data.get("last_run_at"),
                 "last_run_status": job_data.get("last_run_status"),
+                "last_run_job_id": job_data.get("last_run_job_id"),
+                "last_run_error_message": job_data.get("last_run_error_message"),
+                "last_run_properties_scraped": job_data.get("last_run_properties_scraped"),
+                "last_run_properties_saved": job_data.get("last_run_properties_saved"),
                 "next_run_at": job_data.get("next_run_at"),
                 "created_at": job_data.get("created_at")
             })
