@@ -666,6 +666,16 @@ class PropertyEnrichmentPipeline:
             )
             if property_doc:
                 property_doc["_id"] = str(property_doc["_id"])
+                # Convert ObjectId fields to strings to prevent Pydantic serialization warnings
+                from bson import ObjectId
+                if "agent_id" in property_doc and property_doc["agent_id"] and isinstance(property_doc["agent_id"], ObjectId):
+                    property_doc["agent_id"] = str(property_doc["agent_id"])
+                if "broker_id" in property_doc and property_doc["broker_id"] and isinstance(property_doc["broker_id"], ObjectId):
+                    property_doc["broker_id"] = str(property_doc["broker_id"])
+                if "office_id" in property_doc and property_doc["office_id"] and isinstance(property_doc["office_id"], ObjectId):
+                    property_doc["office_id"] = str(property_doc["office_id"])
+                if "builder_id" in property_doc and property_doc["builder_id"] and isinstance(property_doc["builder_id"], ObjectId):
+                    property_doc["builder_id"] = str(property_doc["builder_id"])
             return property_doc
         except Exception as e:
             logger.error(f"Error getting property {property_id}: {e}")
