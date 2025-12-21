@@ -1420,17 +1420,40 @@ async def get_scheduled_job_stats(scheduled_job_id: str, limit: int = 1000):
         success_rate = (successful_runs / total_runs * 100) if total_runs > 0 else 0
         
         # Count unique properties added (properties with this job's scheduled_job_id)
-        unique_properties_count = await db.properties_collection.count_documents({
-            "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"}
-        })
+        # Use distinct to count unique property_ids, not all documents
+        property_ids = await db.properties_collection.distinct(
+            "property_id",
+            {"job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"}}
+        )
+        unique_properties_count = len(property_ids)
         
-        # Count unique properties by listing type
+        # Count unique properties by listing type using aggregation to count distinct property_ids
         properties_by_type = {}
         for listing_type in ["for_sale", "sold", "for_rent", "pending"]:
-            count = await db.properties_collection.count_documents({
-                "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"},
-                "listing_type": listing_type
-            })
+            # Use aggregation to count distinct property_ids for this listing type
+            pipeline = [
+                {
+                    "$match": {
+                        "job_id": {"$regex": f"^(scheduled|triggered)_{scheduled_job_id}"},
+                        "listing_type": listing_type
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$property_id"
+                    }
+                },
+                {
+                    "$count": "unique_count"
+                }
+            ]
+            
+            result = None
+            async for doc in db.properties_collection.aggregate(pipeline):
+                result = doc
+                break
+            
+            count = result.get("unique_count", 0) if result else 0
             if count > 0:
                 properties_by_type[listing_type] = count
         
