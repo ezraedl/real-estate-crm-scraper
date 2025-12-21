@@ -2237,7 +2237,7 @@ class MLSScraper:
             def safe_get(key, default=None):
                 try:
                     value = prop_data.get(key, default)
-                    # Convert pandas NaN to None
+                    # Convert pandas NaN/NA to None
                     if pd.isna(value):
                         return None
                     # Handle None values
@@ -2246,6 +2246,37 @@ class MLSScraper:
                     return value
                 except:
                     return default
+            
+            # Helper function to safely get boolean values (handles pandas NA properly)
+            def safe_get_bool(key, default=None):
+                try:
+                    value = prop_data.get(key, default)
+                    # Check for pandas NA types first (before any boolean operations)
+                    # This prevents "boolean value of NA is ambiguous" errors
+                    # Use pd.isna() which handles all pandas NA types (NaN, NA, NaT)
+                    if pd.isna(value):
+                        return None
+                    # Handle None values
+                    if value is None:
+                        return None
+                    # Check for pandas NA singleton (pandas 1.0+)
+                    if hasattr(pd, 'NA') and value is pd.NA:
+                        return None
+                    # Convert to boolean, handling string representations
+                    if isinstance(value, str):
+                        return value.lower() in ('true', '1', 'yes', 'on')
+                    # Use explicit boolean conversion that handles pandas/numpy types
+                    if isinstance(value, (bool, np.bool_)):
+                        return bool(value)
+                    # For numeric values, convert to bool (0/1, etc.)
+                    try:
+                        return bool(value) if value is not None else None
+                    except (ValueError, TypeError):
+                        return None
+                except Exception:
+                    # Catch all exceptions (including "boolean value of NA is ambiguous")
+                    # to prevent property conversion from failing
+                    return None
             
             # Extract address information
             address = PropertyAddress(
@@ -2407,7 +2438,7 @@ class MLSScraper:
                 primary_photo=safe_get('primary_photo'),
                 alt_photos=alt_photos_list,
                 days_on_mls=safe_get('days_on_mls'),
-                new_construction=safe_get('new_construction'),
+                new_construction=safe_get_bool('new_construction'),
                 monthly_fees=safe_get('monthly_fees'),
                 one_time_fees=safe_get('one_time_fees'),
                 tax_history=safe_get('tax_history'),
@@ -2648,6 +2679,36 @@ class MLSScraper:
             
             if not missing_properties:
                 logger.debug(f"   [OFF-MARKET] No missing properties found for scheduled job {scheduled_job_id}")
+                # Still mark the check as completed even if there are no missing properties
+                if location and job_id:
+                    try:
+                        current_job = await db.get_job(job_id)
+                        if current_job:
+                            latest_progress_logs = current_job.progress_logs or {"locations": []}
+                            location_entry = None
+                            for loc_entry in latest_progress_logs.get("locations", []):
+                                if loc_entry.get("location") == location:
+                                    location_entry = loc_entry
+                                    break
+                            
+                            if location_entry:
+                                if "off_market_check" not in location_entry:
+                                    location_entry["off_market_check"] = {}
+                                location_entry["off_market_check"]["status"] = "completed"
+                                location_entry["off_market_check"]["checked"] = 0
+                                location_entry["off_market_check"]["found"] = 0
+                                location_entry["off_market_check"]["errors"] = 0
+                                
+                                if current_job.status == JobStatus.RUNNING:
+                                    await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=latest_progress_logs)
+                                elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                    await db.jobs_collection.update_one(
+                                        {"job_id": job_id},
+                                        {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
+                                    )
+                    except Exception as e:
+                        logger.error(f"   [OFF-MARKET] Error updating progress logs for no missing properties: {e}")
+                
                 return {
                     "missing_checked": 0,
                     "off_market_found": 0,
@@ -2816,32 +2877,53 @@ class MLSScraper:
                     await asyncio.sleep(2.0)  # 2 second delay between batches
             
             # Update final off-market check status in progress_logs
-            if progress_logs and location and job_id:
+            if location and job_id:
                 try:
-                    location_entry = None
-                    for loc_entry in progress_logs.get("locations", []):
-                        if loc_entry.get("location") == location:
-                            location_entry = loc_entry
-                            break
-                    
-                    if location_entry:
-                        location_entry["off_market_check"]["status"] = "completed"
-                        location_entry["off_market_check"]["checked"] = total_checked
-                        location_entry["off_market_check"]["found"] = off_market_count
-                        location_entry["off_market_check"]["errors"] = error_count
-                        # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
-                        current_job = await db.get_job(job_id)
-                        if current_job and current_job.status == JobStatus.RUNNING:
-                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
-                        elif current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
-                            # Job is already final, only update progress_logs without changing status
-                            logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check completion")
-                            await db.jobs_collection.update_one(
-                                {"job_id": job_id},
-                                {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
-                            )
+                    # Re-fetch the latest job and progress_logs from database to avoid stale data
+                    current_job = await db.get_job(job_id)
+                    if not current_job:
+                        logger.warning(f"   [OFF-MARKET] Job {job_id} not found, cannot update progress logs")
+                    else:
+                        # Get latest progress_logs from job
+                        latest_progress_logs = current_job.progress_logs or {"locations": []}
+                        
+                        # Find location_entry in latest progress_logs
+                        location_entry = None
+                        for loc_entry in latest_progress_logs.get("locations", []):
+                            if loc_entry.get("location") == location:
+                                location_entry = loc_entry
+                                break
+                        
+                        if location_entry:
+                            # Initialize off_market_check if it doesn't exist
+                            if "off_market_check" not in location_entry:
+                                location_entry["off_market_check"] = {}
+                            
+                            # Update off-market check status
+                            location_entry["off_market_check"]["status"] = "completed"
+                            location_entry["off_market_check"]["checked"] = total_checked
+                            location_entry["off_market_check"]["found"] = off_market_count
+                            location_entry["off_market_check"]["errors"] = error_count
+                            
+                            # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                            if current_job.status == JobStatus.RUNNING:
+                                await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=latest_progress_logs)
+                            elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                # Job is already final, only update progress_logs without changing status
+                                logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check completion")
+                                await db.jobs_collection.update_one(
+                                    {"job_id": job_id},
+                                    {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
+                                )
+                        else:
+                            logger.warning(f"   [OFF-MARKET] Location entry not found in progress_logs for location {location}")
                 except Exception as e:
                     logger.error(f"   [OFF-MARKET] Error updating final progress logs: {e}")
+                    try:
+                        import traceback as tb
+                        logger.debug(f"   [OFF-MARKET] Traceback: {tb.format_exc()}")
+                    except Exception:
+                        pass
             
             result = {
                 "missing_checked": total_checked,
@@ -2942,6 +3024,36 @@ class MLSScraper:
             
             if not missing_properties:
                 logger.debug(f"   [OFF-MARKET] No missing properties found in database for {city}, {state}")
+                # Still mark the check as completed even if there are no missing properties
+                if location and job_id:
+                    try:
+                        current_job = await db.get_job(job_id)
+                        if current_job:
+                            latest_progress_logs = current_job.progress_logs or {"locations": []}
+                            location_entry = None
+                            for loc_entry in latest_progress_logs.get("locations", []):
+                                if loc_entry.get("location") == location:
+                                    location_entry = loc_entry
+                                    break
+                            
+                            if location_entry:
+                                if "off_market_check" not in location_entry:
+                                    location_entry["off_market_check"] = {}
+                                location_entry["off_market_check"]["status"] = "completed"
+                                location_entry["off_market_check"]["checked"] = 0
+                                location_entry["off_market_check"]["found"] = 0
+                                location_entry["off_market_check"]["errors"] = 0
+                                
+                                if current_job.status == JobStatus.RUNNING:
+                                    await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=latest_progress_logs)
+                                elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                    await db.jobs_collection.update_one(
+                                        {"job_id": job_id},
+                                        {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
+                                    )
+                    except Exception as e:
+                        logger.error(f"   [OFF-MARKET] Error updating progress logs for no missing properties: {e}")
+                
                 return {
                     "missing_checked": 0,
                     "off_market_found": 0,
@@ -3109,15 +3221,53 @@ class MLSScraper:
                     await asyncio.sleep(2.0)  # 2 second delay between batches
             
             # Update final off-market check status in progress_logs
-            if location_entry and job_id:
+            if location and job_id:
                 try:
-                    location_entry["off_market_check"]["status"] = "completed"
-                    location_entry["off_market_check"]["checked"] = total_checked
-                    location_entry["off_market_check"]["found"] = off_market_count
-                    location_entry["off_market_check"]["errors"] = error_count
-                    await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                    # Re-fetch the latest job and progress_logs from database to avoid stale data
+                    current_job = await db.get_job(job_id)
+                    if not current_job:
+                        logger.warning(f"   [OFF-MARKET] Job {job_id} not found, cannot update progress logs")
+                    else:
+                        # Get latest progress_logs from job
+                        latest_progress_logs = current_job.progress_logs or {"locations": []}
+                        
+                        # Find location_entry in latest progress_logs
+                        location_entry = None
+                        for loc_entry in latest_progress_logs.get("locations", []):
+                            if loc_entry.get("location") == location:
+                                location_entry = loc_entry
+                                break
+                        
+                        if location_entry:
+                            # Initialize off_market_check if it doesn't exist
+                            if "off_market_check" not in location_entry:
+                                location_entry["off_market_check"] = {}
+                            
+                            # Update off-market check status
+                            location_entry["off_market_check"]["status"] = "completed"
+                            location_entry["off_market_check"]["checked"] = total_checked
+                            location_entry["off_market_check"]["found"] = off_market_count
+                            location_entry["off_market_check"]["errors"] = error_count
+                            
+                            # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                            if current_job.status == JobStatus.RUNNING:
+                                await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=latest_progress_logs)
+                            elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                # Job is already final, only update progress_logs without changing status
+                                logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check completion")
+                                await db.jobs_collection.update_one(
+                                    {"job_id": job_id},
+                                    {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
+                                )
+                        else:
+                            logger.warning(f"   [OFF-MARKET] Location entry not found in progress_logs for location {location}")
                 except Exception as e:
                     logger.error(f"   [OFF-MARKET] Error updating final progress logs: {e}")
+                    try:
+                        import traceback as tb
+                        logger.debug(f"   [OFF-MARKET] Traceback: {tb.format_exc()}")
+                    except Exception:
+                        pass
             
             result = {
                 "missing_checked": total_checked,

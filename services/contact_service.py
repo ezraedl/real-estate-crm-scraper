@@ -114,9 +114,19 @@ class ContactService:
                             contact_map[str(i)] = returned_contacts[i]
                     
                     return contact_map
+                elif response.status_code == 404:
+                    # Batch endpoint not implemented - fall back to individual calls
+                    # This is expected if the backend doesn't support batch operations yet
+                    return {}
                 else:
                     print(f"Failed to batch create/find contacts: {response.status_code} - {response.text}")
                     return {}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                # Batch endpoint not implemented - fall back to individual calls
+                return {}
+            print(f"Error batch creating/finding contacts via API: {e}")
+            return {}
         except Exception as e:
             print(f"Error batch creating/finding contacts via API: {e}")
             return {}

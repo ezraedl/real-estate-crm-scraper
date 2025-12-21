@@ -394,18 +394,167 @@ class HistoryTracker:
         return None
     
     async def get_property_history(self, property_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get property history (price and status changes)"""
+        """
+        Get property history (price and status changes) - combines price and status by timestamp.
+        Each entry contains both price change (if any) and status change (if any) that occurred at the same time.
+        """
         try:
-            cursor = self.history_collection.find(
-                {"property_id": property_id}
-            ).sort("timestamp", -1).limit(limit)
+            # Get change logs from embedded array
+            property_doc = await self.properties_collection.find_one(
+                {"property_id": property_id},
+                {"change_logs": 1}
+            )
             
+            if not property_doc or "change_logs" not in property_doc:
+                return []
+            
+            change_logs = property_doc.get("change_logs", [])
+            
+            # Group changes by timestamp (normalize to date for grouping)
+            from collections import defaultdict
+            changes_by_timestamp = defaultdict(lambda: {"price": None, "status": None, "timestamp": None, "job_id": None})
+            
+            price_fields = {'financial.list_price', 'financial.original_list_price', 'financial.price_per_sqft'}
+            status_fields = {'status', 'mls_status'}
+            
+            # Priority order for price fields (list_price is most important)
+            price_priority = {
+                'financial.list_price': 1,
+                'financial.original_list_price': 2,
+                'financial.price_per_sqft': 3
+            }
+            
+            for log in change_logs:
+                timestamp = log.get("timestamp")
+                job_id = log.get("job_id")
+                
+                # Normalize timestamp to date for grouping (changes on same day are grouped)
+                if isinstance(timestamp, datetime):
+                    normalized_date = timestamp.date()
+                elif isinstance(timestamp, str):
+                    try:
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        if dt.tzinfo:
+                            dt = dt.replace(tzinfo=None)
+                        normalized_date = dt.date()
+                    except:
+                        normalized_date = datetime.utcnow().date()
+                else:
+                    normalized_date = datetime.utcnow().date()
+                
+                # Handle simple format (single field)
+                if log.get("field"):
+                    field = log.get("field")
+                    old_value = log.get("old_value")
+                    new_value = log.get("new_value")
+                    
+                    if field in price_fields:
+                        # Only use if we don't have a price yet, or if this field has higher priority
+                        current_price = changes_by_timestamp[normalized_date]["price"]
+                        if current_price is None or price_priority.get(field, 99) < price_priority.get(current_price.get("field", ""), 99):
+                            changes_by_timestamp[normalized_date]["price"] = {
+                                "field": field,
+                                "old_value": old_value,
+                                "new_value": new_value
+                            }
+                            changes_by_timestamp[normalized_date]["timestamp"] = timestamp
+                            changes_by_timestamp[normalized_date]["job_id"] = job_id
+                    elif field in status_fields:
+                        # Status field - use 'status' field if available, otherwise mls_status
+                        if field == "status" or changes_by_timestamp[normalized_date]["status"] is None:
+                            changes_by_timestamp[normalized_date]["status"] = {
+                                "field": field,
+                                "old_value": old_value,
+                                "new_value": new_value
+                            }
+                            if changes_by_timestamp[normalized_date]["timestamp"] is None:
+                                changes_by_timestamp[normalized_date]["timestamp"] = timestamp
+                            if changes_by_timestamp[normalized_date]["job_id"] is None:
+                                changes_by_timestamp[normalized_date]["job_id"] = job_id
+                
+                # Handle consolidated format (multiple fields in one entry)
+                elif isinstance(log.get("field_changes"), dict):
+                    field_changes = log.get("field_changes", {})
+                    
+                    # Process price fields (prioritize list_price)
+                    price_changes_in_entry = []
+                    for field, change_data in field_changes.items():
+                        if field in price_fields:
+                            price_changes_in_entry.append((field, change_data))
+                    
+                    if price_changes_in_entry:
+                        # Sort by priority and take the highest priority one
+                        price_changes_in_entry.sort(key=lambda x: price_priority.get(x[0], 99))
+                        field, change_data = price_changes_in_entry[0]
+                        current_price = changes_by_timestamp[normalized_date]["price"]
+                        if current_price is None or price_priority.get(field, 99) < price_priority.get(current_price.get("field", ""), 99):
+                            changes_by_timestamp[normalized_date]["price"] = {
+                                "field": field,
+                                "old_value": change_data.get("old_value"),
+                                "new_value": change_data.get("new_value")
+                            }
+                            changes_by_timestamp[normalized_date]["timestamp"] = timestamp
+                            changes_by_timestamp[normalized_date]["job_id"] = job_id
+                    
+                    # Process status fields
+                    for field, change_data in field_changes.items():
+                        if field in status_fields:
+                            if field == "status" or changes_by_timestamp[normalized_date]["status"] is None:
+                                changes_by_timestamp[normalized_date]["status"] = {
+                                    "field": field,
+                                    "old_value": change_data.get("old_value"),
+                                    "new_value": change_data.get("new_value")
+                                }
+                                if changes_by_timestamp[normalized_date]["timestamp"] is None:
+                                    changes_by_timestamp[normalized_date]["timestamp"] = timestamp
+                                if changes_by_timestamp[normalized_date]["job_id"] is None:
+                                    changes_by_timestamp[normalized_date]["job_id"] = job_id
+            
+            # Convert grouped changes to history entries
             history = []
-            async for entry in cursor:
-                entry["_id"] = str(entry["_id"])
+            for normalized_date, change_data in sorted(changes_by_timestamp.items(), reverse=True):
+                timestamp = change_data["timestamp"] or datetime.combine(normalized_date, datetime.min.time())
+                price_info = change_data["price"]
+                status_info = change_data["status"]
+                
+                # Only include entries that have at least price or status change
+                if price_info is None and status_info is None:
+                    continue
+                
+                entry = {
+                    "property_id": property_id,
+                    "timestamp": timestamp,
+                    "job_id": change_data["job_id"]
+                }
+                
+                # Add price change data (prioritize list_price)
+                if price_info:
+                    old_price = price_info.get("old_value")
+                    new_price = price_info.get("new_value")
+                    if old_price is not None and new_price is not None:
+                        price_diff = new_price - old_price
+                        percent_change = ((price_diff / old_price) * 100) if old_price > 0 else 0
+                        entry["price_change"] = {
+                            "old_price": old_price,
+                            "new_price": new_price,
+                            "price_difference": price_diff,
+                            "percent_change": round(percent_change, 2),
+                            "change_type": "reduction" if price_diff < 0 else "increase",
+                            "field": price_info.get("field")
+                        }
+                
+                # Add status change data
+                if status_info:
+                    entry["status_change"] = {
+                        "old_status": status_info.get("old_value"),
+                        "new_status": status_info.get("new_value"),
+                        "field": status_info.get("field")
+                    }
+                
                 history.append(entry)
             
-            return history
+            # Limit results
+            return history[:limit]
             
         except Exception as e:
             logger.error(f"Error getting property history for {property_id}: {e}")
@@ -447,35 +596,109 @@ class HistoryTracker:
             change_logs = property_doc.get("change_logs", [])
             
             # Filter to price-related fields (supports both simple and consolidated formats)
+            # Priority: list_price > original_list_price > price_per_sqft
             price_fields = {'financial.list_price', 'financial.original_list_price', 'financial.price_per_sqft'}
-            price_changes = []
+            price_priority = {
+                'financial.list_price': 1,
+                'financial.original_list_price': 2,
+                'financial.price_per_sqft': 3
+            }
+            
+            # Group price changes by timestamp, keeping only the highest priority field per timestamp
+            price_changes_by_timestamp = {}
             
             for log in change_logs:
+                timestamp = log.get("timestamp")
+                job_id = log.get("job_id")
+                created_at = log.get("created_at")
+                
+                # Normalize timestamp for grouping
+                if isinstance(timestamp, datetime):
+                    normalized_ts = timestamp
+                elif isinstance(timestamp, str):
+                    try:
+                        normalized_ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        if normalized_ts.tzinfo:
+                            normalized_ts = normalized_ts.replace(tzinfo=None)
+                    except:
+                        normalized_ts = datetime.utcnow()
+                else:
+                    normalized_ts = datetime.utcnow()
+                
                 # Handle simple format (single field)
                 if log.get("field") and log.get("field") in price_fields:
-                    price_changes.append({
-                        "field": log.get("field"),
-                        "old_value": log.get("old_value"),
-                        "new_value": log.get("new_value"),
-                        "timestamp": log.get("timestamp"),
-                        "job_id": log.get("job_id"),
-                        "created_at": log.get("created_at")
-                    })
+                    field = log.get("field")
+                    old_value = log.get("old_value")
+                    new_value = log.get("new_value")
+                    
+                    if old_value is not None and new_value is not None:
+                        # Check if we already have a price change for this timestamp
+                        if normalized_ts not in price_changes_by_timestamp:
+                            price_changes_by_timestamp[normalized_ts] = {
+                                "field": field,
+                                "old_value": old_value,
+                                "new_value": new_value,
+                                "timestamp": timestamp,
+                                "job_id": job_id,
+                                "created_at": created_at
+                            }
+                        else:
+                            # Replace if this field has higher priority
+                            current_priority = price_priority.get(price_changes_by_timestamp[normalized_ts]["field"], 99)
+                            new_priority = price_priority.get(field, 99)
+                            if new_priority < current_priority:
+                                price_changes_by_timestamp[normalized_ts] = {
+                                    "field": field,
+                                    "old_value": old_value,
+                                    "new_value": new_value,
+                                    "timestamp": timestamp,
+                                    "job_id": job_id,
+                                    "created_at": created_at
+                                }
+                
                 # Handle consolidated format (multiple fields in one entry)
                 elif isinstance(log.get("field_changes"), dict):
                     field_changes = log.get("field_changes", {})
+                    
+                    # Find the highest priority price field in this entry
+                    price_fields_in_entry = []
                     for field, change_data in field_changes.items():
                         if field in price_fields:
-                            price_changes.append({
+                            old_val = change_data.get("old_value")
+                            new_val = change_data.get("new_value")
+                            if old_val is not None and new_val is not None:
+                                price_fields_in_entry.append((field, change_data))
+                    
+                    if price_fields_in_entry:
+                        # Sort by priority and take the highest priority one
+                        price_fields_in_entry.sort(key=lambda x: price_priority.get(x[0], 99))
+                        field, change_data = price_fields_in_entry[0]
+                        
+                        if normalized_ts not in price_changes_by_timestamp:
+                            price_changes_by_timestamp[normalized_ts] = {
                                 "field": field,
                                 "old_value": change_data.get("old_value"),
                                 "new_value": change_data.get("new_value"),
-                                "timestamp": log.get("timestamp"),
-                                "job_id": log.get("job_id"),
-                                "created_at": log.get("created_at")
-                            })
+                                "timestamp": timestamp,
+                                "job_id": job_id,
+                                "created_at": created_at
+                            }
+                        else:
+                            # Replace if this field has higher priority
+                            current_priority = price_priority.get(price_changes_by_timestamp[normalized_ts]["field"], 99)
+                            new_priority = price_priority.get(field, 99)
+                            if new_priority < current_priority:
+                                price_changes_by_timestamp[normalized_ts] = {
+                                    "field": field,
+                                    "old_value": change_data.get("old_value"),
+                                    "new_value": change_data.get("new_value"),
+                                    "timestamp": timestamp,
+                                    "job_id": job_id,
+                                    "created_at": created_at
+                                }
             
-            # Sort by timestamp (newest first) and limit
+            # Convert to list and sort by timestamp (newest first)
+            price_changes = list(price_changes_by_timestamp.values())
             price_changes.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
             
             # Convert to price_history format for backward compatibility
@@ -498,8 +721,9 @@ class HistoryTracker:
                         "old_price": old_value,
                         "new_price": new_value,
                         "price_difference": price_diff,
-                        "percent_change": percent_change,
-                        "change_type": "reduction" if price_diff < 0 else "increase"
+                        "percent_change": round(percent_change, 2),
+                        "change_type": "reduction" if price_diff < 0 else "increase",
+                        "field": log.get("field")  # Include field name for debugging
                     },
                     "job_id": log.get("job_id"),
                     "created_at": log.get("created_at")
