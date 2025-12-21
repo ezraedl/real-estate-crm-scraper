@@ -1528,6 +1528,18 @@ async def toggle_scheduled_job_status(scheduled_job_id: str, status_data: dict):
         logger.error(f"Error toggling job status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to toggle job status: {str(e)}")
 
+def get_status_value(status):
+    """Safely extract status value from enum or string"""
+    if status is None:
+        return None
+    if isinstance(status, JobStatus):
+        return status.value
+    if isinstance(status, str):
+        return status
+    if hasattr(status, 'value'):
+        return status.value
+    return str(status)
+
 # Get scheduled job details and run history
 @app.get("/scheduled-jobs/{scheduled_job_id}")
 async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = True, limit: int = 50):
@@ -1567,7 +1579,7 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
                 "incremental_runs_before_full": scheduled_job.incremental_runs_before_full,
                 "run_count": scheduled_job.run_count,
                 "last_run_at": scheduled_job.last_run_at,
-                "last_run_status": scheduled_job.last_run_status.value if scheduled_job.last_run_status else None,
+                "last_run_status": get_status_value(scheduled_job.last_run_status),
                 "last_run_job_id": scheduled_job.last_run_job_id,
                 "last_run_error_message": scheduled_job.last_run_error_message,
                 "last_run_properties_scraped": scheduled_job.last_run_properties_scraped,
