@@ -1806,9 +1806,9 @@ class MLSScraper:
                             else:
                                 logger.debug(f"   [VALIDATION] All properties match requested zip code '{expected_zip}'")
                 except asyncio.TimeoutError:
-                error_msg = f"Scraping all listing types in {location} timed out after {timeout_seconds} seconds"
-                logger.warning(f"   [TIMEOUT] {error_msg}")
-                scrape_error = error_msg
+                    error_msg = f"Scraping all listing types in {location} timed out after {timeout_seconds} seconds"
+                    logger.warning(f"   [TIMEOUT] {error_msg}")
+                    scrape_error = error_msg
                 except Exception as e:
                     # Catch all other exceptions from homeharvest/realtor (API errors, network errors, etc.)
                     error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
