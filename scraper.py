@@ -1771,57 +1771,57 @@ class MLSScraper:
                     )
                     # Update last request time AFTER request completes successfully
                     self.last_request_time = time.time()
-                
-                num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
-                logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
-                
-                # Anti-blocking: Add delay after successful request to avoid rapid-fire patterns
-                if num_properties > 0:
-                    post_request_delay = random.uniform(2.0, 4.0)  # 2-4 seconds after successful request
-                    logger.debug(f"   [THROTTLE] Waiting {post_request_delay:.1f}s after successful request to avoid blocking")
-                    await asyncio.sleep(post_request_delay)
-                
-                # Validate location if zip code was used
-                zip_match = re.search(r'\b(\d{5})\b', location)
-                expected_zip = zip_match.group(1) if zip_match else None
-                
-                if expected_zip and num_properties > 0:
-                    zip_codes_in_results = set()
-                    if 'zip_code' in properties_df.columns:
-                        zip_codes_in_results = set(properties_df['zip_code'].dropna().astype(str).str.zfill(5).unique())
-                    elif 'address' in properties_df.columns:
-                        for addr in properties_df['address'].dropna():
-                            if isinstance(addr, str):
-                                zip_match = re.search(r'\b(\d{5})\b', addr)
-                                if zip_match:
-                                    zip_codes_in_results.add(zip_match.group(1).zfill(5))
                     
-                    if zip_codes_in_results:
-                        matching_zips = [z for z in zip_codes_in_results if z == expected_zip.zfill(5)]
-                        if not matching_zips:
-                            logger.warning(
-                                f"   [WARNING] Location mismatch! Requested zip '{expected_zip}' but got zips: {sorted(zip_codes_in_results)[:10]}"
-                                f" (showing first 10 of {len(zip_codes_in_results)} unique zips)"
-                            )
-                        else:
-                            logger.debug(f"   [VALIDATION] All properties match requested zip code '{expected_zip}'")
-            except asyncio.TimeoutError:
+                    num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
+                    logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
+                    
+                    # Anti-blocking: Add delay after successful request to avoid rapid-fire patterns
+                    if num_properties > 0:
+                        post_request_delay = random.uniform(2.0, 4.0)  # 2-4 seconds after successful request
+                        logger.debug(f"   [THROTTLE] Waiting {post_request_delay:.1f}s after successful request to avoid blocking")
+                        await asyncio.sleep(post_request_delay)
+                    
+                    # Validate location if zip code was used
+                    zip_match = re.search(r'\b(\d{5})\b', location)
+                    expected_zip = zip_match.group(1) if zip_match else None
+                    
+                    if expected_zip and num_properties > 0:
+                        zip_codes_in_results = set()
+                        if 'zip_code' in properties_df.columns:
+                            zip_codes_in_results = set(properties_df['zip_code'].dropna().astype(str).str.zfill(5).unique())
+                        elif 'address' in properties_df.columns:
+                            for addr in properties_df['address'].dropna():
+                                if isinstance(addr, str):
+                                    zip_match = re.search(r'\b(\d{5})\b', addr)
+                                    if zip_match:
+                                        zip_codes_in_results.add(zip_match.group(1).zfill(5))
+                        
+                        if zip_codes_in_results:
+                            matching_zips = [z for z in zip_codes_in_results if z == expected_zip.zfill(5)]
+                            if not matching_zips:
+                                logger.warning(
+                                    f"   [WARNING] Location mismatch! Requested zip '{expected_zip}' but got zips: {sorted(zip_codes_in_results)[:10]}"
+                                    f" (showing first 10 of {len(zip_codes_in_results)} unique zips)"
+                                )
+                            else:
+                                logger.debug(f"   [VALIDATION] All properties match requested zip code '{expected_zip}'")
+                except asyncio.TimeoutError:
                 error_msg = f"Scraping all listing types in {location} timed out after {timeout_seconds} seconds"
                 logger.warning(f"   [TIMEOUT] {error_msg}")
                 scrape_error = error_msg
-            except Exception as e:
-                # Catch all other exceptions from homeharvest/realtor (API errors, network errors, etc.)
-                error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
-                error_type = type(e).__name__
-                logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
-                try:
-                    import traceback as tb
-                    logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {tb.format_exc()}")
-                except Exception:
-                    # Fallback if traceback import fails
-                    logger.debug(f"   [HOMEHARVEST ERROR] Could not format traceback")
-                scrape_error = error_msg
-                properties_df = None
+                except Exception as e:
+                    # Catch all other exceptions from homeharvest/realtor (API errors, network errors, etc.)
+                    error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
+                    error_type = type(e).__name__
+                    logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
+                    try:
+                        import traceback as tb
+                        logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {tb.format_exc()}")
+                    except Exception:
+                        # Fallback if traceback import fails
+                        logger.debug(f"   [HOMEHARVEST ERROR] Could not format traceback")
+                    scrape_error = error_msg
+                    properties_df = None
             
             # If the combined call failed or returned empty, try individual calls as fallback
             num_properties_from_combined = len(properties_df) if properties_df is not None and not properties_df.empty else 0
