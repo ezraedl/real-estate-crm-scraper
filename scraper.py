@@ -72,6 +72,11 @@ class MLSScraper:
         self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
         # Track if job runs were full scrapes (keyed by job_id)
         self.job_run_flags: Dict[str, Dict[str, Any]] = {}
+        # Global rate limiter: Only allow 1 request to Realtor.com at a time across ALL jobs
+        # This prevents multiple parallel jobs from overwhelming Realtor.com with simultaneous requests
+        # Even if 3-5 jobs run in parallel, they'll queue their requests through this semaphore
+        self.global_request_semaphore = asyncio.Semaphore(1)  # Only 1 concurrent request to Realtor.com
+        self.last_request_time = 0.0  # Track last request time for minimum delay enforcement
     
     async def start(self):
         """Start the scraper service"""
@@ -1727,29 +1732,54 @@ class MLSScraper:
             curl_cffi_status = "✅ enabled" if _curl_cffi_available else "❌ not available"
             logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} curl_cffi={curl_cffi_status} params={log_params}")
             
-            # Anti-blocking: Add random delay (2-5 seconds) before scraping to avoid rapid-fire requests
-            pre_scrape_delay = random.uniform(2.0, 5.0)
-            logger.debug(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping to avoid blocking")
-            await asyncio.sleep(pre_scrape_delay)
-            
-            # Scrape properties - Run blocking call in thread pool
-            timeout_seconds = 600  # 10 minutes timeout for all listing types combined
-            loop = asyncio.get_event_loop()
-            
-            properties_df = None
-            scrape_error = None
-            
-            try:
-                properties_df = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self.executor,
-                        lambda: scrape_property(**scrape_params)
-                    ),
-                    timeout=timeout_seconds
-                )
+            # Global rate limiting: Acquire semaphore to ensure only 1 request to Realtor.com at a time
+            # This coordinates requests across ALL parallel jobs, preventing simultaneous requests
+            async with self.global_request_semaphore:
+                # Calculate minimum delay between requests based on RATE_LIMIT_PER_MINUTE
+                # If RATE_LIMIT_PER_MINUTE=60, that's 1 request per second minimum
+                min_delay_between_requests = 60.0 / settings.RATE_LIMIT_PER_MINUTE  # e.g., 60/60 = 1.0 second
+                
+                # Check if we need to wait before making this request
+                current_time = time.time()
+                time_since_last_request = current_time - self.last_request_time
+                
+                if time_since_last_request < min_delay_between_requests:
+                    wait_time = min_delay_between_requests - time_since_last_request
+                    logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s to maintain {settings.RATE_LIMIT_PER_MINUTE} requests/min rate limit")
+                    await asyncio.sleep(wait_time)
+                
+                # Anti-blocking: Add random delay (3-7 seconds) before scraping to avoid rapid-fire requests
+                # Increased delay range to be more conservative
+                pre_scrape_delay = random.uniform(3.0, 7.0)
+                logger.debug(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping to avoid blocking")
+                await asyncio.sleep(pre_scrape_delay)
+                
+                # Scrape properties - Run blocking call in thread pool
+                timeout_seconds = 600  # 10 minutes timeout for all listing types combined
+                loop = asyncio.get_event_loop()
+                
+                properties_df = None
+                scrape_error = None
+                
+                try:
+                    properties_df = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            self.executor,
+                            lambda: scrape_property(**scrape_params)
+                        ),
+                        timeout=timeout_seconds
+                    )
+                    # Update last request time AFTER request completes successfully
+                    self.last_request_time = time.time()
                 
                 num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
                 logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
+                
+                # Anti-blocking: Add delay after successful request to avoid rapid-fire patterns
+                if num_properties > 0:
+                    post_request_delay = random.uniform(2.0, 4.0)  # 2-4 seconds after successful request
+                    logger.debug(f"   [THROTTLE] Waiting {post_request_delay:.1f}s after successful request to avoid blocking")
+                    await asyncio.sleep(post_request_delay)
                 
                 # Validate location if zip code was used
                 zip_match = re.search(r'\b(\d{5})\b', location)
@@ -1813,8 +1843,9 @@ class MLSScraper:
                 for idx, listing_type in enumerate(listing_types):
                     try:
                         # Anti-blocking: Add delay between fallback calls (except before first)
+                        # Increased delay with more randomization to avoid detection patterns
                         if idx > 0:
-                            fallback_delay = random.uniform(3.0, 6.0)  # 3-6 seconds between calls
+                            fallback_delay = random.uniform(8.0, 15.0)  # 8-15 seconds between calls
                             logger.debug(f"   [THROTTLE] Waiting {fallback_delay:.1f}s before fallback call for '{listing_type}'")
                             await asyncio.sleep(fallback_delay)
                         
@@ -1832,6 +1863,18 @@ class MLSScraper:
                         
                         logger.info(f"   [FALLBACK] Trying individual call for listing_type='{listing_type}' with params: {[k for k in individual_params.keys() if k != 'proxy']}")
                         
+                        # Global rate limiting: Acquire semaphore for fallback calls too
+                        async with self.global_request_semaphore:
+                            # Calculate minimum delay between requests
+                            min_delay_between_requests = 60.0 / settings.RATE_LIMIT_PER_MINUTE
+                            current_time = time.time()
+                            time_since_last_request = current_time - self.last_request_time
+                            
+                            if time_since_last_request < min_delay_between_requests:
+                                wait_time = min_delay_between_requests - time_since_last_request
+                                logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s before fallback call")
+                                await asyncio.sleep(wait_time)
+                        
                         individual_df = await asyncio.wait_for(
                             loop.run_in_executor(
                                 self.executor,
@@ -1840,9 +1883,17 @@ class MLSScraper:
                             timeout=timeout_seconds // len(listing_types)  # Divide timeout among types
                         )
                         
+                        # Update last request time AFTER fallback request completes
+                        self.last_request_time = time.time()
+                        
                         if individual_df is not None and not individual_df.empty:
                             num_individual = len(individual_df)
                             logger.info(f"   [FALLBACK] Individual call for '{listing_type}' returned {num_individual} properties")
+                            
+                            # Anti-blocking: Add delay after successful fallback call
+                            post_fallback_delay = random.uniform(3.0, 6.0)  # 3-6 seconds after successful fallback
+                            logger.debug(f"   [THROTTLE] Waiting {post_fallback_delay:.1f}s after successful fallback call")
+                            await asyncio.sleep(post_fallback_delay)
                             
                             # Convert to Property objects
                             for index, row in individual_df.iterrows():
@@ -1867,10 +1918,15 @@ class MLSScraper:
                             logger.debug(f"   [FALLBACK] Could not format traceback")
                         
                         # Anti-blocking: If blocked, add exponential backoff before next fallback call
+                        # Increased base delay and max delay to be more conservative
                         if blocked_by_realtor and idx < len(listing_types) - 1:
-                            backoff_delay = min(10.0 * (2 ** idx), 60.0)  # Exponential backoff, max 60s
-                            logger.warning(f"   [THROTTLE] Blocked by Realtor.com, waiting {backoff_delay:.1f}s before next fallback call")
-                            await asyncio.sleep(backoff_delay)
+                            base_delay = 15.0 * (2 ** idx)  # Start at 15s, then 30s, 60s, 120s
+                            backoff_delay = min(base_delay, 120.0)  # Cap at 120s (2 minutes)
+                            # Add randomization to avoid predictable patterns
+                            randomized_delay = backoff_delay + random.uniform(-2.0, 5.0)
+                            randomized_delay = max(10.0, randomized_delay)  # Minimum 10s
+                            logger.warning(f"   [THROTTLE] Blocked by Realtor.com, waiting {randomized_delay:.1f}s before next fallback call")
+                            await asyncio.sleep(randomized_delay)
                         
                         continue
                 
