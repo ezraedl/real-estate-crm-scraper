@@ -91,6 +91,9 @@ class MLSScraper:
                 # Process jobs
                 for job in pending_jobs:
                     if job.job_id not in self.current_jobs:
+                        # Add to current_jobs BEFORE creating task to prevent race condition
+                        # This ensures only one instance of a job can be processed at a time
+                        self.current_jobs[job.job_id] = job
                         asyncio.create_task(self.process_job(job))
                 
                 # Wait before checking for new jobs
@@ -162,7 +165,10 @@ class MLSScraper:
             logger.error(f"Failed to update job {job.job_id} status to RUNNING: {e}")
             # Continue anyway - we'll try again below
         
-        self.current_jobs[job.job_id] = job
+        # Job was already added to current_jobs in the main loop to prevent race conditions
+        # Just verify it's there (it should be)
+        if job.job_id not in self.current_jobs:
+            self.current_jobs[job.job_id] = job
         
         # Cancellation flag shared between main task and monitor
         cancel_flag = {"cancelled": False}
@@ -1864,6 +1870,7 @@ class MLSScraper:
                         logger.info(f"   [FALLBACK] Trying individual call for listing_type='{listing_type}' with params: {[k for k in individual_params.keys() if k != 'proxy']}")
                         
                         # Global rate limiting: Acquire semaphore for fallback calls too
+                        # Keep semaphore held during the entire request to ensure proper serialization
                         async with self.global_request_semaphore:
                             # Calculate minimum delay between requests
                             min_delay_between_requests = 60.0 / settings.RATE_LIMIT_PER_MINUTE
@@ -1874,17 +1881,18 @@ class MLSScraper:
                                 wait_time = min_delay_between_requests - time_since_last_request
                                 logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s before fallback call")
                                 await asyncio.sleep(wait_time)
-                        
-                        individual_df = await asyncio.wait_for(
-                            loop.run_in_executor(
-                                self.executor,
-                                lambda lt=listing_type, params=individual_params: scrape_property(**params)
-                            ),
-                            timeout=timeout_seconds // len(listing_types)  # Divide timeout among types
-                        )
-                        
-                        # Update last request time AFTER fallback request completes
-                        self.last_request_time = time.time()
+                            
+                            # Make the request while holding the semaphore
+                            individual_df = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    self.executor,
+                                    lambda lt=listing_type, params=individual_params: scrape_property(**params)
+                                ),
+                                timeout=timeout_seconds // len(listing_types)  # Divide timeout among types
+                            )
+                            
+                            # Update last request time AFTER fallback request completes
+                            self.last_request_time = time.time()
                         
                         if individual_df is not None and not individual_df.empty:
                             num_individual = len(individual_df)
