@@ -50,6 +50,8 @@ else:
     logger.warning("⚠️  curl_cffi is not available - anti-bot measures may be limited. Install with: pip install curl-cffi")
 
 # Verify homeharvest's curl_cffi status after import
+# Note: Official homeharvest package doesn't export USE_CURL_CFFI
+# Only the forked version (HomeHarvestLocal) exports this
 try:
     from homeharvest.core.scrapers import USE_CURL_CFFI, DEFAULT_IMPERSONATE
     if USE_CURL_CFFI:
@@ -58,8 +60,10 @@ try:
         logger.warning(f"⚠️  [HOMEHARVEST] curl_cffi is NOT enabled in homeharvest (DEFAULT_IMPERSONATE={DEFAULT_IMPERSONATE})")
         if _curl_cffi_available:
             logger.error("❌ [HOMEHARVEST] curl_cffi is available in scraper.py but NOT in homeharvest! This indicates an import issue.")
-except ImportError as e:
-    logger.warning(f"⚠️  [HOMEHARVEST] Could not check curl_cffi status in homeharvest: {e}")
+except (ImportError, AttributeError) as e:
+    # Official homeharvest package doesn't export USE_CURL_CFFI - this is expected
+    # Only log at debug level to avoid cluttering logs
+    logger.debug(f"[HOMEHARVEST] Using official homeharvest package (curl_cffi status check not available): {e}")
 except Exception as e:
     logger.warning(f"⚠️  [HOMEHARVEST] Error checking curl_cffi status in homeharvest: {e}")
 
@@ -356,6 +360,13 @@ class MLSScraper:
                             # So we don't need to append it again here
                             if location_summary:
                                 logger.info(f"Location {location} complete: {location_summary.get('inserted', 0)} inserted, {location_summary.get('updated', 0)} updated, {location_summary.get('skipped', 0)} skipped")
+                                
+                                # Anti-blocking: Add delay between locations to avoid rapid-fire patterns
+                                # This gives Realtor.com time to "forget" us between locations
+                                if i < len(job.locations) - 1:  # Don't delay after last location
+                                    between_location_delay = random.uniform(15.0, 30.0)  # 15-30 seconds between locations
+                                    logger.debug(f"   [THROTTLE] Waiting {between_location_delay:.1f}s before next location to avoid blocking")
+                                    await asyncio.sleep(between_location_delay)
                             
                             successful_locations += 1
                     
@@ -1170,7 +1181,9 @@ class MLSScraper:
                                 current_proxy_config, 
                                 listing_types_to_scrape, 
                                 limit=job.limit if job.limit else None,
-                                past_days=job.past_days if job.past_days else 90
+                                past_days=job.past_days if job.past_days else 90,
+                                cancel_flag=cancel_flag,
+                                location_last_update=location_last_update
                             ),
                             timeout=scrape_timeout
                         )
@@ -1601,9 +1614,18 @@ class MLSScraper:
                         except Exception as e:
                             logger.error(f"Error updating job status with enrichment progress: {e}")
     
-    async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None) -> Tuple[Dict[str, List[Property]], Optional[str]]:
+    async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None, cancel_flag: Optional[dict] = None, location_last_update: Optional[dict] = None) -> Tuple[Dict[str, List[Property]], Optional[str]]:
         """Scrape properties for all listing types in a single request. Returns a tuple of (dict mapping listing_type to properties, error_message if any)."""
         try:
+            # Helper to check for cancellation/timeout
+            def check_cancelled():
+                if cancel_flag:
+                    if cancel_flag.get("cancelled", False):
+                        return True, "Job cancelled"
+                    timed_out = cancel_flag.get("timed_out_locations", [])
+                    if location in timed_out:
+                        return True, f"Location {location} timed out"
+                return False, None
             logger.debug(f"   [DEBUG] _scrape_all_listing_types called with listing_types: {listing_types}")
             
             # Prepare scraping parameters - same logic as _scrape_listing_type but for all types
@@ -1752,13 +1774,31 @@ class MLSScraper:
                 if time_since_last_request < min_delay_between_requests:
                     wait_time = min_delay_between_requests - time_since_last_request
                     logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s to maintain {settings.RATE_LIMIT_PER_MINUTE} requests/min rate limit")
-                    await asyncio.sleep(wait_time)
+                    # Check for cancellation during wait (split into smaller chunks)
+                    chunk_size = 1.0  # Check every second
+                    waited = 0.0
+                    while waited < wait_time:
+                        cancelled, reason = check_cancelled()
+                        if cancelled:
+                            return {}, reason
+                        sleep_time = min(chunk_size, wait_time - waited)
+                        await asyncio.sleep(sleep_time)
+                        waited += sleep_time
                 
-                # Anti-blocking: Add random delay (3-7 seconds) before scraping to avoid rapid-fire requests
-                # Increased delay range to be more conservative
-                pre_scrape_delay = random.uniform(3.0, 7.0)
+                # Anti-blocking: Add random delay (10-20 seconds) before scraping to avoid rapid-fire requests
+                # Drastically increased to avoid blocking
+                pre_scrape_delay = random.uniform(10.0, 20.0)
                 logger.debug(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping to avoid blocking")
-                await asyncio.sleep(pre_scrape_delay)
+                # Check for cancellation during wait
+                chunk_size = 1.0
+                waited = 0.0
+                while waited < pre_scrape_delay:
+                    cancelled, reason = check_cancelled()
+                    if cancelled:
+                        return {}, reason
+                    sleep_time = min(chunk_size, pre_scrape_delay - waited)
+                    await asyncio.sleep(sleep_time)
+                    waited += sleep_time
                 
                 # Scrape properties - Run blocking call in thread pool
                 timeout_seconds = 600  # 10 minutes timeout for all listing types combined
@@ -1781,11 +1821,24 @@ class MLSScraper:
                     num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
                     logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
                     
+                    # Update location_last_update when properties are actually found
+                    if num_properties > 0 and location_last_update is not None:
+                        location_last_update[location] = datetime.utcnow()
+                    
                     # Anti-blocking: Add delay after successful request to avoid rapid-fire patterns
                     if num_properties > 0:
-                        post_request_delay = random.uniform(2.0, 4.0)  # 2-4 seconds after successful request
+                        post_request_delay = random.uniform(5.0, 10.0)  # 5-10 seconds after successful request
                         logger.debug(f"   [THROTTLE] Waiting {post_request_delay:.1f}s after successful request to avoid blocking")
-                        await asyncio.sleep(post_request_delay)
+                        # Check for cancellation during wait
+                        chunk_size = 1.0
+                        waited = 0.0
+                        while waited < post_request_delay:
+                            cancelled, reason = check_cancelled()
+                            if cancelled:
+                                return {}, reason
+                            sleep_time = min(chunk_size, post_request_delay - waited)
+                            await asyncio.sleep(sleep_time)
+                            waited += sleep_time
                     
                     # Validate location if zip code was used
                     zip_match = re.search(r'\b(\d{5})\b', location)
@@ -1880,7 +1933,16 @@ class MLSScraper:
                             if time_since_last_request < min_delay_between_requests:
                                 wait_time = min_delay_between_requests - time_since_last_request
                                 logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s before fallback call")
-                                await asyncio.sleep(wait_time)
+                                # Check for cancellation during wait
+                                chunk_size = 1.0
+                                waited = 0.0
+                                while waited < wait_time:
+                                    cancelled, reason = check_cancelled()
+                                    if cancelled:
+                                        return {}, reason
+                                    sleep_time = min(chunk_size, wait_time - waited)
+                                    await asyncio.sleep(sleep_time)
+                                    waited += sleep_time
                             
                             # Make the request while holding the semaphore
                             individual_df = await asyncio.wait_for(
@@ -1898,10 +1960,23 @@ class MLSScraper:
                             num_individual = len(individual_df)
                             logger.info(f"   [FALLBACK] Individual call for '{listing_type}' returned {num_individual} properties")
                             
+                            # Update location_last_update when properties are actually found
+                            if location_last_update is not None:
+                                location_last_update[location] = datetime.utcnow()
+                            
                             # Anti-blocking: Add delay after successful fallback call
-                            post_fallback_delay = random.uniform(3.0, 6.0)  # 3-6 seconds after successful fallback
+                            post_fallback_delay = random.uniform(8.0, 15.0)  # 8-15 seconds after successful fallback
                             logger.debug(f"   [THROTTLE] Waiting {post_fallback_delay:.1f}s after successful fallback call")
-                            await asyncio.sleep(post_fallback_delay)
+                            # Check for cancellation during wait
+                            chunk_size = 1.0
+                            waited = 0.0
+                            while waited < post_fallback_delay:
+                                cancelled, reason = check_cancelled()
+                                if cancelled:
+                                    return {}, reason
+                                sleep_time = min(chunk_size, post_fallback_delay - waited)
+                                await asyncio.sleep(sleep_time)
+                                waited += sleep_time
                             
                             # Convert to Property objects
                             for index, row in individual_df.iterrows():
@@ -1926,15 +2001,24 @@ class MLSScraper:
                             logger.debug(f"   [FALLBACK] Could not format traceback")
                         
                         # Anti-blocking: If blocked, add exponential backoff before next fallback call
-                        # Increased base delay and max delay to be more conservative
+                        # Drastically increased delays to avoid persistent blocking
                         if blocked_by_realtor and idx < len(listing_types) - 1:
-                            base_delay = 15.0 * (2 ** idx)  # Start at 15s, then 30s, 60s, 120s
-                            backoff_delay = min(base_delay, 120.0)  # Cap at 120s (2 minutes)
+                            base_delay = 30.0 * (2 ** idx)  # Start at 30s, then 60s, 120s, 240s
+                            backoff_delay = min(base_delay, 300.0)  # Cap at 300s (5 minutes)
                             # Add randomization to avoid predictable patterns
-                            randomized_delay = backoff_delay + random.uniform(-2.0, 5.0)
-                            randomized_delay = max(10.0, randomized_delay)  # Minimum 10s
+                            randomized_delay = backoff_delay + random.uniform(-5.0, 10.0)
+                            randomized_delay = max(30.0, randomized_delay)  # Minimum 30s
                             logger.warning(f"   [THROTTLE] Blocked by Realtor.com, waiting {randomized_delay:.1f}s before next fallback call")
-                            await asyncio.sleep(randomized_delay)
+                            # Check for cancellation during backoff (split into chunks)
+                            chunk_size = 5.0  # Check every 5 seconds
+                            waited = 0.0
+                            while waited < randomized_delay:
+                                cancelled, reason = check_cancelled()
+                                if cancelled:
+                                    return {}, reason
+                                sleep_time = min(chunk_size, randomized_delay - waited)
+                                await asyncio.sleep(sleep_time)
+                                waited += sleep_time
                         
                         continue
                 
