@@ -50,22 +50,41 @@ else:
     logger.warning("⚠️  curl_cffi is not available - anti-bot measures may be limited. Install with: pip install curl-cffi")
 
 # Verify homeharvest's curl_cffi status after import
-# Note: Official homeharvest package doesn't export USE_CURL_CFFI
-# Only the forked version (HomeHarvestLocal) exports this
+# HomeHarvestLocal should export USE_CURL_CFFI from homeharvest.core.scrapers
+# This check is informational and not critical - the service will work regardless
 try:
-    from homeharvest.core.scrapers import USE_CURL_CFFI, DEFAULT_IMPERSONATE
-    if USE_CURL_CFFI:
-        logger.info(f"✅ [HOMEHARVEST] curl_cffi is enabled in homeharvest with impersonate={DEFAULT_IMPERSONATE}")
-    else:
-        logger.warning(f"⚠️  [HOMEHARVEST] curl_cffi is NOT enabled in homeharvest (DEFAULT_IMPERSONATE={DEFAULT_IMPERSONATE})")
-        if _curl_cffi_available:
-            logger.error("❌ [HOMEHARVEST] curl_cffi is available in scraper.py but NOT in homeharvest! This indicates an import issue.")
-except (ImportError, AttributeError) as e:
-    # Official homeharvest package doesn't export USE_CURL_CFFI - this is expected
-    # Only log at debug level to avoid cluttering logs
-    logger.debug(f"[HOMEHARVEST] Using official homeharvest package (curl_cffi status check not available): {e}")
+    import homeharvest.core.scrapers as scrapers_module
+    # Try direct import first (most reliable)
+    try:
+        USE_CURL_CFFI = scrapers_module.USE_CURL_CFFI
+        DEFAULT_IMPERSONATE = getattr(scrapers_module, 'DEFAULT_IMPERSONATE', None)
+        if USE_CURL_CFFI:
+            logger.info(f"✅ [HOMEHARVEST] curl_cffi is enabled in homeharvest with impersonate={DEFAULT_IMPERSONATE}")
+        else:
+            logger.warning(f"⚠️  [HOMEHARVEST] curl_cffi is NOT enabled in homeharvest (DEFAULT_IMPERSONATE={DEFAULT_IMPERSONATE})")
+            if _curl_cffi_available:
+                logger.error("❌ [HOMEHARVEST] curl_cffi is available in scraper.py but NOT in homeharvest! This indicates an import issue.")
+    except AttributeError:
+        # Fallback: check if it exists using getattr
+        USE_CURL_CFFI = getattr(scrapers_module, 'USE_CURL_CFFI', None)
+        DEFAULT_IMPERSONATE = getattr(scrapers_module, 'DEFAULT_IMPERSONATE', None)
+        if USE_CURL_CFFI is not None:
+            if USE_CURL_CFFI:
+                logger.info(f"✅ [HOMEHARVEST] curl_cffi is enabled in homeharvest (via getattr) with impersonate={DEFAULT_IMPERSONATE}")
+            else:
+                logger.warning(f"⚠️  [HOMEHARVEST] curl_cffi is NOT enabled in homeharvest (DEFAULT_IMPERSONATE={DEFAULT_IMPERSONATE})")
+        else:
+            # Variable doesn't exist in this version
+            if _curl_cffi_available:
+                logger.debug(f"[HOMEHARVEST] USE_CURL_CFFI not found in homeharvest.core.scrapers, but curl_cffi is available and HOMEHARVEST_USE_CURL_CFFI is set")
+            else:
+                logger.debug(f"[HOMEHARVEST] USE_CURL_CFFI not found in homeharvest.core.scrapers (version may not export it)")
+except ImportError as e:
+    # Can't even import the module
+    logger.debug(f"[HOMEHARVEST] Could not import homeharvest.core.scrapers: {e}")
 except Exception as e:
-    logger.warning(f"⚠️  [HOMEHARVEST] Error checking curl_cffi status in homeharvest: {e}")
+    # Unexpected error during check - log at debug level since it's non-critical
+    logger.debug(f"[HOMEHARVEST] Could not check curl_cffi status in homeharvest: {e}")
 
 class MLSScraper:
     def __init__(self):
