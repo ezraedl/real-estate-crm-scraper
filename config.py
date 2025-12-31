@@ -47,7 +47,9 @@ class Settings:
     LOCATION_TIMEOUT_MINUTES = int(get_required_env("LOCATION_TIMEOUT_MINUTES", "10"))
     
     # Rate Limiting - Default values
-    RATE_LIMIT_PER_MINUTE = int(get_required_env("RATE_LIMIT_PER_MINUTE", "60"))
+    # Reduced from 60 to 10 requests per minute to avoid blocking
+    # This means minimum 6 seconds between requests
+    RATE_LIMIT_PER_MINUTE = int(get_required_env("RATE_LIMIT_PER_MINUTE", "10"))
     
     # DataImpulse Configuration - Optional
     # Set USE_DATAIMPULSE=false to disable DataImpulse proxy even if credentials are provided
