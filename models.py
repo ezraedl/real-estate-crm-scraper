@@ -511,6 +511,7 @@ class ImmediateScrapeRequest(BaseModel):
     foreclosure: bool = False
     limit: int = Field(default=100, le=1000)  # Lower limit for immediate requests
     past_days: Optional[int] = Field(None, ge=1, le=365)  # Focus on sold properties from last N days
+    force_rescrape: bool = Field(default=False, description="If True, skip database cache and perform fresh scrape from source")
 
 class ScheduledScrapeRequest(BaseModel):
     locations: List[str] = Field(..., min_items=1)

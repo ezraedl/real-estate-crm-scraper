@@ -223,9 +223,16 @@ Create and run an immediate scraping job that returns results synchronously.
 {
   "locations": ["Indianapolis, IN"],
   "listing_type": "for_sale",
-  "limit": 100
+  "limit": 100,
+  "force_rescrape": false
 }
 ```
+
+**Request Parameters:**
+- `locations` (required): Array of location strings to scrape
+- `listing_type` (optional): Type of listing to scrape (`for_sale`, `for_rent`, `sold`, `pending`)
+- `limit` (optional, default: 100): Maximum number of properties to scrape
+- `force_rescrape` (optional, default: false): If `true`, skips database cache and performs fresh scrape from source. Use this when you need the latest data even if properties exist in the database.
 
 **Response:**
 ```json
