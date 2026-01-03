@@ -2866,6 +2866,9 @@ class MLSScraper:
         properties that were already scraped in this job run.
         
         If location is provided, only checks properties in that specific location (zip code).
+        
+        Properties that are not found when queried by address are marked as OFF_MARKET since
+        they have been completely removed from listing sites.
         """
         try:
             # Only check for for_sale and pending properties
@@ -2878,13 +2881,31 @@ class MLSScraper:
             # Query database for properties with this scheduled_job_id that weren't scraped in THIS job run
             # Properties that have last_scraped < job_start_time (weren't updated in this scrape)
             # OR have last_scraped = null (never been scraped by this job)
+            # Also check scraped_at field as fallback, and handle missing scheduled_job_id by checking job_id pattern
+            import re
+            # Extract base scheduled_job_id from pattern (e.g., "scheduled_for_sale_1760461902" from "scheduled_scheduled_for_sale_1760461902_...")
+            base_scheduled_job_id = scheduled_job_id
+            if scheduled_job_id.startswith("scheduled_"):
+                # Remove leading "scheduled_" if present
+                base_scheduled_job_id = scheduled_job_id.replace("scheduled_", "", 1)
+            
             query = {
-                "scheduled_job_id": scheduled_job_id,
+                "$or": [
+                    {"scheduled_job_id": scheduled_job_id},
+                    {"scheduled_job_id": base_scheduled_job_id},
+                    # Fallback: match job_id pattern if scheduled_job_id field is missing
+                    {"job_id": {"$regex": f"^scheduled_{re.escape(base_scheduled_job_id)}"}},
+                    {"job_id": {"$regex": f"^scheduled_scheduled_{re.escape(base_scheduled_job_id)}"}}
+                ],
                 "listing_type": {"$in": listing_types_to_check},
                 "$or": [
                     {"last_scraped": {"$lt": job_start_time}},
                     {"last_scraped": None},
-                    {"last_scraped": {"$exists": False}}
+                    {"last_scraped": {"$exists": False}},
+                    # Also check scraped_at field as fallback
+                    {"scraped_at": {"$lt": job_start_time}},
+                    {"scraped_at": None},
+                    {"scraped_at": {"$exists": False}}
                 ]
             }
             
@@ -3077,7 +3098,8 @@ class MLSScraper:
                                         "$set": {
                                             "status": "OFF_MARKET",
                                             "mls_status": queried_property.mls_status or prop_data.get("mls_status"),
-                                            "scraped_at": datetime.utcnow()
+                                            "scraped_at": datetime.utcnow(),
+                                            "last_scraped": datetime.utcnow()  # Also update last_scraped for consistency
                                         }
                                     }
                                 )
@@ -3111,7 +3133,49 @@ class MLSScraper:
                             else:
                                 logger.debug(f"   [OFF-MARKET] Property {property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
                         else:
-                            logger.debug(f"   [OFF-MARKET] Property {property_id} not found in HomeHarvest (may be deleted)")
+                            # Property not found - mark as OFF_MARKET since it's been completely removed
+                            logger.info(f"   [OFF-MARKET] Property {property_id} not found in HomeHarvest - marking as OFF_MARKET")
+                            
+                            # Update property status to OFF_MARKET since it's no longer available
+                            old_status = prop_data.get("status") or 'UNKNOWN'
+                            await db.properties_collection.update_one(
+                                {"property_id": property_id},
+                                {
+                                    "$set": {
+                                        "status": "OFF_MARKET",
+                                        "mls_status": "DELISTED",
+                                        "scraped_at": datetime.utcnow(),
+                                        "last_scraped": datetime.utcnow()  # Also update last_scraped for consistency
+                                    }
+                                }
+                            )
+                            
+                            # Record status change in change_logs
+                            try:
+                                change_entry = {
+                                    "field": "status",
+                                    "old_value": old_status,
+                                    "new_value": "OFF_MARKET",
+                                    "change_type": "modified",
+                                    "timestamp": datetime.utcnow()
+                                }
+                                await history_tracker.record_change_logs(
+                                    property_id,
+                                    [change_entry],
+                                    "off_market_detection"
+                                )
+                            except Exception as e:
+                                logger.error(f"   [OFF-MARKET] Error recording change log: {e}")
+                            
+                            off_market_count += 1
+                            # Track per listing type (only for for_sale and pending)
+                            if listing_type in ['for_sale', 'pending']:
+                                off_market_by_listing_type[listing_type] = off_market_by_listing_type.get(listing_type, 0) + 1
+                                
+                                # Update progress_logs per listing type
+                                if location_entry and listing_type in location_entry.get("listing_types", {}):
+                                    location_entry["listing_types"][listing_type]["off_market"] = \
+                                        location_entry["listing_types"][listing_type].get("off_market", 0) + 1
                         
                         # Add delay between queries to avoid rate limiting
                         if i < len(batch) - 1:  # Don't delay after last property in batch
@@ -3200,10 +3264,42 @@ class MLSScraper:
                 logger.debug(f"Traceback: {tb.format_exc()}")
             except Exception:
                 logger.debug(f"Could not format traceback")
+            
+            # CRITICAL: Always mark as completed (even on error) so UI doesn't show "in_progress" forever
+            if location and job_id:
+                try:
+                    current_job = await db.get_job(job_id)
+                    if current_job:
+                        latest_progress_logs = current_job.progress_logs or {"locations": []}
+                        location_entry = None
+                        for loc_entry in latest_progress_logs.get("locations", []):
+                            if loc_entry.get("location") == location:
+                                location_entry = loc_entry
+                                break
+                        
+                        if location_entry:
+                            if "off_market_check" not in location_entry:
+                                location_entry["off_market_check"] = {}
+                            # Mark as failed if no properties were checked, completed if some were checked
+                            location_entry["off_market_check"]["status"] = "failed" if total_checked == 0 else "completed"
+                            location_entry["off_market_check"]["checked"] = total_checked
+                            location_entry["off_market_check"]["found"] = off_market_count
+                            location_entry["off_market_check"]["errors"] = error_count + 1
+                            location_entry["off_market_check"]["error_message"] = str(e)
+                            
+                            # Update even if job is completed
+                            await db.jobs_collection.update_one(
+                                {"job_id": job_id},
+                                {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
+                            )
+                            logger.info(f"   [OFF-MARKET] Updated progress logs to mark off-market check as failed/completed after error")
+                except Exception as update_error:
+                    logger.error(f"   [OFF-MARKET] Error updating progress logs on exception: {update_error}")
+            
             return {
-                "missing_checked": 0,
-                "off_market_found": 0,
-                "errors": 1,
+                "missing_checked": total_checked,
+                "off_market_found": off_market_count,
+                "errors": error_count + 1,
                 "skipped": False,
                 "error": str(e)
             }
@@ -3421,7 +3517,8 @@ class MLSScraper:
                                         "$set": {
                                             "status": "OFF_MARKET",
                                             "mls_status": queried_property.mls_status or prop_data.get("mls_status"),
-                                            "scraped_at": datetime.utcnow()
+                                            "scraped_at": datetime.utcnow(),
+                                            "last_scraped": datetime.utcnow()  # Also update last_scraped for consistency
                                         }
                                     }
                                 )
@@ -3455,7 +3552,49 @@ class MLSScraper:
                             else:
                                 logger.debug(f"   [OFF-MARKET] Property {property_id} still active (status={queried_property.status}, mls_status={queried_property.mls_status})")
                         else:
-                            logger.debug(f"   [OFF-MARKET] Property {property_id} not found in HomeHarvest (may be deleted)")
+                            # Property not found - mark as OFF_MARKET since it's been completely removed
+                            logger.info(f"   [OFF-MARKET] Property {property_id} not found in HomeHarvest - marking as OFF_MARKET")
+                            
+                            # Update property status to OFF_MARKET since it's no longer available
+                            old_status = prop_data.get("status") or 'UNKNOWN'
+                            await db.properties_collection.update_one(
+                                {"property_id": property_id},
+                                {
+                                    "$set": {
+                                        "status": "OFF_MARKET",
+                                        "mls_status": "DELISTED",
+                                        "scraped_at": datetime.utcnow(),
+                                        "last_scraped": datetime.utcnow()  # Also update last_scraped for consistency
+                                    }
+                                }
+                            )
+                            
+                            # Record status change in change_logs
+                            try:
+                                change_entry = {
+                                    "field": "status",
+                                    "old_value": old_status,
+                                    "new_value": "OFF_MARKET",
+                                    "change_type": "modified",
+                                    "timestamp": datetime.utcnow()
+                                }
+                                await history_tracker.record_change_logs(
+                                    property_id,
+                                    [change_entry],
+                                    "off_market_detection"
+                                )
+                            except Exception as e:
+                                logger.error(f"   [OFF-MARKET] Error recording change log: {e}")
+                            
+                            off_market_count += 1
+                            # Track per listing type (only for for_sale and pending)
+                            if listing_type in ['for_sale', 'pending']:
+                                off_market_by_listing_type[listing_type] = off_market_by_listing_type.get(listing_type, 0) + 1
+                                
+                                # Update progress_logs per listing type
+                                if location_entry and listing_type in location_entry.get("listing_types", {}):
+                                    location_entry["listing_types"][listing_type]["off_market"] = \
+                                        location_entry["listing_types"][listing_type].get("off_market", 0) + 1
                         
                         # Add delay between queries to avoid rate limiting
                         if i < len(batch) - 1:  # Don't delay after last property in batch
