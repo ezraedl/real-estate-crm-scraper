@@ -2703,6 +2703,21 @@ class MLSScraper:
                 last_scraped=datetime.utcnow()  # Set last_scraped timestamp
             )
             
+            # CRITICAL: Check if property status indicates it's off-market
+            # This ensures properties are correctly marked as OFF_MARKET even if HomeHarvest
+            # returns them with a different status (e.g., if they're off-market on Zillow/Realtor)
+            raw_status = safe_get('status')
+            raw_mls_status = safe_get('mls_status')
+            if self.is_off_market_status(raw_status, raw_mls_status):
+                # Property is off-market - update status accordingly
+                property_obj.status = "OFF_MARKET"
+                # If mls_status indicates off-market but isn't already set, set it
+                if raw_mls_status and not property_obj.mls_status:
+                    property_obj.mls_status = raw_mls_status
+                elif not property_obj.mls_status:
+                    # If no mls_status but status indicates off-market, set a default
+                    property_obj.mls_status = "DELISTED"
+            
             # Generate property_id from formatted address if not provided
             if not property_obj.property_id and property_obj.address and property_obj.address.formatted_address:
                 property_obj.property_id = property_obj.generate_property_id()
