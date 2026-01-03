@@ -883,75 +883,80 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
         logger.info(f"Available ListingType values: {[lt.value for lt in ListingType]}")
         logger.info(f"Received listing_type: {request.listing_type} (type: {type(request.listing_type)})")
         
-        # First, check database for existing properties
+        # First, check database for existing properties (unless force_rescrape is True)
         total_properties_scraped = 0
         total_properties_saved = 0
         all_properties = []
         
-        logger.info(f"Checking database for existing properties before scraping...")
-        
-        for location in request.locations:
-            try:
-                # Check if properties already exist in database for this location
-                # First try without listing_type filter to find any property at this address
-                existing_properties = await db.find_properties_by_location(
-                    location=location,
-                    listing_type=None,  # Don't filter by listing_type initially
-                    radius=request.radius or 0.1,
-                    limit=request.limit
-                )
-                
-                # If no properties found and listing_type is specified, try with the specific listing_type
-                if not existing_properties and request.listing_type:
+        # Skip database check if force_rescrape is True
+        if not getattr(request, 'force_rescrape', False):
+            logger.info(f"Checking database for existing properties before scraping...")
+            
+            for location in request.locations:
+                try:
+                    # Check if properties already exist in database for this location
+                    # First try without listing_type filter to find any property at this address
                     existing_properties = await db.find_properties_by_location(
                         location=location,
-                        listing_type=request.listing_type,
+                        listing_type=None,  # Don't filter by listing_type initially
                         radius=request.radius or 0.1,
                         limit=request.limit
                     )
-                
-                if existing_properties:
-                    logger.info(f"Found {len(existing_properties)} existing properties for location: {location}")
-                    all_properties.extend(existing_properties)
-                    total_properties_scraped += len(existing_properties)
-                    total_properties_saved += len(existing_properties)
-                    continue  # Skip scraping if we found existing properties
-                
-                logger.info(f"No existing properties found for location: {location}, proceeding with scraping...")
-                
-            except Exception as e:
-                logger.error(f"Error checking database for location {location}: {e}")
-                # Continue with scraping if database check fails
-                pass
-        
-        # If we found existing properties, return immediately for fast response
-        if all_properties:
-            logger.info(f"Found {len(all_properties)} existing properties, returning immediately for fast response")
-            # Calculate execution time
-            end_time = datetime.utcnow()
-            execution_time = round((end_time - start_time).total_seconds(), 2)
+                    
+                    # If no properties found and listing_type is specified, try with the specific listing_type
+                    if not existing_properties and request.listing_type:
+                        existing_properties = await db.find_properties_by_location(
+                            location=location,
+                            listing_type=request.listing_type,
+                            radius=request.radius or 0.1,
+                            limit=request.limit
+                        )
+                    
+                    if existing_properties:
+                        logger.info(f"Found {len(existing_properties)} existing properties for location: {location}")
+                        all_properties.extend(existing_properties)
+                        total_properties_scraped += len(existing_properties)
+                        total_properties_saved += len(existing_properties)
+                        continue  # Skip scraping if we found existing properties
+                    
+                    logger.info(f"No existing properties found for location: {location}, proceeding with scraping...")
+                    
+                except Exception as e:
+                    logger.error(f"Error checking database for location {location}: {e}")
+                    # Continue with scraping if database check fails
+                    pass
             
-            # Update job status in database
-            await db.update_job_status(job_id, JobStatus.COMPLETED)
-            logger.info(f"Updated job status to COMPLETED: {job_id}")
-            
-            # Return response with existing properties immediately
-            response = ImmediateScrapeResponse(
-                job_id=job_id,
-                status=JobStatus.COMPLETED,
-                message=f"Found {len(all_properties)} existing properties in {execution_time:.2f} seconds",
-                created_at=start_time,
-                completed_at=end_time,
-                execution_time_seconds=execution_time,
-                properties_scraped=len(all_properties),
-                properties_saved=len(all_properties),
-                properties=all_properties
-            )
-            
-            logger.info(f"Returning existing properties immediately: {job_id} - {len(all_properties)} properties")
-            return response
+            # If we found existing properties, return immediately for fast response
+            if all_properties:
+                logger.info(f"Found {len(all_properties)} existing properties, returning immediately for fast response")
+                # Calculate execution time
+                end_time = datetime.utcnow()
+                execution_time = round((end_time - start_time).total_seconds(), 2)
+                
+                # Update job status in database
+                await db.update_job_status(job_id, JobStatus.COMPLETED)
+                logger.info(f"Updated job status to COMPLETED: {job_id}")
+                
+                # Return response with existing properties immediately
+                response = ImmediateScrapeResponse(
+                    job_id=job_id,
+                    status=JobStatus.COMPLETED,
+                    message=f"Found {len(all_properties)} existing properties in {execution_time:.2f} seconds",
+                    created_at=start_time,
+                    completed_at=end_time,
+                    execution_time_seconds=execution_time,
+                    properties_scraped=len(all_properties),
+                    properties_saved=len(all_properties),
+                    properties=all_properties
+                )
+                
+                logger.info(f"Returning existing properties immediately: {job_id} - {len(all_properties)} properties")
+                return response
         else:
-            logger.info(f"No existing properties found, proceeding with scraping...")
+            logger.info(f"force_rescrape=True: Skipping database check, performing fresh scrape...")
+        
+        # Proceed with scraping (either no existing properties found, or force_rescrape is True)
+        logger.info(f"Proceeding with scraping for {len(request.locations)} location(s)...")
             # Continue with scraping for locations that didn't have existing properties
             for location in request.locations:
                 try:
