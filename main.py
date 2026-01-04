@@ -1045,8 +1045,6 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: 
                     )
                     
                     # Collect all properties from all listing types
-                    target_address = "8101 Wellsbrook Dr"
-                    target_found_in_results = False
                     for listing_type, properties_list in all_properties_by_type.items():
                         if properties_list:
                             logger.info(f"Found {len(properties_list)} {listing_type} properties for location: {location}")
@@ -1055,24 +1053,8 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: 
                                     prop.is_comp = True
                                 all_properties.append(prop)
                                 logger.debug(f"  - Found property: {prop.address.formatted_address if prop.address else 'No address'} (ID: {prop.property_id}, type: {listing_type})")
-                                
-                                # #region agent log
-                                if prop.address and prop.address.formatted_address:
-                                    is_target = target_address.lower() in prop.address.formatted_address.lower()
-                                    if is_target:
-                                        import json
-                                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"main.py:1046","message":"Target property found in final results","data":{"listing_type":listing_type,"property_id":prop.property_id,"address":prop.address.formatted_address,"status":prop.status,"mls_status":prop.mls_status},"timestamp":int(datetime.utcnow().timestamp()*1000)}) + '\n')
-                                        target_found_in_results = True
-                                # #endregion
                         else:
                             logger.info(f"No {listing_type} properties found for location: {location}")
-                    
-                    # #region agent log
-                    import json
-                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"main.py:1052","message":"Final results summary","data":{"total_properties":len(all_properties),"target_address":target_address,"target_found":target_found_in_results,"properties_by_type":{k:len(v) for k,v in all_properties_by_type.items()}},"timestamp":int(datetime.utcnow().timestamp()*1000)}) + '\n')
-                    # #endregion
                     
                     if scrape_error:
                         logger.warning(f"Scrape completed with error: {scrape_error}")
