@@ -1819,37 +1819,6 @@ class MLSScraper:
                     num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
                     logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
                     
-                    # #region agent log
-                    if properties_df is not None and not properties_df.empty:
-                        import json
-                        addresses_in_raw = []
-                        target_address = "8101 Wellsbrook Dr"
-                        target_found_in_raw = False
-                        target_row_index = None
-                        target_address_actual = None
-                        # Check ALL addresses, not just first 20
-                        if 'formatted_address' in properties_df.columns:
-                            all_addresses = properties_df['formatted_address'].dropna().astype(str).tolist()
-                            addresses_in_raw = all_addresses[:20]  # Sample for display
-                            for idx, addr in enumerate(all_addresses):
-                                if target_address.lower() in addr.lower():
-                                    target_found_in_raw = True
-                                    target_row_index = idx
-                                    target_address_actual = addr
-                                    break
-                        elif 'address' in properties_df.columns:
-                            all_addresses = [str(addr) for addr in properties_df['address'].dropna().tolist()]
-                            addresses_in_raw = all_addresses[:20]  # Sample for display
-                            for idx, addr in enumerate(all_addresses):
-                                if target_address.lower() in str(addr).lower():
-                                    target_found_in_raw = True
-                                    target_row_index = idx
-                                    target_address_actual = str(addr)
-                                    break
-                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A,B","location":"scraper.py:1863","message":"Raw DataFrame addresses (ALL checked)","data":{"num_properties":num_properties,"target_address":target_address,"target_found_in_raw":target_found_in_raw,"target_row_index":target_row_index,"target_address_actual":target_address_actual,"sample_addresses":addresses_in_raw},"timestamp":int(time.time()*1000)}) + '\n')
-                    # #endregion
-                    
                     # Update location_last_update when properties are actually found
                     if num_properties > 0 and location_last_update is not None:
                         location_last_update[location] = datetime.utcnow()
@@ -1963,39 +1932,14 @@ class MLSScraper:
                             
                             # Convert to Property objects
                             conversion_errors = 0
-                            target_address = "8101 Wellsbrook Dr"
-                            target_converted = False
                             for index, row in individual_df.iterrows():
                                 try:
-                                    # #region agent log
-                                    row_address = None
-                                    if 'formatted_address' in row.index:
-                                        row_address = str(row.get('formatted_address', ''))
-                                    elif 'address' in row.index:
-                                        row_address = str(row.get('address', ''))
-                                    is_target = target_address.lower() in str(row_address).lower() if row_address else False
-                                    # #endregion
-                                    
                                     property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
                                     if listing_type == "sold":
                                         property_obj.is_comp = True
                                     properties_by_type_fallback[listing_type].append(property_obj)
-                                    
-                                    # #region agent log
-                                    if is_target:
-                                        import json
-                                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2003","message":"Target property converted successfully","data":{"listing_type":listing_type,"property_id":property_obj.property_id,"address":property_obj.address.formatted_address if property_obj.address else None},"timestamp":int(time.time()*1000)}) + '\n')
-                                        target_converted = True
-                                    # #endregion
                                 except Exception as e:
                                     conversion_errors += 1
-                                    # #region agent log
-                                    if is_target:
-                                        import json
-                                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2008","message":"Target property conversion failed","data":{"listing_type":listing_type,"error":str(e),"row_address":row_address},"timestamp":int(time.time()*1000)}) + '\n')
-                                    # #endregion
                                     logger.error(f"Error converting property for {listing_type} in fallback: {e}")
                                     continue
                         else:
@@ -2080,39 +2024,16 @@ class MLSScraper:
                                 status_counts = unexpected_df['status'].value_counts().head(5)
                                 logger.warning(f"   [UNEXPECTED]     Status breakdown: {dict(status_counts)}")
                     
-                    target_address = "8101 Wellsbrook Dr"
                     for listing_type in listing_types:
                         type_df = properties_df[properties_df['listing_type'] == listing_type]
                         logger.debug(f"   [SPLIT] Found {len(type_df)} properties for listing_type '{listing_type}'")
                         for index, row in type_df.iterrows():
                             try:
-                                # #region agent log
-                                row_address = None
-                                if 'formatted_address' in row.index:
-                                    row_address = str(row.get('formatted_address', ''))
-                                elif 'address' in row.index:
-                                    row_address = str(row.get('address', ''))
-                                is_target = target_address.lower() in str(row_address).lower() if row_address else False
-                                # #endregion
-                                
                                 property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
                                 if listing_type == "sold":
                                     property_obj.is_comp = True
                                 properties_by_type[listing_type].append(property_obj)
-                                
-                                # #region agent log
-                                if is_target:
-                                    import json
-                                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2149","message":"Target property converted (main loop)","data":{"listing_type":listing_type,"property_id":property_obj.property_id,"address":property_obj.address.formatted_address if property_obj.address else None},"timestamp":int(time.time()*1000)}) + '\n')
-                                # #endregion
                             except Exception as e:
-                                # #region agent log
-                                if is_target:
-                                    import json
-                                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2154","message":"Target property conversion failed (main loop)","data":{"listing_type":listing_type,"error":str(e),"row_address":row_address},"timestamp":int(time.time()*1000)}) + '\n')
-                                # #endregion
                                 logger.error(f"Error converting property for {listing_type}: {e}")
                                 continue
                     
@@ -2130,52 +2051,6 @@ class MLSScraper:
                     logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column! Inferring listing type from 'status' field.")
                     logger.debug(f"   [SPLIT] Attempting to split {len(properties_df)} properties by inferring listing_type from status field")
                     
-                    # #region agent log - Log ALL raw status/MLS status combinations
-                    import json
-                    status_combinations = {}
-                    target_address = "8101 Wellsbrook Dr"
-                    target_status_info = None
-                    
-                    if 'status' in properties_df.columns and 'mls_status' in properties_df.columns:
-                        for idx, row in properties_df.iterrows():
-                            status_val = row.get('status') if 'status' in row.index else None
-                            mls_status_val = row.get('mls_status') if 'mls_status' in row.index else None
-                            status_key = f"{status_val}|{mls_status_val}"
-                            
-                            # Get address for this row
-                            address_val = None
-                            if 'formatted_address' in row.index:
-                                address_val = row.get('formatted_address')
-                            elif 'address' in row.index:
-                                addr = row.get('address')
-                                if isinstance(addr, str):
-                                    address_val = addr
-                                elif isinstance(addr, dict):
-                                    address_val = addr.get('formatted_address') or addr.get('street') or str(addr)
-                            
-                            if status_key not in status_combinations:
-                                status_combinations[status_key] = {
-                                    'count': 0,
-                                    'status': str(status_val) if status_val is not None else None,
-                                    'mls_status': str(mls_status_val) if mls_status_val is not None else None,
-                                    'sample_addresses': []
-                                }
-                            status_combinations[status_key]['count'] += 1
-                            if len(status_combinations[status_key]['sample_addresses']) < 5 and address_val:
-                                status_combinations[status_key]['sample_addresses'].append(str(address_val))
-                            
-                            # Check if this is the target property
-                            if address_val and target_address.lower() in str(address_val).lower():
-                                target_status_info = {
-                                    'status': str(status_val) if status_val is not None else None,
-                                    'mls_status': str(mls_status_val) if mls_status_val is not None else None,
-                                    'address': str(address_val),
-                                    'row_index': int(idx) if pd.notna(idx) else None
-                                }
-                    
-                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"scraper.py:2195","message":"Raw DataFrame status combinations","data":{"total_properties":len(properties_df),"status_combinations":status_combinations,"target_address":target_address,"target_status_info":target_status_info},"timestamp":int(time.time()*1000)}) + '\n')
-                    # #endregion
                     
                     def infer_listing_type_from_status(status_value: Any, mls_status_value: Any = None) -> Optional[str]:
                         """Infer listing type from status and mls_status fields"""
@@ -2252,14 +2127,6 @@ class MLSScraper:
                     unassigned_count = 0
                     unassigned_properties = []  # Track unassigned properties for logging
                     conversion_failure_count = 0
-                    target_address = "8101 Wellsbrook Dr"
-                    
-                    # #region agent log
-                    import json
-                    # Log before conversion loop starts
-                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"scraper.py:2224","message":"Starting property conversion loop","data":{"total_rows":len(properties_df),"target_address":target_address},"timestamp":int(time.time()*1000)}) + '\n')
-                    # #endregion
                     
                     for index, row in properties_df.iterrows():
                         try:
@@ -2279,26 +2146,6 @@ class MLSScraper:
                                 address_value = row.get('street')
                             elif 'formatted_address' in row.index:
                                 address_value = row.get('formatted_address')
-                            
-                            # #region agent log
-                            # More flexible matching - check for "8101" and "Wellsbrook" separately
-                            is_target = False
-                            # Safely check for pandas NA before using address_value in boolean context
-                            address_is_valid = address_value is not None
-                            if address_is_valid:
-                                try:
-                                    if pd.isna(address_value):
-                                        address_is_valid = False
-                                except (TypeError, ValueError):
-                                    pass
-                            if address_is_valid:
-                                addr_str = str(address_value).lower()
-                                # Check for exact match or partial match (address number + street name)
-                                if target_address.lower() in addr_str:
-                                    is_target = True
-                                elif "8101" in addr_str and "wellsbrook" in addr_str:
-                                    is_target = True
-                            # #endregion
                             
                             inferred_type = infer_listing_type_from_status(status_value, mls_status_value)
                             
@@ -2342,80 +2189,8 @@ class MLSScraper:
                                 property_obj.is_comp = True
                             properties_by_type[listing_type].append(property_obj)
                             inferred_count[listing_type] += 1
-                            
-                            # #region agent log
-                            if is_target:
-                                import json
-                                # Safely convert status and mls_status to strings, checking for pandas NA first
-                                status_safe = str(status_value) if (status_value is not None and not pd.isna(status_value)) else None
-                                mls_status_safe = str(mls_status_value) if (mls_status_value is not None and not pd.isna(mls_status_value)) else None
-                                with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2387","message":"Target property converted (inferred type)","data":{"listing_type":listing_type,"inferred_type":inferred_type,"property_id":property_obj.property_id,"address":property_obj.address.formatted_address if property_obj.address else None,"status":status_safe,"mls_status":mls_status_safe},"timestamp":int(time.time()*1000)}) + '\n')
-                            # #endregion
                         except Exception as e:
-                            # #region agent log
-                            import json
-                            import traceback
                             conversion_failure_count += 1
-                            # Check if this failed property is the target (even if is_target wasn't set due to address format mismatch)
-                            is_target_failed = False
-                            # Safely check for pandas NA before using address_value in boolean context
-                            address_is_valid = address_value is not None
-                            if address_is_valid:
-                                try:
-                                    if pd.isna(address_value):
-                                        address_is_valid = False
-                                except (TypeError, ValueError):
-                                    pass
-                            if address_is_valid:
-                                addr_str = str(address_value).lower()
-                                if target_address.lower() in addr_str or ("8101" in addr_str and "wellsbrook" in addr_str):
-                                    is_target_failed = True
-                            
-                            # Log all conversion failures with detailed error info (not just target)
-                            error_traceback = traceback.format_exc()
-                            
-                            # Safely convert status and mls_status to strings, checking for pandas NA first
-                            status_str_safe = None
-                            try:
-                                if status_value is not None:
-                                    if not pd.isna(status_value):
-                                        status_str_safe = str(status_value)
-                                    else:
-                                        status_str_safe = "<NA>"
-                            except:
-                                try:
-                                    status_str_safe = str(status_value) if status_value is not None else None
-                                except:
-                                    status_str_safe = None
-                            
-                            mls_status_str_safe = None
-                            try:
-                                if mls_status_value is not None:
-                                    if not pd.isna(mls_status_value):
-                                        mls_status_str_safe = str(mls_status_value)
-                                    else:
-                                        mls_status_str_safe = "<NA>"
-                            except:
-                                try:
-                                    mls_status_str_safe = str(mls_status_value) if mls_status_value is not None else None
-                                except:
-                                    mls_status_str_safe = None
-                            
-                            error_details = {
-                                "error": str(e),
-                                "error_type": type(e).__name__,
-                                "address_value": str(address_value) if address_value else None,
-                                "status": status_str_safe,
-                                "mls_status": mls_status_str_safe,
-                                "is_target_detected": is_target or is_target_failed,
-                                "conversion_failure_count": conversion_failure_count,
-                                "traceback": error_traceback
-                            }
-                            
-                            with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A,E","location":"scraper.py:2356","message":"Property conversion failed (inferred type)","data":error_details,"timestamp":int(time.time()*1000)}) + '\n')
-                            # #endregion
                             logger.error(f"Error converting property: {e}")
                             continue
                     
@@ -2423,12 +2198,6 @@ class MLSScraper:
                     total_split = sum(len(props) for props in properties_by_type.values())
                     split_summary = ', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])
                     logger.info(f"   [SPLIT] Inferred listing types from status field: {split_summary} (total: {total_split}, unassigned: {unassigned_count})")
-                    
-                    # #region agent log
-                    import json
-                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A,E","location":"scraper.py:2296","message":"Conversion loop summary","data":{"total_rows":len(properties_df),"successful_conversions":total_split,"conversion_failures":conversion_failure_count,"target_address":target_address},"timestamp":int(time.time()*1000)}) + '\n')
-                    # #endregion
                     
                     # Log details of unassigned properties
                     # NOTE: The ListingType enum in models.py only defines 4 types (for_sale, for_rent, sold, pending)
@@ -3166,6 +2935,13 @@ class MLSScraper:
         Properties that are not found when queried by address are marked as OFF_MARKET since
         they have been completely removed from listing sites.
         """
+        # Initialize variables at function start so they're always defined in exception handler
+        total_checked = 0
+        off_market_count = 0
+        error_count = 0
+        batch_number = 0
+        total_missing = 0
+        
         try:
             # Only check for for_sale and pending properties
             listing_types_to_check = ['for_sale', 'pending']
