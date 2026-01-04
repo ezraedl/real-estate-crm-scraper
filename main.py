@@ -912,7 +912,12 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: 
         all_properties = []
         
         # Skip database check if force_rescrape is True
-        if not getattr(request, 'force_rescrape', False):
+        # Access force_rescrape directly from the Pydantic model (it's always present with default=False)
+        force_rescrape = request.force_rescrape
+        logger.info(f"force_rescrape value: {force_rescrape} (type: {type(force_rescrape)})")
+        logger.info(f"Full request object: {request.model_dump()}")
+        logger.info(f"Request dict: {request.dict()}")
+        if not force_rescrape:
             logger.info(f"Checking database for existing properties before scraping...")
             
             for location in request.locations:
@@ -980,6 +985,10 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: 
         
         # Proceed with scraping (either no existing properties found, or force_rescrape is True)
         logger.info(f"Proceeding with scraping for {len(request.locations)} location(s)...")
+        
+        # Track diagnostic information across all locations
+        all_diagnostic_info = []
+        
         # Continue with scraping for locations that didn't have existing properties
         for location in request.locations:
             try:
@@ -1003,63 +1012,120 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: 
                 # Get proxy configuration
                 proxy_config = await scraper.get_proxy_config(temp_job)
                 
-                # Scrape the location directly using scrape_property (bypass scraper method)
-                logger.info(f"Calling scrape_property directly for: {location}")
+                # Use the scraper instance's method which properly uses the local HomeHarvest fork
+                logger.info(f"Using scraper._scrape_all_listing_types for: {location}")
                 logger.info(f"Scraper job config: listing_type={temp_job.listing_type}, limit={temp_job.limit}, radius={temp_job.radius}")
                 
-                # Import scrape_property directly to bypass scraper method issues
-                from homeharvest import scrape_property
-                import pandas as pd
+                # Include off_market for force_rescrape to catch properties that have moved off-market
+                listing_types = ["sold", "for_sale", "for_rent", "pending", "off_market"]
+                
+                # Track diagnostic information
+                diagnostic_info = {
+                    "listing_types_tried": listing_types.copy(),
+                    "listing_types_errors": {},
+                    "fallback_search_attempted": False,
+                    "fallback_search_error": None
+                }
                 
                 all_properties = []
-                # Prioritize sold properties first, then others
-                listing_types = ["sold", "for_sale", "for_rent", "pending"]
                 
-                for listing_type in listing_types:
-                    try:
-                        logger.info(f"Scraping {listing_type} properties directly...")
-                        
-                        scrape_params = {
-                            "location": location,
-                            "listing_type": listing_type,
-                            "mls_only": False,
-                            "limit": temp_job.limit or 200
-                        }
-                        
-                        # Add past_days for sold properties to focus on recent sales
-                        if listing_type == "sold" and temp_job.past_days:
-                            scrape_params["past_days"] = temp_job.past_days
-                            logger.info(f"Focusing on sold properties from last {temp_job.past_days} days")
-                        
-                        properties_df = scrape_property(**scrape_params)
-                        
-                        if not properties_df.empty:
-                            logger.info(f"Found {len(properties_df)} {listing_type} properties")
-                            
-                            # Convert DataFrame to Property models
-                            for index, row in properties_df.iterrows():
-                                try:
-                                    property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
-                                    if listing_type == "sold":
-                                        property_obj.is_comp = True
-                                    all_properties.append(property_obj)
-                                    
-                                    # Check if this is 1707
-                                    if '1707' in property_obj.address.formatted_address:
-                                        logger.info(f"🎯 FOUND 1707: {property_obj.address.formatted_address}")
-                                        
-                                except Exception as e:
-                                    logger.error(f"Error converting property: {e}")
-                                    continue
+                try:
+                    # Use the scraper's _scrape_all_listing_types method which handles the local HomeHarvest fork correctly
+                    logger.info(f"Scraping all listing types ({', '.join(listing_types)}) for location: {location}")
+                    
+                    all_properties_by_type, scrape_error = await scraper._scrape_all_listing_types(
+                        location=location,
+                        job=temp_job,
+                        proxy_config=proxy_config,
+                        listing_types=listing_types,
+                        limit=temp_job.limit or 200,
+                        past_days=temp_job.past_days if temp_job.past_days else None,
+                        cancel_flag=None,
+                        location_last_update=None
+                    )
+                    
+                    # Collect all properties from all listing types
+                    target_address = "8101 Wellsbrook Dr"
+                    target_found_in_results = False
+                    for listing_type, properties_list in all_properties_by_type.items():
+                        if properties_list:
+                            logger.info(f"Found {len(properties_list)} {listing_type} properties for location: {location}")
+                            for prop in properties_list:
+                                if listing_type == "sold":
+                                    prop.is_comp = True
+                                all_properties.append(prop)
+                                logger.debug(f"  - Found property: {prop.address.formatted_address if prop.address else 'No address'} (ID: {prop.property_id}, type: {listing_type})")
+                                
+                                # #region agent log
+                                if prop.address and prop.address.formatted_address:
+                                    is_target = target_address.lower() in prop.address.formatted_address.lower()
+                                    if is_target:
+                                        import json
+                                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"main.py:1046","message":"Target property found in final results","data":{"listing_type":listing_type,"property_id":prop.property_id,"address":prop.address.formatted_address,"status":prop.status,"mls_status":prop.mls_status},"timestamp":int(datetime.utcnow().timestamp()*1000)}) + '\n')
+                                        target_found_in_results = True
+                                # #endregion
                         else:
-                            logger.info(f"No {listing_type} properties found")
+                            logger.info(f"No {listing_type} properties found for location: {location}")
+                    
+                    # #region agent log
+                    import json
+                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"main.py:1052","message":"Final results summary","data":{"total_properties":len(all_properties),"target_address":target_address,"target_found":target_found_in_results,"properties_by_type":{k:len(v) for k,v in all_properties_by_type.items()}},"timestamp":int(datetime.utcnow().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    
+                    if scrape_error:
+                        logger.warning(f"Scrape completed with error: {scrape_error}")
+                        # Don't set this as an error for all types, just log it
+                    
+                    # If no properties found, try without listing_type filter (all types)
+                    if not all_properties:
+                        diagnostic_info["fallback_search_attempted"] = True
+                        logger.info(f"No properties found with specific listing types. Trying without listing_type filter (all types) for location: {location}")
+                        
+                        # Try with all listing types (including off_market) to get comprehensive results
+                        all_listing_types = ["sold", "for_sale", "for_rent", "pending", "off_market"]
+                        all_properties_by_type_fallback, fallback_error = await scraper._scrape_all_listing_types(
+                            location=location,
+                            job=temp_job,
+                            proxy_config=proxy_config,
+                            listing_types=all_listing_types,  # All types for comprehensive search
+                            limit=temp_job.limit or 200,
+                            past_days=None,
+                            cancel_flag=None,
+                            location_last_update=None
+                        )
+                        
+                        if all_properties_by_type_fallback:
+                            for listing_type, properties_list in all_properties_by_type_fallback.items():
+                                if properties_list:
+                                    logger.info(f"Found {len(properties_list)} {listing_type} properties (fallback search) for location: {location}")
+                                    for prop in properties_list:
+                                        all_properties.append(prop)
+                                        logger.debug(f"  - Found property (fallback): {prop.address.formatted_address if prop.address else 'No address'} (ID: {prop.property_id}, type: {listing_type})")
+                        
+                        if fallback_error:
+                            diagnostic_info["fallback_search_error"] = fallback_error
+                            logger.warning(f"Fallback search completed with error: {fallback_error}")
+                        elif not all_properties:
+                            logger.info(f"No properties found even without listing_type filter for location: {location}")
                             
-                    except Exception as e:
-                        logger.error(f"Error scraping {listing_type} properties: {e}")
-                        continue
+                except Exception as e:
+                    import traceback
+                    error_msg = f"{type(e).__name__}: {str(e)}"
+                    # Mark all listing types as having this error
+                    for listing_type in listing_types:
+                        diagnostic_info["listing_types_errors"][listing_type] = error_msg
+                    logger.error(f"Error scraping properties for location {location}: {e}")
+                    logger.error(f"Error type: {type(e).__name__}")
+                    logger.error(f"Error traceback: {traceback.format_exc()}")
                 
                 properties = all_properties
                 logger.info(f"Direct scraping returned {len(properties)} properties for: {location}")
+                
+                # Log diagnostic information
+                logger.info(f"Diagnostic info for {location}: {diagnostic_info}")
+                all_diagnostic_info.append({"location": location, "info": diagnostic_info})
                 
                 # Log the first few properties found for debugging
                 if properties:
@@ -1104,11 +1170,41 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: 
         await db.update_job_status(job_id, JobStatus.COMPLETED)
         logger.info(f"Updated job status to COMPLETED: {job_id}")
         
+        # Build diagnostic message
+        diagnostic_msg_parts = []
+        if all_diagnostic_info:
+            # Aggregate diagnostic info from all locations
+            all_listing_types_tried = set()
+            all_errors = {}
+            fallback_attempted = False
+            
+            for diag in all_diagnostic_info:
+                info = diag["info"]
+                all_listing_types_tried.update(info.get('listing_types_tried', []))
+                all_errors.update(info.get('listing_types_errors', {}))
+                if info.get('fallback_search_attempted'):
+                    fallback_attempted = True
+            
+            if all_listing_types_tried:
+                diagnostic_msg_parts.append(f"Listing types tried: {', '.join(sorted(all_listing_types_tried))}")
+            if all_errors:
+                errors = ', '.join([f"{lt}: {err}" for lt, err in all_errors.items()])
+                diagnostic_msg_parts.append(f"Errors: {errors}")
+            if fallback_attempted:
+                diagnostic_msg_parts.append("Fallback search (all types) attempted")
+        
+        # Include diagnostic info in message if no properties found
+        if total_properties_scraped == 0 and diagnostic_msg_parts:
+            diagnostic_msg = " | ".join(diagnostic_msg_parts)
+            message = f"No properties found in {execution_time:.2f} seconds. {diagnostic_msg}"
+        else:
+            message = f"Successfully scraped {total_properties_scraped} properties in {execution_time:.2f} seconds"
+        
         # Return response with property details
         response = ImmediateScrapeResponse(
             job_id=job_id,
             status=JobStatus.COMPLETED,
-            message=f"Successfully scraped {total_properties_scraped} properties in {execution_time:.2f} seconds",
+            message=message,
             created_at=start_time,
             completed_at=end_time,
             execution_time_seconds=execution_time,
@@ -1467,7 +1563,7 @@ async def get_scheduled_job_stats(scheduled_job_id: str, limit: int = 1000, toke
         
         # Count unique properties by listing type using aggregation to count distinct property_ids
         properties_by_type = {}
-        for listing_type in ["for_sale", "sold", "for_rent", "pending"]:
+        for listing_type in ["for_sale", "sold", "pending", "for_rent", "off_market"]:
             # Use aggregation to count distinct property_ids for this listing type
             pipeline = [
                 {
@@ -1722,7 +1818,7 @@ async def list_scheduled_jobs(
                 "status": job_data.get("status"),
                 "cron_expression": job_data.get("cron_expression"),
                 "locations": job_data.get("locations"),
-                "listing_types": job_data.get("listing_types", ["for_sale", "sold", "for_rent", "pending"]),  # New multi-select field
+                "listing_types": job_data.get("listing_types", ["for_sale", "sold", "pending", "for_rent", "off_market"]),  # New multi-select field (includes off_market by default)
                 "listing_type": job_data.get("listing_type"),  # Backward compatibility
                 "split_by_zip": job_data.get("split_by_zip", False),
                 "zip_batch_size": job_data.get("zip_batch_size"),
@@ -1765,7 +1861,7 @@ async def create_scheduled_job(job_data: dict, token_payload: dict = Depends(ver
         # Default to all listing types if not specified
         listing_types = job_data.get('listing_types')
         if not listing_types or len(listing_types) == 0:
-            listing_types = ["for_sale", "sold", "for_rent", "pending"]
+            listing_types = ["for_sale", "sold", "pending", "for_rent", "off_market"]  # Include off_market by default for comprehensive data
         
         # Get locations - ensure it's a list
         locations = job_data.get('locations', [])

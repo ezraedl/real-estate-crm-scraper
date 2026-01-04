@@ -99,7 +99,7 @@ class MLSScraper:
         # This prevents multiple parallel jobs from overwhelming Realtor.com with simultaneous requests
         # Even if 3-5 jobs run in parallel, they'll queue their requests through this semaphore
         self.global_request_semaphore = asyncio.Semaphore(1)  # Only 1 concurrent request to Realtor.com
-        self.last_request_time = 0.0  # Track last request time for minimum delay enforcement
+        # No need to track last_request_time - gateway manages rate limiting
     
     async def start(self):
         """Start the scraper service"""
@@ -278,7 +278,7 @@ class MLSScraper:
                     "timestamp": datetime.utcnow().isoformat(),
                     "event": "job_started",
                     "message": f"Job started - Processing {len(job.locations)} location(s)",
-                    "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "for_rent", "pending"],
+                    "listing_types": job.listing_types or (job.listing_type and [job.listing_type]) or ["for_sale", "sold", "pending", "for_rent", "off_market"],
                     "scrape_type": scrape_type,
                     "scrape_type_details": scrape_type_details
                 }
@@ -1040,18 +1040,25 @@ class MLSScraper:
                 logger.debug(f"   [TARGET] Scraping single type in {location}: {job.listing_type}")
             else:
                 # Default: scrape all types for comprehensive data
-                listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent"]
-                logger.debug(f"   [TARGET] Scraping ALL property types in {location} (default)")
+                # Note: 'off_market' is included but will be inferred from status, not passed to homeharvest
+                listing_types_to_scrape = ["for_sale", "sold", "pending", "for_rent", "off_market"]
+                logger.debug(f"   [TARGET] Scraping ALL property types in {location} (default, including off_market detection)")
             
-            # Enforce consistent order: for_sale, sold, pending, for_rent
-            preferred_order = ["for_sale", "sold", "pending", "for_rent"]
+            # Enforce consistent order: for_sale, sold, pending, for_rent, off_market
+            # Note: off_market properties are detected from status, not scraped directly
+            preferred_order = ["for_sale", "sold", "pending", "for_rent", "off_market"]
             listing_types_to_scrape = sorted(
                 listing_types_to_scrape,
                 key=lambda x: preferred_order.index(x) if x in preferred_order else 999
             )
             
+            # Filter out 'off_market' from listing_types passed to homeharvest (not supported by API)
+            # but keep it in listing_types_to_scrape for status inference
+            listing_types_for_homeharvest = [lt for lt in listing_types_to_scrape if lt != "off_market"]
+            
             logger.debug(f"   [DEBUG] Listing types to scrape (ordered): {listing_types_to_scrape}")
-            logger.debug(f"   [NOTE] 'off_market' not supported by homeharvest library")
+            logger.debug(f"   [DEBUG] Listing types for homeharvest API: {listing_types_for_homeharvest}")
+            logger.debug(f"   [NOTE] 'off_market' will be inferred from status field, not passed to homeharvest library")
             
             # Initialize location entry in progress_logs with new structure
             location_entry = {
@@ -1173,7 +1180,13 @@ class MLSScraper:
 
                     
                     start_time = datetime.utcnow()
-                    logger.info(f"   [FETCH] Fetching all listing types ({', '.join(listing_types_to_scrape)}) from {location} in a single request...")
+                    # Show both the requested types and what's being sent to homeharvest
+                    requested_types_str = ', '.join(listing_types_to_scrape)
+                    homeharvest_types_str = ', '.join([lt for lt in listing_types_to_scrape if lt != "off_market"])
+                    if "off_market" in listing_types_to_scrape:
+                        logger.info(f"   [FETCH] Fetching listing types ({homeharvest_types_str}) from {location} in a single request (off_market will be inferred from status)...")
+                    else:
+                        logger.info(f"   [FETCH] Fetching all listing types ({requested_types_str}) from {location} in a single request...")
                     
                     # Update location_last_update when scraping starts (for timeout detection)
                     if location_last_update is not None:
@@ -1194,16 +1207,16 @@ class MLSScraper:
                     try:
                         # Make a single call with all listing types
                         all_properties_by_type, scrape_error_info = await asyncio.wait_for(
-                            self._scrape_all_listing_types(
-                                location, 
-                                job, 
-                                current_proxy_config, 
-                                listing_types_to_scrape, 
-                                limit=job.limit if job.limit else None,
-                                past_days=job.past_days if job.past_days else 90,
-                                cancel_flag=cancel_flag,
-                                location_last_update=location_last_update
-                            ),
+                        self._scrape_all_listing_types(
+                            location, 
+                            job, 
+                            current_proxy_config, 
+                            listing_types_to_scrape,  # Pass full list including off_market for status inference
+                            limit=job.limit if job.limit else None,
+                            past_days=job.past_days if job.past_days else 90,
+                            cancel_flag=cancel_flag,
+                            location_last_update=location_last_update
+                        ),
                             timeout=scrape_timeout
                         )
                     except asyncio.TimeoutError:
@@ -1647,18 +1660,20 @@ class MLSScraper:
                 return False, None
             logger.debug(f"   [DEBUG] _scrape_all_listing_types called with listing_types: {listing_types}")
             
-            # Prepare scraping parameters - same logic as _scrape_listing_type but for all types
-            zip_match = re.search(r'\b(\d{5})\b', location)
-            if zip_match:
-                location_to_use = zip_match.group(1)
-                logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
-            else:
-                location_to_use = location
-                logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
+            # Filter out 'off_market' from listing_types passed to homeharvest (not supported by API)
+            # but keep it in listing_types for status inference later
+            listing_types_for_homeharvest = [lt for lt in listing_types if lt != "off_market"]
+            if "off_market" in listing_types and "off_market" not in listing_types_for_homeharvest:
+                logger.debug(f"   [DEBUG] 'off_market' filtered out from homeharvest API call (will be inferred from status)")
+            
+            # Prepare scraping parameters - use the original location as-is (no automatic zip code extraction)
+            # Zip code extraction should only happen per user request or for broad area searches
+            location_to_use = location
+            logger.debug(f"   [LOCATION] Using location as-is: '{location_to_use}'")
             
             scrape_params = {
                 "location": location_to_use,
-                "listing_type": listing_types,  # Pass list of listing types for single request
+                "listing_type": listing_types_for_homeharvest,  # Pass filtered list (without off_market) to homeharvest
                 "mls_only": False,
                 "limit": limit or job.limit or 10000
             }
@@ -1779,45 +1794,10 @@ class MLSScraper:
             curl_cffi_status = "✅ enabled" if _curl_cffi_available else "❌ not available"
             logger.info(f"   [HOMEHARVEST] Calling scrape_property proxy_enabled={proxy_enabled} proxy_host={proxy_host} proxy_port={proxy_port} curl_cffi={curl_cffi_status} params={log_params}")
             
-            # Global rate limiting: Acquire semaphore to ensure only 1 request to Realtor.com at a time
-            # This coordinates requests across ALL parallel jobs, preventing simultaneous requests
+            # Serialization: Acquire semaphore to ensure only 1 request at a time
+            # This prevents overwhelming the gateway with concurrent requests
+            # Gateway manages rate limiting, so we don't need client-side delays
             async with self.global_request_semaphore:
-                # Calculate minimum delay between requests based on RATE_LIMIT_PER_MINUTE
-                # If RATE_LIMIT_PER_MINUTE=60, that's 1 request per second minimum
-                min_delay_between_requests = 60.0 / settings.RATE_LIMIT_PER_MINUTE  # e.g., 60/60 = 1.0 second
-                
-                # Check if we need to wait before making this request
-                current_time = time.time()
-                time_since_last_request = current_time - self.last_request_time
-                
-                if time_since_last_request < min_delay_between_requests:
-                    wait_time = min_delay_between_requests - time_since_last_request
-                    logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s to maintain {settings.RATE_LIMIT_PER_MINUTE} requests/min rate limit")
-                    # Check for cancellation during wait (split into smaller chunks)
-                    chunk_size = 1.0  # Check every second
-                    waited = 0.0
-                    while waited < wait_time:
-                        cancelled, reason = check_cancelled()
-                        if cancelled:
-                            return {}, reason
-                        sleep_time = min(chunk_size, wait_time - waited)
-                        await asyncio.sleep(sleep_time)
-                        waited += sleep_time
-                
-                # Anti-blocking: Add random delay (10-20 seconds) before scraping to avoid rapid-fire requests
-                # Drastically increased to avoid blocking
-                pre_scrape_delay = random.uniform(10.0, 20.0)
-                logger.debug(f"   [THROTTLE] Waiting {pre_scrape_delay:.1f}s before scraping to avoid blocking")
-                # Check for cancellation during wait
-                chunk_size = 1.0
-                waited = 0.0
-                while waited < pre_scrape_delay:
-                    cancelled, reason = check_cancelled()
-                    if cancelled:
-                        return {}, reason
-                    sleep_time = min(chunk_size, pre_scrape_delay - waited)
-                    await asyncio.sleep(sleep_time)
-                    waited += sleep_time
                 
                 # Scrape properties - Run blocking call in thread pool
                 timeout_seconds = 600  # 10 minutes timeout for all listing types combined
@@ -1834,30 +1814,47 @@ class MLSScraper:
                         ),
                         timeout=timeout_seconds
                     )
-                    # Update last request time AFTER request completes successfully
-                    self.last_request_time = time.time()
+                    # Gateway manages rate limiting - no need to track request time
                     
                     num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
                     logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
+                    
+                    # #region agent log
+                    if properties_df is not None and not properties_df.empty:
+                        import json
+                        addresses_in_raw = []
+                        target_address = "8101 Wellsbrook Dr"
+                        target_found_in_raw = False
+                        target_row_index = None
+                        target_address_actual = None
+                        # Check ALL addresses, not just first 20
+                        if 'formatted_address' in properties_df.columns:
+                            all_addresses = properties_df['formatted_address'].dropna().astype(str).tolist()
+                            addresses_in_raw = all_addresses[:20]  # Sample for display
+                            for idx, addr in enumerate(all_addresses):
+                                if target_address.lower() in addr.lower():
+                                    target_found_in_raw = True
+                                    target_row_index = idx
+                                    target_address_actual = addr
+                                    break
+                        elif 'address' in properties_df.columns:
+                            all_addresses = [str(addr) for addr in properties_df['address'].dropna().tolist()]
+                            addresses_in_raw = all_addresses[:20]  # Sample for display
+                            for idx, addr in enumerate(all_addresses):
+                                if target_address.lower() in str(addr).lower():
+                                    target_found_in_raw = True
+                                    target_row_index = idx
+                                    target_address_actual = str(addr)
+                                    break
+                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A,B","location":"scraper.py:1863","message":"Raw DataFrame addresses (ALL checked)","data":{"num_properties":num_properties,"target_address":target_address,"target_found_in_raw":target_found_in_raw,"target_row_index":target_row_index,"target_address_actual":target_address_actual,"sample_addresses":addresses_in_raw},"timestamp":int(time.time()*1000)}) + '\n')
+                    # #endregion
                     
                     # Update location_last_update when properties are actually found
                     if num_properties > 0 and location_last_update is not None:
                         location_last_update[location] = datetime.utcnow()
                     
-                    # Anti-blocking: Add delay after successful request to avoid rapid-fire patterns
-                    if num_properties > 0:
-                        post_request_delay = random.uniform(5.0, 10.0)  # 5-10 seconds after successful request
-                        logger.debug(f"   [THROTTLE] Waiting {post_request_delay:.1f}s after successful request to avoid blocking")
-                        # Check for cancellation during wait
-                        chunk_size = 1.0
-                        waited = 0.0
-                        while waited < post_request_delay:
-                            cancelled, reason = check_cancelled()
-                            if cancelled:
-                                return {}, reason
-                            sleep_time = min(chunk_size, post_request_delay - waited)
-                            await asyncio.sleep(sleep_time)
-                            waited += sleep_time
+                    # No post-request delay needed - gateway manages rate limiting
                     
                     # Validate location if zip code was used
                     zip_match = re.search(r'\b(\d{5})\b', location)
@@ -1918,14 +1915,13 @@ class MLSScraper:
                 
                 properties_by_type_fallback: Dict[str, List[Property]] = {lt: [] for lt in listing_types}
                 
-                for idx, listing_type in enumerate(listing_types):
+                # Filter out 'off_market' from fallback calls since homeharvest doesn't support it
+                listing_types_for_fallback = [lt for lt in listing_types if lt != "off_market"]
+                
+                for idx, listing_type in enumerate(listing_types_for_fallback):
                     try:
-                        # Anti-blocking: Add delay between fallback calls (except before first)
-                        # Increased delay with more randomization to avoid detection patterns
-                        if idx > 0:
-                            fallback_delay = random.uniform(8.0, 15.0)  # 8-15 seconds between calls
-                            logger.debug(f"   [THROTTLE] Waiting {fallback_delay:.1f}s before fallback call for '{listing_type}'")
-                            await asyncio.sleep(fallback_delay)
+                        # No delay needed - gateway manages rate limiting
+                        # Semaphore ensures serialization (one request at a time)
                         
                         # Create params for individual listing type call
                         individual_params = scrape_params.copy()
@@ -1941,39 +1937,19 @@ class MLSScraper:
                         
                         logger.info(f"   [FALLBACK] Trying individual call for listing_type='{listing_type}' with params: {[k for k in individual_params.keys() if k != 'proxy']}")
                         
-                        # Global rate limiting: Acquire semaphore for fallback calls too
-                        # Keep semaphore held during the entire request to ensure proper serialization
+                        # Serialization: Acquire semaphore for fallback calls too
+                        # Gateway manages rate limiting, so we just ensure one request at a time
                         async with self.global_request_semaphore:
-                            # Calculate minimum delay between requests
-                            min_delay_between_requests = 60.0 / settings.RATE_LIMIT_PER_MINUTE
-                            current_time = time.time()
-                            time_since_last_request = current_time - self.last_request_time
-                            
-                            if time_since_last_request < min_delay_between_requests:
-                                wait_time = min_delay_between_requests - time_since_last_request
-                                logger.debug(f"   [GLOBAL RATE LIMIT] Waiting {wait_time:.2f}s before fallback call")
-                                # Check for cancellation during wait
-                                chunk_size = 1.0
-                                waited = 0.0
-                                while waited < wait_time:
-                                    cancelled, reason = check_cancelled()
-                                    if cancelled:
-                                        return {}, reason
-                                    sleep_time = min(chunk_size, wait_time - waited)
-                                    await asyncio.sleep(sleep_time)
-                                    waited += sleep_time
-                            
                             # Make the request while holding the semaphore
                             individual_df = await asyncio.wait_for(
                                 loop.run_in_executor(
                                     self.executor,
                                     lambda lt=listing_type, params=individual_params: scrape_property(**params)
                                 ),
-                                timeout=timeout_seconds // len(listing_types)  # Divide timeout among types
+                                timeout=timeout_seconds // max(1, len(listing_types_for_fallback))  # Divide timeout among types (excluding off_market)
                             )
                             
-                            # Update last request time AFTER fallback request completes
-                            self.last_request_time = time.time()
+                            # No delay needed - gateway manages rate limiting
                         
                         if individual_df is not None and not individual_df.empty:
                             num_individual = len(individual_df)
@@ -1983,28 +1959,43 @@ class MLSScraper:
                             if location_last_update is not None:
                                 location_last_update[location] = datetime.utcnow()
                             
-                            # Anti-blocking: Add delay after successful fallback call
-                            post_fallback_delay = random.uniform(8.0, 15.0)  # 8-15 seconds after successful fallback
-                            logger.debug(f"   [THROTTLE] Waiting {post_fallback_delay:.1f}s after successful fallback call")
-                            # Check for cancellation during wait
-                            chunk_size = 1.0
-                            waited = 0.0
-                            while waited < post_fallback_delay:
-                                cancelled, reason = check_cancelled()
-                                if cancelled:
-                                    return {}, reason
-                                sleep_time = min(chunk_size, post_fallback_delay - waited)
-                                await asyncio.sleep(sleep_time)
-                                waited += sleep_time
+                            # No post-request delay needed - gateway manages rate limiting
                             
                             # Convert to Property objects
+                            conversion_errors = 0
+                            target_address = "8101 Wellsbrook Dr"
+                            target_converted = False
                             for index, row in individual_df.iterrows():
                                 try:
+                                    # #region agent log
+                                    row_address = None
+                                    if 'formatted_address' in row.index:
+                                        row_address = str(row.get('formatted_address', ''))
+                                    elif 'address' in row.index:
+                                        row_address = str(row.get('address', ''))
+                                    is_target = target_address.lower() in str(row_address).lower() if row_address else False
+                                    # #endregion
+                                    
                                     property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
                                     if listing_type == "sold":
                                         property_obj.is_comp = True
                                     properties_by_type_fallback[listing_type].append(property_obj)
+                                    
+                                    # #region agent log
+                                    if is_target:
+                                        import json
+                                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2003","message":"Target property converted successfully","data":{"listing_type":listing_type,"property_id":property_obj.property_id,"address":property_obj.address.formatted_address if property_obj.address else None},"timestamp":int(time.time()*1000)}) + '\n')
+                                        target_converted = True
+                                    # #endregion
                                 except Exception as e:
+                                    conversion_errors += 1
+                                    # #region agent log
+                                    if is_target:
+                                        import json
+                                        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2008","message":"Target property conversion failed","data":{"listing_type":listing_type,"error":str(e),"row_address":row_address},"timestamp":int(time.time()*1000)}) + '\n')
+                                    # #endregion
                                     logger.error(f"Error converting property for {listing_type} in fallback: {e}")
                                     continue
                         else:
@@ -2089,16 +2080,39 @@ class MLSScraper:
                                 status_counts = unexpected_df['status'].value_counts().head(5)
                                 logger.warning(f"   [UNEXPECTED]     Status breakdown: {dict(status_counts)}")
                     
+                    target_address = "8101 Wellsbrook Dr"
                     for listing_type in listing_types:
                         type_df = properties_df[properties_df['listing_type'] == listing_type]
                         logger.debug(f"   [SPLIT] Found {len(type_df)} properties for listing_type '{listing_type}'")
                         for index, row in type_df.iterrows():
                             try:
+                                # #region agent log
+                                row_address = None
+                                if 'formatted_address' in row.index:
+                                    row_address = str(row.get('formatted_address', ''))
+                                elif 'address' in row.index:
+                                    row_address = str(row.get('address', ''))
+                                is_target = target_address.lower() in str(row_address).lower() if row_address else False
+                                # #endregion
+                                
                                 property_obj = self.convert_to_property_model(row, job.job_id, listing_type, job.scheduled_job_id)
                                 if listing_type == "sold":
                                     property_obj.is_comp = True
                                 properties_by_type[listing_type].append(property_obj)
+                                
+                                # #region agent log
+                                if is_target:
+                                    import json
+                                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2149","message":"Target property converted (main loop)","data":{"listing_type":listing_type,"property_id":property_obj.property_id,"address":property_obj.address.formatted_address if property_obj.address else None},"timestamp":int(time.time()*1000)}) + '\n')
+                                # #endregion
                             except Exception as e:
+                                # #region agent log
+                                if is_target:
+                                    import json
+                                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2154","message":"Target property conversion failed (main loop)","data":{"listing_type":listing_type,"error":str(e),"row_address":row_address},"timestamp":int(time.time()*1000)}) + '\n')
+                                # #endregion
                                 logger.error(f"Error converting property for {listing_type}: {e}")
                                 continue
                     
@@ -2116,15 +2130,105 @@ class MLSScraper:
                     logger.warning(f"   [WARNING] DataFrame doesn't have 'listing_type' column! Inferring listing type from 'status' field.")
                     logger.debug(f"   [SPLIT] Attempting to split {len(properties_df)} properties by inferring listing_type from status field")
                     
+                    # #region agent log - Log ALL raw status/MLS status combinations
+                    import json
+                    status_combinations = {}
+                    target_address = "8101 Wellsbrook Dr"
+                    target_status_info = None
+                    
+                    if 'status' in properties_df.columns and 'mls_status' in properties_df.columns:
+                        for idx, row in properties_df.iterrows():
+                            status_val = row.get('status') if 'status' in row.index else None
+                            mls_status_val = row.get('mls_status') if 'mls_status' in row.index else None
+                            status_key = f"{status_val}|{mls_status_val}"
+                            
+                            # Get address for this row
+                            address_val = None
+                            if 'formatted_address' in row.index:
+                                address_val = row.get('formatted_address')
+                            elif 'address' in row.index:
+                                addr = row.get('address')
+                                if isinstance(addr, str):
+                                    address_val = addr
+                                elif isinstance(addr, dict):
+                                    address_val = addr.get('formatted_address') or addr.get('street') or str(addr)
+                            
+                            if status_key not in status_combinations:
+                                status_combinations[status_key] = {
+                                    'count': 0,
+                                    'status': str(status_val) if status_val is not None else None,
+                                    'mls_status': str(mls_status_val) if mls_status_val is not None else None,
+                                    'sample_addresses': []
+                                }
+                            status_combinations[status_key]['count'] += 1
+                            if len(status_combinations[status_key]['sample_addresses']) < 5 and address_val:
+                                status_combinations[status_key]['sample_addresses'].append(str(address_val))
+                            
+                            # Check if this is the target property
+                            if address_val and target_address.lower() in str(address_val).lower():
+                                target_status_info = {
+                                    'status': str(status_val) if status_val is not None else None,
+                                    'mls_status': str(mls_status_val) if mls_status_val is not None else None,
+                                    'address': str(address_val),
+                                    'row_index': int(idx) if pd.notna(idx) else None
+                                }
+                    
+                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"scraper.py:2195","message":"Raw DataFrame status combinations","data":{"total_properties":len(properties_df),"status_combinations":status_combinations,"target_address":target_address,"target_status_info":target_status_info},"timestamp":int(time.time()*1000)}) + '\n')
+                    # #endregion
+                    
                     def infer_listing_type_from_status(status_value: Any, mls_status_value: Any = None) -> Optional[str]:
                         """Infer listing type from status and mls_status fields"""
-                        if status_value is None:
+                        # Safely check for None and pandas NA
+                        status_is_valid = status_value is not None
+                        if status_is_valid:
+                            try:
+                                if pd.isna(status_value):
+                                    status_is_valid = False
+                            except (TypeError, ValueError):
+                                pass
+                        
+                        if not status_is_valid:
                             return None
                         
-                        status_str = str(status_value).upper() if status_value else ""
-                        mls_status_str = str(mls_status_value).upper() if mls_status_value else ""
+                        # Safely convert status to string
+                        status_str = ""
+                        try:
+                            if status_is_valid:
+                                status_str = str(status_value).upper()
+                        except:
+                            status_str = ""
                         
-                        # Check for sold properties first (most specific)
+                        # Safely check for mls_status None and pandas NA
+                        mls_status_is_valid = mls_status_value is not None
+                        if mls_status_is_valid:
+                            try:
+                                if pd.isna(mls_status_value):
+                                    mls_status_is_valid = False
+                            except (TypeError, ValueError):
+                                pass
+                        
+                        # Safely convert mls_status to string
+                        mls_status_str = ""
+                        try:
+                            if mls_status_is_valid:
+                                mls_status_str = str(mls_status_value).upper()
+                        except:
+                            mls_status_str = ""
+                        
+                        # Check for off-market properties (EXPIRED, WITHDRAWN, CANCELLED, etc.)
+                        # NOTE: OFF_MARKET is requested in scraping (force_rescrape=true) but not in ListingType enum
+                        # Properties with OFF_MARKET status should be handled if "off_market" is in listing_types
+                        off_market_indicators = ['EXPIRED', 'WITHDRAWN', 'CANCELLED', 'INACTIVE', 'DELISTED', 
+                                                'TEMPORARILY OFF MARKET', 'TEMPORARILY_OFF_MARKET', 'OFF_MARKET']
+                        if status_str == 'OFF_MARKET' or any(indicator in mls_status_str for indicator in off_market_indicators):
+                            # Return "off_market" if it's in the requested listing_types, otherwise fallback to "sold"
+                            if "off_market" in listing_types:
+                                return "off_market"
+                            # If off_market not in listing_types, fallback to sold (legacy behavior)
+                            return "sold"
+                        
+                        # Check for sold properties
                         if "SOLD" in status_str or "SOLD" in mls_status_str:
                             return "sold"
                         
@@ -2147,6 +2251,15 @@ class MLSScraper:
                     inferred_count = {lt: 0 for lt in listing_types}
                     unassigned_count = 0
                     unassigned_properties = []  # Track unassigned properties for logging
+                    conversion_failure_count = 0
+                    target_address = "8101 Wellsbrook Dr"
+                    
+                    # #region agent log
+                    import json
+                    # Log before conversion loop starts
+                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"scraper.py:2224","message":"Starting property conversion loop","data":{"total_rows":len(properties_df),"target_address":target_address},"timestamp":int(time.time()*1000)}) + '\n')
+                    # #endregion
                     
                     for index, row in properties_df.iterrows():
                         try:
@@ -2164,21 +2277,63 @@ class MLSScraper:
                                     address_value = addr.get('formatted_address') or addr.get('street') or str(addr)
                             elif 'street' in row.index:
                                 address_value = row.get('street')
+                            elif 'formatted_address' in row.index:
+                                address_value = row.get('formatted_address')
+                            
+                            # #region agent log
+                            # More flexible matching - check for "8101" and "Wellsbrook" separately
+                            is_target = False
+                            # Safely check for pandas NA before using address_value in boolean context
+                            address_is_valid = address_value is not None
+                            if address_is_valid:
+                                try:
+                                    if pd.isna(address_value):
+                                        address_is_valid = False
+                                except (TypeError, ValueError):
+                                    pass
+                            if address_is_valid:
+                                addr_str = str(address_value).lower()
+                                # Check for exact match or partial match (address number + street name)
+                                if target_address.lower() in addr_str:
+                                    is_target = True
+                                elif "8101" in addr_str and "wellsbrook" in addr_str:
+                                    is_target = True
+                            # #endregion
                             
                             inferred_type = infer_listing_type_from_status(status_value, mls_status_value)
                             
+                            # Safely check inferred_type for pandas NA before using in boolean context
+                            inferred_type_is_valid = inferred_type is not None
+                            if inferred_type_is_valid:
+                                try:
+                                    if pd.isna(inferred_type):
+                                        inferred_type_is_valid = False
+                                except (TypeError, ValueError):
+                                    pass
+                            
                             # Use inferred type if it's in our requested listing types, otherwise use first type as fallback
-                            if inferred_type and inferred_type in listing_types:
+                            if inferred_type_is_valid and inferred_type in listing_types:
                                 listing_type = inferred_type
                             else:
                                 listing_type = listing_types[0]  # Fallback to first type
                                 unassigned_count += 1
                                 # Track unassigned property details for logging
+                                # Safely convert address_value to string, checking for pandas NA first
+                                address_str_safe = 'Unknown'
+                                if address_value is not None:
+                                    try:
+                                        if not pd.isna(address_value):
+                                            address_str_safe = str(address_value)
+                                    except (TypeError, ValueError):
+                                        try:
+                                            address_str_safe = str(address_value) if address_value is not None else 'Unknown'
+                                        except:
+                                            address_str_safe = 'Unknown'
                                 unassigned_properties.append({
-                                    'status': str(status_value) if status_value is not None else 'None',
-                                    'mls_status': str(mls_status_value) if mls_status_value is not None else 'None',
+                                    'status': str(status_value) if (status_value is not None and not pd.isna(status_value)) else 'None',
+                                    'mls_status': str(mls_status_value) if (mls_status_value is not None and not pd.isna(mls_status_value)) else 'None',
                                     'inferred_type': inferred_type if inferred_type else 'None',
-                                    'address': address_value if address_value else 'Unknown',
+                                    'address': address_str_safe,
                                     'assigned_to': listing_type  # Show which type it was assigned to as fallback
                                 })
                             
@@ -2187,7 +2342,80 @@ class MLSScraper:
                                 property_obj.is_comp = True
                             properties_by_type[listing_type].append(property_obj)
                             inferred_count[listing_type] += 1
+                            
+                            # #region agent log
+                            if is_target:
+                                import json
+                                # Safely convert status and mls_status to strings, checking for pandas NA first
+                                status_safe = str(status_value) if (status_value is not None and not pd.isna(status_value)) else None
+                                mls_status_safe = str(mls_status_value) if (mls_status_value is not None and not pd.isna(mls_status_value)) else None
+                                with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"scraper.py:2387","message":"Target property converted (inferred type)","data":{"listing_type":listing_type,"inferred_type":inferred_type,"property_id":property_obj.property_id,"address":property_obj.address.formatted_address if property_obj.address else None,"status":status_safe,"mls_status":mls_status_safe},"timestamp":int(time.time()*1000)}) + '\n')
+                            # #endregion
                         except Exception as e:
+                            # #region agent log
+                            import json
+                            import traceback
+                            conversion_failure_count += 1
+                            # Check if this failed property is the target (even if is_target wasn't set due to address format mismatch)
+                            is_target_failed = False
+                            # Safely check for pandas NA before using address_value in boolean context
+                            address_is_valid = address_value is not None
+                            if address_is_valid:
+                                try:
+                                    if pd.isna(address_value):
+                                        address_is_valid = False
+                                except (TypeError, ValueError):
+                                    pass
+                            if address_is_valid:
+                                addr_str = str(address_value).lower()
+                                if target_address.lower() in addr_str or ("8101" in addr_str and "wellsbrook" in addr_str):
+                                    is_target_failed = True
+                            
+                            # Log all conversion failures with detailed error info (not just target)
+                            error_traceback = traceback.format_exc()
+                            
+                            # Safely convert status and mls_status to strings, checking for pandas NA first
+                            status_str_safe = None
+                            try:
+                                if status_value is not None:
+                                    if not pd.isna(status_value):
+                                        status_str_safe = str(status_value)
+                                    else:
+                                        status_str_safe = "<NA>"
+                            except:
+                                try:
+                                    status_str_safe = str(status_value) if status_value is not None else None
+                                except:
+                                    status_str_safe = None
+                            
+                            mls_status_str_safe = None
+                            try:
+                                if mls_status_value is not None:
+                                    if not pd.isna(mls_status_value):
+                                        mls_status_str_safe = str(mls_status_value)
+                                    else:
+                                        mls_status_str_safe = "<NA>"
+                            except:
+                                try:
+                                    mls_status_str_safe = str(mls_status_value) if mls_status_value is not None else None
+                                except:
+                                    mls_status_str_safe = None
+                            
+                            error_details = {
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "address_value": str(address_value) if address_value else None,
+                                "status": status_str_safe,
+                                "mls_status": mls_status_str_safe,
+                                "is_target_detected": is_target or is_target_failed,
+                                "conversion_failure_count": conversion_failure_count,
+                                "traceback": error_traceback
+                            }
+                            
+                            with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A,E","location":"scraper.py:2356","message":"Property conversion failed (inferred type)","data":error_details,"timestamp":int(time.time()*1000)}) + '\n')
+                            # #endregion
                             logger.error(f"Error converting property: {e}")
                             continue
                     
@@ -2196,9 +2424,21 @@ class MLSScraper:
                     split_summary = ', '.join([f'{lt}={len(properties_by_type[lt])}' for lt in listing_types])
                     logger.info(f"   [SPLIT] Inferred listing types from status field: {split_summary} (total: {total_split}, unassigned: {unassigned_count})")
                     
+                    # #region agent log
+                    import json
+                    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A,E","location":"scraper.py:2296","message":"Conversion loop summary","data":{"total_rows":len(properties_df),"successful_conversions":total_split,"conversion_failures":conversion_failure_count,"target_address":target_address},"timestamp":int(time.time()*1000)}) + '\n')
+                    # #endregion
+                    
                     # Log details of unassigned properties
+                    # NOTE: The ListingType enum in models.py only defines 4 types (for_sale, for_rent, sold, pending)
+                    # However, "off_market" is requested in scraping when force_rescrape=true (see main.py line 1015)
+                    # Properties with OFF_MARKET status (status='OFF_MARKET' or mls_status='EXPIRED', etc.) 
+                    # are now handled by infer_listing_type_from_status() if "off_market" is in listing_types
+                    # If "off_market" is not in listing_types, they fallback to 'sold' (legacy behavior)
+                    expected_types_list = ', '.join(listing_types)
                     if unassigned_count > 0:
-                        logger.warning(f"   [UNASSIGNED] Found {unassigned_count} properties that don't match any of the 4 expected listing types:")
+                        logger.warning(f"   [UNASSIGNED] Found {unassigned_count} properties that don't match any of the expected listing types ({expected_types_list}):")
                         # Group by status for cleaner logging
                         status_groups = {}
                         for prop in unassigned_properties:
@@ -2234,22 +2474,14 @@ class MLSScraper:
         try:
             logger.debug(f"   [DEBUG] _scrape_listing_type called with listing_type: '{listing_type}' (type: {type(listing_type)})")
             
-            # Prepare scraping parameters - remove all filtering for comprehensive data
+            # Prepare scraping parameters - use the original location as-is (no automatic zip code extraction)
+            # Zip code extraction should only happen per user request or for broad area searches
             # According to homeharvest docs, location accepts: zip code, city, "city, state", or full address
-            # For best precision, use just the zip code when available (e.g., "46201" instead of "Indianapolis, IN 46201")
-            # Extract zip code if present for more precise matching
-            zip_match = re.search(r'\b(\d{5})\b', location)
-            if zip_match:
-                # Use just the zip code for maximum precision (per homeharvest documentation)
-                location_to_use = zip_match.group(1)
-                logger.debug(f"   [LOCATION] Using zip code '{location_to_use}' from location '{location}' for precise matching")
-            else:
-                # No zip code found, use the original location format (city, state, or full address)
-                location_to_use = location
-                logger.debug(f"   [LOCATION] Using full location format '{location_to_use}' (no zip code found)")
+            location_to_use = location
+            logger.debug(f"   [LOCATION] Using location as-is: '{location_to_use}'")
             
             scrape_params = {
-                "location": location_to_use,  # Use zip code if available, otherwise original format
+                "location": location_to_use,  # Use location as-is (no automatic zip code extraction)
                 "listing_type": listing_type,
                 "mls_only": False,  # Always use all sources for maximum data
                 "limit": limit or job.limit or 10000  # Use high limit for comprehensive scraping
@@ -2492,14 +2724,25 @@ class MLSScraper:
             def safe_get(key, default=None):
                 try:
                     value = prop_data.get(key, default)
-                    # Convert pandas NaN/NA to None
-                    if pd.isna(value):
-                        return None
+                    # Convert pandas NaN/NA to None - check multiple ways to be safe
+                    if value is not None:
+                        try:
+                            # Check for pandas NA types (NaN, NA, NaT)
+                            if pd.isna(value):
+                                return None
+                            # Also check for pandas.NA singleton explicitly
+                            if hasattr(pd, 'NA') and value is pd.NA:
+                                return None
+                        except (TypeError, ValueError):
+                            # If pd.isna fails, continue with value
+                            pass
                     # Handle None values
                     if value is None:
                         return None
                     return value
-                except:
+                except Exception as e:
+                    # Log the error for debugging
+                    logger.debug(f"Error in safe_get for key '{key}': {e}")
                     return default
             
             # Helper function to safely get boolean values (handles pandas NA properly)
@@ -2708,13 +2951,29 @@ class MLSScraper:
             # returns them with a different status (e.g., if they're off-market on Zillow/Realtor)
             raw_status = safe_get('status')
             raw_mls_status = safe_get('mls_status')
+            # Ensure raw_mls_status is not pandas NA before using in boolean context
+            # Double-check in case safe_get didn't catch it
+            try:
+                if raw_mls_status is not None and pd.isna(raw_mls_status):
+                    raw_mls_status = None
+            except (TypeError, ValueError):
+                # If pd.isna fails, treat as None
+                raw_mls_status = None
+            
             if self.is_off_market_status(raw_status, raw_mls_status):
                 # Property is off-market - update status accordingly
                 property_obj.status = "OFF_MARKET"
                 # If mls_status indicates off-market but isn't already set, set it
-                if raw_mls_status and not property_obj.mls_status:
-                    property_obj.mls_status = raw_mls_status
-                elif not property_obj.mls_status:
+                # Use safe check to avoid pandas NA boolean ambiguity
+                if raw_mls_status is not None:
+                    try:
+                        # Double-check it's not pandas NA
+                        if not pd.isna(raw_mls_status):
+                            property_obj.mls_status = raw_mls_status
+                    except (TypeError, ValueError):
+                        # If check fails, skip setting mls_status
+                        pass
+                if not property_obj.mls_status:
                     # If no mls_status but status indicates off-market, set a default
                     property_obj.mls_status = "DELISTED"
             
@@ -2768,15 +3027,37 @@ class MLSScraper:
     
     def is_off_market_status(self, status: Optional[str], mls_status: Optional[str]) -> bool:
         """Check if a property status indicates it's off-market"""
-        if not status and not mls_status:
+        # Safely check for None/NA values to avoid pandas NA boolean ambiguity
+        status_is_valid = False
+        mls_status_is_valid = False
+        
+        try:
+            if status is not None:
+                # Check if it's pandas NA
+                if not pd.isna(status):
+                    status_is_valid = True
+        except (TypeError, ValueError):
+            # If pd.isna fails, assume it's valid if not None
+            status_is_valid = (status is not None)
+        
+        try:
+            if mls_status is not None:
+                # Check if it's pandas NA
+                if not pd.isna(mls_status):
+                    mls_status_is_valid = True
+        except (TypeError, ValueError):
+            # If pd.isna fails, assume it's valid if not None
+            mls_status_is_valid = (mls_status is not None)
+        
+        if not status_is_valid and not mls_status_is_valid:
             return False
         
         # Check status field
-        if status and status.upper() == 'OFF_MARKET':
+        if status_is_valid and str(status).upper() == 'OFF_MARKET':
             return True
         
         # Check mls_status field for off-market indicators
-        if mls_status:
+        if mls_status_is_valid:
             mls_status_upper = mls_status.upper()
             off_market_indicators = [
                 'EXPIRED', 'WITHDRAWN', 'CANCELLED', 'INACTIVE', 'DELISTED',
