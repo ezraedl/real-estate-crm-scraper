@@ -71,5 +71,8 @@ class Settings:
     JWT_SECRET = get_required_env("JWT_SECRET", "default-secret-key")
     NODE_ENV = get_required_env("NODE_ENV", "production")
     GOOGLE_CLIENT_ID = get_required_env("GOOGLE_CLIENT_ID", "")
+    
+    # CORS Configuration
+    CORS_ORIGINS = get_required_env("CORS_ORIGINS", "*")
 
 settings = Settings()
