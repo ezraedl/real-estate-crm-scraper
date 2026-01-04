@@ -42,8 +42,7 @@ class ListingType(str, Enum):
     FOR_RENT = "for_rent"
     SOLD = "sold"
     PENDING = "pending"
-    # Note: OFF_MARKET is not supported by homeharvest library
-    # OFF_MARKET = "off_market"  # Disabled - not supported by homeharvest
+    OFF_MARKET = "off_market"  # Used when force_rescrape=true to catch properties that have moved off-market
 
 class ScheduledJob(BaseModel):
     """
