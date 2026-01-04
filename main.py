@@ -49,13 +49,33 @@ app = FastAPI(
 
 # Add CORS middleware
 # Allow frontend domain and Authorization header for JWT tokens
-allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",") if os.getenv("CORS_ORIGINS") else ["*"]
+cors_origins_str = settings.CORS_ORIGINS.strip() if settings.CORS_ORIGINS else "*"
+if cors_origins_str == "*":
+    # When using allow_credentials=True, cannot use ["*"] - must specify origins
+    # Default to allowing all origins by not restricting (but this is less secure)
+    allowed_origins = ["*"]
+    allow_creds = False  # Cannot use credentials with wildcard
+else:
+    # Split by comma, trim whitespace, and remove trailing slashes
+    allowed_origins = []
+    for origin in cors_origins_str.split(","):
+        origin = origin.strip()
+        if origin:
+            # Remove trailing slash for consistency
+            if origin.endswith("/"):
+                origin = origin[:-1]
+            allowed_origins.append(origin)
+    allow_creds = True  # Can use credentials when origins are specified
+
+logger.info(f"CORS configured with origins: {allowed_origins}, allow_credentials: {allow_creds}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=allow_creds,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],  # Includes Authorization header for JWT tokens
+    expose_headers=["*"],
 )
 
 # Helper function to determine remaining work from progress logs
