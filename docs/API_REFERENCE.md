@@ -12,7 +12,27 @@ http://localhost:8000
 
 ## Authentication
 
-Currently, the API does not require authentication. For production use, implement proper authentication mechanisms.
+The API requires JWT authentication for all endpoints except `/health`.
+
+### Authentication Header
+
+Include the JWT token in the Authorization header:
+
+```
+Authorization: Bearer <your-jwt-token>
+```
+
+### Obtaining a JWT Token
+
+JWT tokens are issued by the backend service after user authentication. The token must be signed with the same `JWT_SECRET` that the scraper service is configured with.
+
+### Public Endpoints
+
+- `GET /health` - Health check endpoint (no authentication required)
+
+### Protected Endpoints
+
+All other endpoints require a valid JWT token in the Authorization header. Requests without a valid token will receive a `401 Unauthorized` response.
 
 ## Endpoints
 

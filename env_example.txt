@@ -1,3 +1,13 @@
+# JWT Secret (must match backend JWT_SECRET)
+# This secret is used to verify JWT tokens issued by the backend
+# IMPORTANT: Must be the same value as JWT_SECRET in backend .env file
+JWT_SECRET=your-jwt-secret-key-here
+
+# CORS Origins (comma-separated, use * for all origins)
+# For production, specify exact origins: http://localhost:5173,https://your-frontend-domain.com
+# For development, you can use * to allow all origins
+CORS_ORIGINS=*
+
 # MongoDB Configuration
 MONGODB_URL=mongodb://localhost:27017
 DATABASE_NAME=mls_scraper

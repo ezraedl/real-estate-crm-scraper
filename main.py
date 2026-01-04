@@ -34,6 +34,7 @@ from scraper import scraper
 from proxy_manager import proxy_manager
 from config import settings
 from services.zip_code_service import zip_code_service
+from middleware.auth import verify_token
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -47,12 +48,14 @@ app = FastAPI(
 )
 
 # Add CORS middleware
+# Allow frontend domain and Authorization header for JWT tokens
+allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",") if os.getenv("CORS_ORIGINS") else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # Includes Authorization header for JWT tokens
 )
 
 # Helper function to determine remaining work from progress logs
@@ -470,7 +473,7 @@ async def shutdown_event():
 
 # Active Properties Re-scraping Management
 @app.get("/active-properties-config")
-async def get_active_properties_config():
+async def get_active_properties_config(token_payload: dict = Depends(verify_token)):
     """Get the current configuration for active properties re-scraping"""
     try:
         job = await db.scheduled_jobs_collection.find_one({
@@ -506,7 +509,7 @@ async def get_active_properties_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/active-properties-config")
-async def update_active_properties_config(request: dict):
+async def update_active_properties_config(request: dict, token_payload: dict = Depends(verify_token)):
     """Update the configuration for active properties re-scraping"""
     try:
         cron_expression = request.get("cron_expression")
@@ -556,7 +559,7 @@ async def update_active_properties_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/active-properties-config/toggle")
-async def toggle_active_properties_rescraping(request: dict):
+async def toggle_active_properties_rescraping(request: dict, token_payload: dict = Depends(verify_token)):
     """Enable or disable active properties re-scraping"""
     try:
         enabled = request.get("enabled", True)
@@ -590,7 +593,7 @@ async def toggle_active_properties_rescraping(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/locations/suggestions")
-async def get_location_suggestions(q: str, state: Optional[str] = None, limit: int = 10):
+async def get_location_suggestions(q: str, state: Optional[str] = None, limit: int = 10, token_payload: dict = Depends(verify_token)):
     """Provide city/state suggestions backed by the ZIP code directory."""
     query = (q or "").strip()
     if len(query) < 2:
@@ -736,7 +739,7 @@ async def health_check():
 
 # Get properties by ID endpoint
 @app.post("/properties/by-ids")
-async def get_properties_by_ids(request: PropertyIdsRequest):
+async def get_properties_by_ids(request: PropertyIdsRequest, token_payload: dict = Depends(verify_token)):
     """
     Get MLS properties by their property IDs.
     This is useful for fetching specific properties that were previously scraped.
@@ -788,7 +791,7 @@ async def get_properties_by_ids(request: PropertyIdsRequest):
 
 # Immediate scraping endpoint (high priority)
 @app.post("/scrape/immediate", response_model=JobResponse)
-async def immediate_scrape(request: ImmediateScrapeRequest):
+async def immediate_scrape(request: ImmediateScrapeRequest, token_payload: dict = Depends(verify_token)):
     """
     Immediate high-priority scraping for urgent property data updates.
     This endpoint bypasses the normal queue and processes immediately.
@@ -840,7 +843,7 @@ async def immediate_scrape(request: ImmediateScrapeRequest):
 
 # Synchronous immediate scraping endpoint
 @app.post("/scrape/immediate/sync", response_model=ImmediateScrapeResponse)
-async def immediate_scrape_sync(request: ImmediateScrapeRequest):
+async def immediate_scrape_sync(request: ImmediateScrapeRequest, token_payload: dict = Depends(verify_token)):
     """
     Immediate synchronous scraping that returns property details directly in the response.
     This endpoint processes the scraping immediately and returns the results without async job handling.
@@ -957,121 +960,121 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
         
         # Proceed with scraping (either no existing properties found, or force_rescrape is True)
         logger.info(f"Proceeding with scraping for {len(request.locations)} location(s)...")
-            # Continue with scraping for locations that didn't have existing properties
-            for location in request.locations:
-                try:
-                    logger.info(f"Starting scraping for location: {location}")
-                    
-                    # Create a temporary job for the scraper to use
-                    # Use higher limits and comprehensive scraping like our working direct tests
-                    temp_job = ScrapingJob(
-                        job_id=job_id,
-                        priority=JobPriority.IMMEDIATE,
-                        locations=[location],
-                        listing_type=None,  # Let scraper handle all listing types comprehensively
-                        property_types=request.property_types,
-                        radius=request.radius,
-                        mls_only=getattr(request, 'mls_only', False),
-                        foreclosure=getattr(request, 'foreclosure', False),
-                        limit=request.limit or 200,  # Use request limit or default to 200
-                        past_days=getattr(request, 'past_days', 365)  # Focus on sold properties from last 365 days
-                    )
-                    
-                    # Get proxy configuration
-                    proxy_config = await scraper.get_proxy_config(temp_job)
-                    
-                    # Scrape the location directly using scrape_property (bypass scraper method)
-                    logger.info(f"Calling scrape_property directly for: {location}")
-                    logger.info(f"Scraper job config: listing_type={temp_job.listing_type}, limit={temp_job.limit}, radius={temp_job.radius}")
-                    
-                    # Import scrape_property directly to bypass scraper method issues
-                    from homeharvest import scrape_property
-                    import pandas as pd
-                    
-                    all_properties = []
-                    # Prioritize sold properties first, then others
-                    listing_types = ["sold", "for_sale", "for_rent", "pending"]
-                    
-                    for listing_type in listing_types:
-                        try:
-                            logger.info(f"Scraping {listing_type} properties directly...")
+        # Continue with scraping for locations that didn't have existing properties
+        for location in request.locations:
+            try:
+                logger.info(f"Starting scraping for location: {location}")
+                
+                # Create a temporary job for the scraper to use
+                # Use higher limits and comprehensive scraping like our working direct tests
+                temp_job = ScrapingJob(
+                    job_id=job_id,
+                    priority=JobPriority.IMMEDIATE,
+                    locations=[location],
+                    listing_type=None,  # Let scraper handle all listing types comprehensively
+                    property_types=request.property_types,
+                    radius=request.radius,
+                    mls_only=getattr(request, 'mls_only', False),
+                    foreclosure=getattr(request, 'foreclosure', False),
+                    limit=request.limit or 200,  # Use request limit or default to 200
+                    past_days=getattr(request, 'past_days', 365)  # Focus on sold properties from last 365 days
+                )
+                
+                # Get proxy configuration
+                proxy_config = await scraper.get_proxy_config(temp_job)
+                
+                # Scrape the location directly using scrape_property (bypass scraper method)
+                logger.info(f"Calling scrape_property directly for: {location}")
+                logger.info(f"Scraper job config: listing_type={temp_job.listing_type}, limit={temp_job.limit}, radius={temp_job.radius}")
+                
+                # Import scrape_property directly to bypass scraper method issues
+                from homeharvest import scrape_property
+                import pandas as pd
+                
+                all_properties = []
+                # Prioritize sold properties first, then others
+                listing_types = ["sold", "for_sale", "for_rent", "pending"]
+                
+                for listing_type in listing_types:
+                    try:
+                        logger.info(f"Scraping {listing_type} properties directly...")
+                        
+                        scrape_params = {
+                            "location": location,
+                            "listing_type": listing_type,
+                            "mls_only": False,
+                            "limit": temp_job.limit or 200
+                        }
+                        
+                        # Add past_days for sold properties to focus on recent sales
+                        if listing_type == "sold" and temp_job.past_days:
+                            scrape_params["past_days"] = temp_job.past_days
+                            logger.info(f"Focusing on sold properties from last {temp_job.past_days} days")
+                        
+                        properties_df = scrape_property(**scrape_params)
+                        
+                        if not properties_df.empty:
+                            logger.info(f"Found {len(properties_df)} {listing_type} properties")
                             
-                            scrape_params = {
-                                "location": location,
-                                "listing_type": listing_type,
-                                "mls_only": False,
-                                "limit": temp_job.limit or 200
-                            }
-                            
-                            # Add past_days for sold properties to focus on recent sales
-                            if listing_type == "sold" and temp_job.past_days:
-                                scrape_params["past_days"] = temp_job.past_days
-                                logger.info(f"Focusing on sold properties from last {temp_job.past_days} days")
-                            
-                            properties_df = scrape_property(**scrape_params)
-                            
-                            if not properties_df.empty:
-                                logger.info(f"Found {len(properties_df)} {listing_type} properties")
-                                
-                                # Convert DataFrame to Property models
-                                for index, row in properties_df.iterrows():
-                                    try:
-                                        property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
-                                        if listing_type == "sold":
-                                            property_obj.is_comp = True
-                                        all_properties.append(property_obj)
+                            # Convert DataFrame to Property models
+                            for index, row in properties_df.iterrows():
+                                try:
+                                    property_obj = scraper.convert_to_property_model(row, temp_job.job_id, listing_type, temp_job.scheduled_job_id)
+                                    if listing_type == "sold":
+                                        property_obj.is_comp = True
+                                    all_properties.append(property_obj)
+                                    
+                                    # Check if this is 1707
+                                    if '1707' in property_obj.address.formatted_address:
+                                        logger.info(f"🎯 FOUND 1707: {property_obj.address.formatted_address}")
                                         
-                                        # Check if this is 1707
-                                        if '1707' in property_obj.address.formatted_address:
-                                            logger.info(f"🎯 FOUND 1707: {property_obj.address.formatted_address}")
-                                            
-                                    except Exception as e:
-                                        logger.error(f"Error converting property: {e}")
-                                        continue
-                            else:
-                                logger.info(f"No {listing_type} properties found")
-                                
-                        except Exception as e:
-                            logger.error(f"Error scraping {listing_type} properties: {e}")
-                            continue
-                    
-                    properties = all_properties
-                    logger.info(f"Direct scraping returned {len(properties)} properties for: {location}")
-                    
-                    # Log the first few properties found for debugging
-                    if properties:
-                        logger.info(f"First few properties found:")
-                        for i, prop in enumerate(properties[:5]):
-                            logger.info(f"  {i+1}. {prop.address.formatted_address} ({prop.property_id}) - {prop.listing_type}")
-                            if '1707' in prop.address.formatted_address:
-                                logger.info(f"    🎯 FOUND 1707!")
-                    
-                    if properties:
-                        logger.info(f"Attempting to save {len(properties)} properties to database...")
-                        try:
-                            # Save properties to database
-                            save_results = await db.save_properties_batch(properties)
+                                except Exception as e:
+                                    logger.error(f"Error converting property: {e}")
+                                    continue
+                        else:
+                            logger.info(f"No {listing_type} properties found")
                             
-                            total_properties_scraped += len(properties)
-                            total_properties_saved += save_results["inserted"] + save_results["updated"]
-                            
-                            # Add properties to response
-                            all_properties.extend(properties)
-                            
-                            logger.info(f"Location {location}: {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
-                        except Exception as save_error:
-                            logger.error(f"Error saving properties for location {location}: {save_error}")
-                            logger.error(f"Save error details: {type(save_error).__name__}: {str(save_error)}")
-                            # Still add properties to response even if save failed
-                            all_properties.extend(properties)
-                            total_properties_scraped += len(properties)
-                    else:
-                        logger.info(f"No properties found by scraper for location: {location}")
-                    
-                except Exception as e:
-                    logger.error(f"Error processing location {location}: {e}")
-                    # Continue with other locations even if one fails
-                    continue
+                    except Exception as e:
+                        logger.error(f"Error scraping {listing_type} properties: {e}")
+                        continue
+                
+                properties = all_properties
+                logger.info(f"Direct scraping returned {len(properties)} properties for: {location}")
+                
+                # Log the first few properties found for debugging
+                if properties:
+                    logger.info(f"First few properties found:")
+                    for i, prop in enumerate(properties[:5]):
+                        logger.info(f"  {i+1}. {prop.address.formatted_address} ({prop.property_id}) - {prop.listing_type}")
+                        if '1707' in prop.address.formatted_address:
+                            logger.info(f"    🎯 FOUND 1707!")
+                
+                if properties:
+                    logger.info(f"Attempting to save {len(properties)} properties to database...")
+                    try:
+                        # Save properties to database
+                        save_results = await db.save_properties_batch(properties)
+                        
+                        total_properties_scraped += len(properties)
+                        total_properties_saved += save_results["inserted"] + save_results["updated"]
+                        
+                        # Add properties to response
+                        all_properties.extend(properties)
+                        
+                        logger.info(f"Location {location}: {save_results['inserted']} inserted, {save_results['updated']} updated, {save_results['skipped']} skipped")
+                    except Exception as save_error:
+                        logger.error(f"Error saving properties for location {location}: {save_error}")
+                        logger.error(f"Save error details: {type(save_error).__name__}: {str(save_error)}")
+                        # Still add properties to response even if save failed
+                        all_properties.extend(properties)
+                        total_properties_scraped += len(properties)
+                else:
+                    logger.info(f"No properties found by scraper for location: {location}")
+                
+            except Exception as e:
+                logger.error(f"Error processing location {location}: {e}")
+                # Continue with other locations even if one fails
+                continue
         
         # Calculate execution time
         end_time = datetime.utcnow()
@@ -1105,7 +1108,7 @@ async def immediate_scrape_sync(request: ImmediateScrapeRequest):
 
 # Scheduled scraping endpoint
 @app.post("/scrape/scheduled", response_model=JobResponse)
-async def scheduled_scrape(request: ScheduledScrapeRequest):
+async def scheduled_scrape(request: ScheduledScrapeRequest, token_payload: dict = Depends(verify_token)):
     """
     Create scheduled scraping jobs for regular data collection.
     Supports both one-time and recurring jobs.
@@ -1156,7 +1159,7 @@ async def scheduled_scrape(request: ScheduledScrapeRequest):
 
 # Trigger existing job immediately
 @app.post("/scrape/trigger", response_model=JobResponse)
-async def trigger_existing_job(request: TriggerJobRequest):
+async def trigger_existing_job(request: TriggerJobRequest, token_payload: dict = Depends(verify_token)):
     """
     Trigger an existing scheduled job to run immediately.
     This creates a new immediate job based on the existing job's configuration.
@@ -1297,7 +1300,7 @@ async def trigger_existing_job(request: TriggerJobRequest):
 
 # Get job status
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str):
+async def get_job_status(job_id: str, token_payload: dict = Depends(verify_token)):
     """Get the status and progress of a specific job"""
     try:
         job = await db.get_job(job_id)
@@ -1331,7 +1334,7 @@ async def get_job_status(job_id: str):
 
 # Get statistics for a scheduled job (MUST come before generic /{scheduled_job_id} route)
 @app.get("/scheduled-jobs/{scheduled_job_id}/stats")
-async def get_scheduled_job_stats(scheduled_job_id: str, limit: int = 1000):
+async def get_scheduled_job_stats(scheduled_job_id: str, limit: int = 1000, token_payload: dict = Depends(verify_token)):
     """Get detailed statistics for a scheduled job"""
     try:
         # Get the scheduled job
@@ -1495,7 +1498,7 @@ async def get_scheduled_job_stats(scheduled_job_id: str, limit: int = 1000):
 
 # Toggle scheduled job status (MUST come before generic /{scheduled_job_id} route)
 @app.patch("/scheduled-jobs/{scheduled_job_id}/status")
-async def toggle_scheduled_job_status(scheduled_job_id: str, status_data: dict):
+async def toggle_scheduled_job_status(scheduled_job_id: str, status_data: dict, token_payload: dict = Depends(verify_token)):
     """Toggle the status of a scheduled job (active/inactive/paused)"""
     try:
         from models import ScheduledJobStatus
@@ -1547,7 +1550,7 @@ def get_status_value(status):
 
 # Get scheduled job details and run history
 @app.get("/scheduled-jobs/{scheduled_job_id}")
-async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = True, limit: int = 50):
+async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = True, limit: int = 50, token_payload: dict = Depends(verify_token)):
     """
     Get scheduled job details including run history.
     This shows the cron job definition and all job executions linked to it.
@@ -1637,7 +1640,8 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
 async def list_scheduled_jobs(
     status: Optional[str] = None,
     limit: int = 50,
-    include_deleted: bool = False
+    include_deleted: bool = False,
+    token_payload: dict = Depends(verify_token)
 ):
     """List all scheduled jobs (cron jobs) with optional status filtering. Deleted jobs are excluded by default."""
     try:
@@ -1728,7 +1732,7 @@ async def list_scheduled_jobs(
 
 # Create new scheduled job
 @app.post("/scheduled-jobs")
-async def create_scheduled_job(job_data: dict):
+async def create_scheduled_job(job_data: dict, token_payload: dict = Depends(verify_token)):
     """Create a new scheduled job (cron job)"""
     try:
         from models import ScheduledJob
@@ -1816,7 +1820,7 @@ async def create_scheduled_job(job_data: dict):
 
 # Update scheduled job
 @app.put("/scheduled-jobs/{scheduled_job_id}")
-async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
+async def update_scheduled_job(scheduled_job_id: str, job_data: dict, token_payload: dict = Depends(verify_token)):
     """Update an existing scheduled job"""
     try:
         # Check if job exists
@@ -1932,7 +1936,7 @@ async def update_scheduled_job(scheduled_job_id: str, job_data: dict):
 
 # Delete scheduled job (soft delete)
 @app.delete("/scheduled-jobs/{scheduled_job_id}")
-async def delete_scheduled_job(scheduled_job_id: str):
+async def delete_scheduled_job(scheduled_job_id: str, token_payload: dict = Depends(verify_token)):
     """Soft delete a scheduled job by marking it as deleted"""
     try:
         from models import ScheduledJobStatus
@@ -1966,7 +1970,8 @@ async def delete_scheduled_job(scheduled_job_id: str):
 async def list_jobs(
     status: Optional[JobStatus] = None,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    token_payload: dict = Depends(verify_token)
 ):
     """List jobs with optional filtering"""
     try:
@@ -2007,7 +2012,7 @@ async def list_jobs(
 
 # Cancel job
 @app.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
+async def cancel_job(job_id: str, token_payload: dict = Depends(verify_token)):
     """Cancel a running or pending job"""
     try:
         job = await db.get_job(job_id)
@@ -2042,7 +2047,7 @@ async def cancel_job(job_id: str):
 
 # Retry failed locations from a job
 @app.post("/jobs/{job_id}/retry-failed")
-async def retry_failed_locations(job_id: str):
+async def retry_failed_locations(job_id: str, token_payload: dict = Depends(verify_token)):
     """Retry failed locations from a completed job"""
     try:
         job = await db.get_job(job_id)
@@ -2465,7 +2470,7 @@ def convert_markdown_to_html(markdown_content: str) -> str:
 # ============================================================================
 
 @app.get("/properties/{property_id}/history")
-async def get_property_history(property_id: str, limit: int = 50):
+async def get_property_history(property_id: str, limit: int = 50, token_payload: dict = Depends(verify_token)):
     """Get property history (price and status changes)"""
     try:
         if not db.enrichment_pipeline:
@@ -2482,7 +2487,7 @@ async def get_property_history(property_id: str, limit: int = 50):
         raise HTTPException(status_code=500, detail=f"Error getting property history: {str(e)}")
 
 @app.get("/properties/{property_id}/changes")
-async def get_property_change_logs(property_id: str, limit: int = 100):
+async def get_property_change_logs(property_id: str, limit: int = 100, token_payload: dict = Depends(verify_token)):
     """Get detailed change logs for a property"""
     try:
         if not db.enrichment_pipeline:
@@ -2499,7 +2504,7 @@ async def get_property_change_logs(property_id: str, limit: int = 100):
         raise HTTPException(status_code=500, detail=f"Error getting change logs: {str(e)}")
 
 @app.get("/properties/{property_id}/enrichment")
-async def get_property_enrichment(property_id: str):
+async def get_property_enrichment(property_id: str, token_payload: dict = Depends(verify_token)):
     """Get enrichment data for a property"""
     try:
         if not db.enrichment_pipeline:
@@ -2521,7 +2526,7 @@ async def get_property_enrichment(property_id: str):
         raise HTTPException(status_code=500, detail=f"Error getting enrichment data: {str(e)}")
 
 @app.get("/properties/motivated-sellers")
-async def get_motivated_sellers(min_score: int = 40, limit: int = 100):
+async def get_motivated_sellers(min_score: int = 40, limit: int = 100, token_payload: dict = Depends(verify_token)):
     """Get properties with motivated seller scores above threshold"""
     try:
         if not db.enrichment_pipeline:
@@ -2540,7 +2545,7 @@ async def get_motivated_sellers(min_score: int = 40, limit: int = 100):
         raise HTTPException(status_code=500, detail=f"Error getting motivated sellers: {str(e)}")
 
 @app.post("/properties/{property_id}/enrich")
-async def enrich_property(property_id: str):
+async def enrich_property(property_id: str, token_payload: dict = Depends(verify_token)):
     """Manually trigger enrichment for a property"""
     try:
         if not db.enrichment_pipeline:
@@ -2571,7 +2576,7 @@ async def enrich_property(property_id: str):
         raise HTTPException(status_code=500, detail=f"Error enriching property: {str(e)}")
 
 @app.post("/enrichment/recalculate-scores", response_model=EnrichmentRecalcResponse)
-async def recalculate_scores(request: EnrichmentRecalcRequest):
+async def recalculate_scores(request: EnrichmentRecalcRequest, token_payload: dict = Depends(verify_token)):
     """
     Recalculate all scores using current config (no re-detection)
     Only updates score from existing findings, very fast operation.
@@ -2594,7 +2599,7 @@ async def recalculate_scores(request: EnrichmentRecalcRequest):
         raise HTTPException(status_code=500, detail=f"Error recalculating scores: {str(e)}")
 
 @app.post("/enrichment/redetect-keywords", response_model=EnrichmentRecalcResponse)
-async def redetect_keywords(request: EnrichmentRecalcRequest):
+async def redetect_keywords(request: EnrichmentRecalcRequest, token_payload: dict = Depends(verify_token)):
     """
     Re-run keyword detection and recalculate scores
     Re-analyzes property descriptions and updates findings.
@@ -2614,7 +2619,7 @@ async def redetect_keywords(request: EnrichmentRecalcRequest):
         raise HTTPException(status_code=500, detail=f"Error re-detecting keywords: {str(e)}")
 
 @app.post("/enrichment/full-reenrich", response_model=EnrichmentRecalcResponse)
-async def full_reenrich(request: EnrichmentRecalcRequest):
+async def full_reenrich(request: EnrichmentRecalcRequest, token_payload: dict = Depends(verify_token)):
     """
     Full re-enrichment (detection + calculation)
     Runs complete enrichment pipeline for all properties.
@@ -2699,7 +2704,7 @@ async def full_reenrich(request: EnrichmentRecalcRequest):
         raise HTTPException(status_code=500, detail=f"Error in full re-enrichment: {str(e)}")
 
 @app.get("/enrichment/config", response_model=EnrichmentConfigResponse)
-async def get_enrichment_config():
+async def get_enrichment_config(token_payload: dict = Depends(verify_token)):
     """Get current scoring configuration"""
     try:
         if not db.enrichment_pipeline:
@@ -2719,7 +2724,7 @@ async def get_enrichment_config():
         raise HTTPException(status_code=500, detail=f"Error getting config: {str(e)}")
 
 @app.post("/enrichment/update-dom")
-async def update_dom_all(limit: Optional[int] = None):
+async def update_dom_all(limit: Optional[int] = None, token_payload: dict = Depends(verify_token)):
     """
     Update days on market for all properties and recalculate scores
     Lightweight operation - only updates DOM finding and recalculates.
@@ -2739,7 +2744,7 @@ async def update_dom_all(limit: Optional[int] = None):
         raise HTTPException(status_code=500, detail=f"Error updating DOM: {str(e)}")
 
 @app.post("/enrichment/recover-pending", response_model=EnrichmentRecalcResponse)
-async def recover_pending_enrichment(limit: Optional[int] = None, batch_size: int = 50):
+async def recover_pending_enrichment(limit: Optional[int] = None, batch_size: int = 50, token_payload: dict = Depends(verify_token)):
     """
     Background recovery job: Find and enrich properties that need enrichment.
     
