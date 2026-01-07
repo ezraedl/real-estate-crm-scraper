@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openai-agent-lookup"
+version = "1.0.0"
+description = "A library for finding real estate agent mobile numbers using OpenAI Agents with web search"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["openai", "agents", "real-estate", "contact-lookup", "phone", "mobile"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+dependencies = [
+    "openai-agents>=0.6.0",
+    "openai>=2.9.0",
+    "pydantic>=2.12.0",
+    "python-dotenv>=1.0.0",
+    "nest-asyncio>=1.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/openai-agent-lookup"
+Documentation = "https://github.com/yourusername/openai-agent-lookup#readme"
+Repository = "https://github.com/yourusername/openai-agent-lookup"
+
+[tool.setuptools]
+packages = ["openai_agent_lookup"]
+
+[tool.setuptools.package-data]
+openai_agent_lookup = ["README.md", "EXAMPLES.md", "INSTALL.md"]
+
