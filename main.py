@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from typing import List, Optional, Dict, Any
+from pydantic import BaseModel
 import asyncio
 import uuid
 from datetime import datetime
@@ -40,6 +41,14 @@ from middleware.auth import verify_token
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import OpenAI Agent Lookup
+try:
+    from openai_agent_lookup import AgentLookupClient
+    AGENT_LOOKUP_AVAILABLE = True
+except ImportError:
+    logger.warning("openai_agent_lookup library not available. Agent lookup endpoint will be disabled.")
+    AGENT_LOOKUP_AVAILABLE = False
+
 # Create FastAPI app
 app = FastAPI(
     title="MLS Scraping Server",
@@ -69,14 +78,53 @@ else:
 
 logger.info(f"CORS configured with origins: {allowed_origins}, allow_credentials: {allow_creds}")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_creds,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],  # Includes Authorization header for JWT tokens
-    expose_headers=["*"],
-)
+# #region agent log
+import json
+try:
+    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"pre-middleware","hypothesisId":"H1","location":"main.py:79","message":"Before middleware - checking allowed_origins type and value","data":{"type":str(type(allowed_origins)),"value":allowed_origins,"is_list":isinstance(allowed_origins, list)},"timestamp":int(__import__('time').time()*1000)}) + "\n")
+except: pass
+# #endregion
+
+# #region agent log
+try:
+    with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"pre-middleware","hypothesisId":"H1,H3,H5","location":"main.py:81","message":"Middleware parameters before add_middleware","data":{"origins_type":str(type(allowed_origins)),"allow_creds":allow_creds,"methods":["GET","POST","PUT","DELETE","OPTIONS","PATCH"]},"timestamp":int(__import__('time').time()*1000)}) + "\n")
+except: pass
+# #endregion
+
+try:
+    # #region agent log
+    try:
+        import json
+        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"middleware-config","hypothesisId":"H5","location":"main.py:106","message":"Testing middleware with explicit headers","data":{"origins":allowed_origins[:3] if len(allowed_origins) > 3 else allowed_origins,"python_version":__import__('sys').version},"timestamp":int(__import__('time').time()*1000)}) + "\n")
+    except: pass
+    # #endregion
+    
+    # Fix: Use explicit header list instead of ["*"] which may not be supported in Python 3.14/FastAPI 0.104.1
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=allow_creds,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"],  # Explicit headers instead of ["*"]
+        expose_headers=["Content-Type", "Authorization"],  # Explicit headers instead of ["*"]
+    )
+    # #region agent log
+    try:
+        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-middleware","hypothesisId":"H1,H3,H5","location":"main.py:88","message":"Middleware added successfully","data":{"success":True},"timestamp":int(__import__('time').time()*1000)}) + "\n")
+    except: pass
+    # #endregion
+except Exception as e:
+    # #region agent log
+    try:
+        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"pre-middleware","hypothesisId":"H1,H3,H5","location":"main.py:120","message":"Middleware addition failed","data":{"error":str(e),"error_type":str(type(e).__name__),"traceback":__import__('traceback').format_exc()},"timestamp":int(__import__('time').time()*1000)}) + "\n")
+    except: pass
+    # #endregion
+    raise
 
 # Helper function to determine remaining work from progress logs
 def get_remaining_locations(job: ScrapingJob) -> List[str]:
@@ -3000,6 +3048,98 @@ async def recover_pending_enrichment(limit: Optional[int] = None, batch_size: in
     except Exception as e:
         logger.error(f"Error in enrichment recovery: {e}")
         raise HTTPException(status_code=500, detail=f"Error in enrichment recovery: {str(e)}")
+
+# Agent Lookup Request Model
+class AgentLookupRequest(BaseModel):
+    agent_name: str
+    city: str
+    contact_id: Optional[str] = None
+
+# Agent Lookup Endpoint
+@app.post("/api/agent-lookup", response_model=Dict[str, Any])
+async def agent_lookup(request: AgentLookupRequest):
+    """
+    Look up agent contact information using OpenAI Agent Lookup library.
+    
+    Accepts: { "agent_name": string, "city": string, "contact_id": string (optional) }
+    Returns: AgentLookupResult with mobile_numbers, emails, and certainty scores
+    
+    Note: This operation can take 30-60 seconds as it performs web searches.
+    """
+    # #region agent log
+    try:
+        with open('c:\\Projects\\Real-Estate-CRM-Repos\\real-estate-crm-backend\\.cursor\\debug.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"endpoint-call","hypothesisId":"H4","location":"main.py:3020","message":"Agent lookup endpoint called","data":{"agent_name":request.agent_name,"city":request.city,"contact_id":getattr(request, 'contact_id', None)},"timestamp":int(__import__('time').time()*1000)}) + "\n")
+    except: pass
+    # #endregion
+    
+    if not AGENT_LOOKUP_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent lookup service is not available. Please ensure openai_agent_lookup library is installed."
+        )
+    
+    try:
+        agent_name = request.agent_name
+        city = request.city
+        
+        if not agent_name:
+            raise HTTPException(status_code=400, detail="agent_name is required")
+        
+        if not city:
+            raise HTTPException(status_code=400, detail="city is required")
+        
+        # Build query string in format: "Agent Name, City"
+        query = f"{agent_name}, {city}"
+        
+        logger.info(f"Starting agent lookup for: {query}")
+        
+        # Prepare trace metadata
+        trace_metadata = {
+            "agent_name_query": agent_name,
+            "city_query": city,
+        }
+        if request.contact_id:
+            trace_metadata["contact_id"] = request.contact_id
+        
+        # Initialize client and perform lookup
+        client = AgentLookupClient()
+        result = await client.lookup_async(query, trace_metadata=trace_metadata)
+        
+        # Convert result to dict for JSON serialization
+        response = {
+            "agent_name": result.agent_name,
+            "mobile_numbers": [
+                {
+                    "number": num.number,
+                    "type": num.type,
+                    "certainty": num.certainty,
+                    "sources": num.sources if hasattr(num, 'sources') else []
+                }
+                for num in result.mobile_numbers
+            ],
+            "emails": [
+                {
+                    "email": email.email,
+                    "certainty": email.certainty,
+                    "sources": email.sources if hasattr(email, 'sources') else []
+                }
+                for email in result.emails
+            ],
+            "has_results": result.has_results(),
+            "has_phone_numbers": result.has_phone_numbers(),
+            "has_emails": result.has_emails()
+        }
+        
+        logger.info(f"Agent lookup completed for {query}: {len(result.mobile_numbers)} numbers, {len(result.emails)} emails found")
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in agent lookup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error performing agent lookup: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

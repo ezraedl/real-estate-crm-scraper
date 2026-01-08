@@ -1,0 +1,15 @@
+# OpenAI Agents SDK
+openai-agents>=0.6.0
+
+# OpenAI SDK
+openai>=2.9.0
+
+# Pydantic for data models
+pydantic>=2.12.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Optional: For nested async support in sync wrappers
+nest-asyncio>=1.5.0
+
