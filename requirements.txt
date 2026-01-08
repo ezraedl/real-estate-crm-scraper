@@ -18,3 +18,12 @@ croniter==1.4.1
 pyyaml==6.0.1
 
 PyJWT>=2.8.0
+
+# OpenAI Agent Lookup library (local package)
+# Install the local package so it's available for imports
+# Dependencies will be installed automatically from setup.py/pyproject.toml
+./openai_agent_lookup
+# Explicitly include key dependencies to ensure they're installed
+openai-agents>=0.6.0
+openai>=2.9.0
+nest-asyncio>=1.5.0
