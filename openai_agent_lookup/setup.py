@@ -19,7 +19,10 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/openai-agent-lookup",
-    packages=find_packages(),
+    # Since setup.py is in the same directory as the package files,
+    # we need to tell setuptools that the package root is the current directory
+    packages=["openai_agent_lookup"],
+    package_dir={"openai_agent_lookup": "."},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
