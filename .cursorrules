@@ -1,5 +1,29 @@
 # Real Estate CRM Scraper - Cursor Rules
 
+## 🌿 Feature Branch Workflow
+
+**IMPORTANT**: When the user asks for a new feature, it MUST be implemented in a dedicated feature branch.
+
+### Feature Branch Requirements
+
+- **Always create a feature branch** before implementing new features
+- **Branch naming**: Use `feature/` prefix followed by a descriptive name (e.g., `feature/user-authentication`, `feature/property-filtering`)
+- **Suggest branch creation**: If the user requests a new feature and you're not already on a feature branch, suggest creating one first
+- **Never commit features directly to main/master**: All new features must be developed in feature branches
+
+### Workflow
+
+1. When a new feature is requested, check the current branch
+2. If not on a feature branch, suggest creating one: `git checkout -b feature/descriptive-name`
+3. Implement the feature in the feature branch
+4. Commit changes to the feature branch
+5. The user can merge to main when ready
+
+### Example
+
+If user asks: "Add user authentication"
+- Response: "I'll help you implement user authentication. Let's create a feature branch first: `git checkout -b feature/user-authentication`. Should I create the branch and proceed with the implementation?"
+
 ## Technology Stack
 - **Language**: Python 3.8+
 - **Framework**: FastAPI
