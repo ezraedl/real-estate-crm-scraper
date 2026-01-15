@@ -485,40 +485,128 @@ class Database:
                     if property_data.last_scraped:
                         update_fields["last_scraped"] = property_data.last_scraped
                     
-                    # Check if we need to create/update contacts (in case contacts weren't created before)
-                    if (property_data.agent and property_data.agent.agent_name and not existing_property.get("agent_id")) or \
-                       (property_data.broker and property_data.broker.broker_name and not existing_property.get("broker_id")) or \
-                       (property_data.builder and property_data.builder.builder_name and not existing_property.get("builder_id")) or \
-                       (property_data.office and property_data.office.office_name and not existing_property.get("office_id")):
-                        # Create/update contacts if they don't exist
-                        contact_ids = await self.contact_service.process_property_contacts(property_data)
-                        
-                        # Preserve existing contact IDs if they exist
-                        if existing_property.get("agent_id"):
-                            contact_ids["agent_id"] = existing_property.get("agent_id")
-                        if existing_property.get("broker_id"):
-                            contact_ids["broker_id"] = existing_property.get("broker_id")
-                        if existing_property.get("builder_id"):
-                            contact_ids["builder_id"] = existing_property.get("builder_id")
-                        if existing_property.get("office_id"):
-                            contact_ids["office_id"] = existing_property.get("office_id")
-                        
-                        # Add contact IDs to update
-                        if contact_ids.get("agent_id"):
-                            update_fields["agent_id"] = contact_ids["agent_id"]
-                        if contact_ids.get("broker_id"):
-                            update_fields["broker_id"] = contact_ids["broker_id"]
-                        if contact_ids.get("builder_id"):
-                            update_fields["builder_id"] = contact_ids["builder_id"]
-                        if contact_ids.get("office_id"):
-                            update_fields["office_id"] = contact_ids["office_id"]
+                    # FIXED: Check both scraped data AND existing nested data in database
+                    # This handles cases where existing property has nested data but scraped data doesn't include it
+                    needs_contact_processing = False
+                    unset_fields = {}
                     
-                    result = await self.properties_collection.update_one(
-                        {"property_id": property_data.property_id},
-                        {
-                            "$set": update_fields
-                        }
-                    )
+                    # Check agent
+                    has_nested_agent = (existing_property.get("agent") and 
+                                       (existing_property.get("agent", {}).get("agent_name") or 
+                                        existing_property.get("agent", {}).get("agent_email") or 
+                                        existing_property.get("agent", {}).get("agent_phones")))
+                    has_scraped_agent = (property_data.agent and property_data.agent.agent_name)
+                    has_agent_id = existing_property.get("agent_id")
+                    
+                    if (has_nested_agent or has_scraped_agent) and not has_agent_id:
+                        needs_contact_processing = True
+                    elif has_agent_id and has_nested_agent:
+                        # Has ID but still has nested data - remove nested data
+                        unset_fields["agent"] = ""
+                    
+                    # Check broker
+                    has_nested_broker = (existing_property.get("broker") and 
+                                        existing_property.get("broker", {}).get("broker_name"))
+                    has_scraped_broker = (property_data.broker and property_data.broker.broker_name)
+                    has_broker_id = existing_property.get("broker_id")
+                    
+                    if (has_nested_broker or has_scraped_broker) and not has_broker_id:
+                        needs_contact_processing = True
+                    elif has_broker_id and has_nested_broker:
+                        unset_fields["broker"] = ""
+                    
+                    # Check builder
+                    has_nested_builder = (existing_property.get("builder") and 
+                                         existing_property.get("builder", {}).get("builder_name"))
+                    has_scraped_builder = (property_data.builder and property_data.builder.builder_name)
+                    has_builder_id = existing_property.get("builder_id")
+                    
+                    if (has_nested_builder or has_scraped_builder) and not has_builder_id:
+                        needs_contact_processing = True
+                    elif has_builder_id and has_nested_builder:
+                        unset_fields["builder"] = ""
+                    
+                    # Check office
+                    has_nested_office = (existing_property.get("office") and 
+                                        (existing_property.get("office", {}).get("office_name") or 
+                                         existing_property.get("office", {}).get("office_email") or 
+                                         existing_property.get("office", {}).get("office_phones")))
+                    has_scraped_office = (property_data.office and property_data.office.office_name)
+                    has_office_id = existing_property.get("office_id")
+                    
+                    if (has_nested_office or has_scraped_office) and not has_office_id:
+                        needs_contact_processing = True
+                    elif has_office_id and has_nested_office:
+                        unset_fields["office"] = ""
+                    
+                    # Process contacts if needed
+                    if needs_contact_processing:
+                        # Use existing nested data if scraped data doesn't have it
+                        # Create a temporary property object with merged contact data
+                        temp_property = property_data
+                        if has_nested_agent and not has_scraped_agent:
+                            # Create PropertyAgent from existing nested data
+                            from models import PropertyAgent
+                            temp_property.agent = PropertyAgent(**existing_property.get("agent", {}))
+                        if has_nested_broker and not has_scraped_broker:
+                            from models import PropertyBroker
+                            temp_property.broker = PropertyBroker(**existing_property.get("broker", {}))
+                        if has_nested_builder and not has_scraped_builder:
+                            from models import PropertyBuilder
+                            temp_property.builder = PropertyBuilder(**existing_property.get("builder", {}))
+                        if has_nested_office and not has_scraped_office:
+                            from models import PropertyOffice
+                            temp_property.office = PropertyOffice(**existing_property.get("office", {}))
+                        
+                        try:
+                            # Create/update contacts if they don't exist
+                            contact_ids = await self.contact_service.process_property_contacts(temp_property)
+                            
+                            if not contact_ids:
+                                logger.warning(f"Failed to process contacts for property {property_data.property_id} - API may be unavailable")
+                            
+                            # Preserve existing contact IDs if they exist
+                            if existing_property.get("agent_id"):
+                                contact_ids["agent_id"] = existing_property.get("agent_id")
+                            if existing_property.get("broker_id"):
+                                contact_ids["broker_id"] = existing_property.get("broker_id")
+                            if existing_property.get("builder_id"):
+                                contact_ids["builder_id"] = existing_property.get("builder_id")
+                            if existing_property.get("office_id"):
+                                contact_ids["office_id"] = existing_property.get("office_id")
+                            
+                            # Add contact IDs to update
+                            if contact_ids.get("agent_id"):
+                                update_fields["agent_id"] = contact_ids["agent_id"]
+                                # Remove nested data after successful linking
+                                unset_fields["agent"] = ""
+                            if contact_ids.get("broker_id"):
+                                update_fields["broker_id"] = contact_ids["broker_id"]
+                                unset_fields["broker"] = ""
+                            if contact_ids.get("builder_id"):
+                                update_fields["builder_id"] = contact_ids["builder_id"]
+                                unset_fields["builder"] = ""
+                            if contact_ids.get("office_id"):
+                                update_fields["office_id"] = contact_ids["office_id"]
+                                unset_fields["office"] = ""
+                        except Exception as e:
+                            logger.error(f"Error processing contacts for property {property_data.property_id}: {e}")
+                            # Continue without contact processing - don't fail the entire save
+                    
+                    # Build update operation
+                    update_operation = {}
+                    if update_fields:
+                        update_operation["$set"] = update_fields
+                    if unset_fields:
+                        update_operation["$unset"] = unset_fields
+                    
+                    if update_operation:
+                        result = await self.properties_collection.update_one(
+                            {"property_id": property_data.property_id},
+                            update_operation
+                        )
+                    else:
+                        result = type('obj', (object,), {'modified_count': 0})()
                     return {
                         "action": "skipped",
                         "reason": "content_unchanged",
@@ -527,7 +615,14 @@ class Database:
                 else:
                     # Content changed - update the property
                     # First, create/update contacts and get contact IDs
-                    contact_ids = await self.contact_service.process_property_contacts(property_data)
+                    try:
+                        contact_ids = await self.contact_service.process_property_contacts(property_data)
+                        
+                        if not contact_ids:
+                            logger.warning(f"Failed to process contacts for property {property_data.property_id} - API may be unavailable")
+                    except Exception as e:
+                        logger.error(f"Error processing contacts for property {property_data.property_id}: {e}")
+                        contact_ids = {}
                     
                     # Preserve existing contact IDs if they exist and new ones weren't created
                     if existing_property.get("agent_id") and not contact_ids.get("agent_id"):
@@ -558,11 +653,31 @@ class Database:
                     if existing_property.get("crm_property_ids"):
                         property_dict["crm_property_ids"] = existing_property["crm_property_ids"]
                     
+                    # FIXED: Remove nested contact data after linking contacts
+                    # Use update_one with $unset instead of replace_one to avoid re-adding nested data
+                    # First, replace the property with contact IDs set
                     result = await self.properties_collection.replace_one(
                         {"property_id": property_data.property_id},
                         property_dict,
                         upsert=True
                     )
+                    
+                    # Then remove nested contact data if contacts were successfully linked
+                    unset_fields = {}
+                    if contact_ids.get("agent_id") and property_dict.get("agent"):
+                        unset_fields["agent"] = ""
+                    if contact_ids.get("broker_id") and property_dict.get("broker"):
+                        unset_fields["broker"] = ""
+                    if contact_ids.get("builder_id") and property_dict.get("builder"):
+                        unset_fields["builder"] = ""
+                    if contact_ids.get("office_id") and property_dict.get("office"):
+                        unset_fields["office"] = ""
+                    
+                    if unset_fields:
+                        await self.properties_collection.update_one(
+                            {"property_id": property_data.property_id},
+                            {"$unset": unset_fields}
+                        )
                     
                     # Update CRM properties that reference this MLS property
                     # Note: For internal scraper updates, we update all platforms
@@ -593,7 +708,14 @@ class Database:
                     }
             else:
                 # New property - create contacts and get contact IDs
-                contact_ids = await self.contact_service.process_property_contacts(property_data)
+                try:
+                    contact_ids = await self.contact_service.process_property_contacts(property_data)
+                    
+                    if not contact_ids:
+                        logger.warning(f"Failed to process contacts for new property {property_data.property_id} - API may be unavailable")
+                except Exception as e:
+                    logger.error(f"Error processing contacts for new property {property_data.property_id}: {e}")
+                    contact_ids = {}
                 
                 # Update property data with contact IDs
                 property_data.agent_id = contact_ids.get("agent_id")
@@ -608,6 +730,18 @@ class Database:
                     property_data.last_scraped = datetime.utcnow()
                 
                 property_dict = property_data.dict(by_alias=True, exclude={"id"})
+                
+                # FIXED: Remove nested contact data for new properties after linking
+                # Since contacts are linked, we don't need nested data
+                if contact_ids.get("agent_id") and property_dict.get("agent"):
+                    property_dict.pop("agent", None)
+                if contact_ids.get("broker_id") and property_dict.get("broker"):
+                    property_dict.pop("broker", None)
+                if contact_ids.get("builder_id") and property_dict.get("builder"):
+                    property_dict.pop("builder", None)
+                if contact_ids.get("office_id") and property_dict.get("office"):
+                    property_dict.pop("office", None)
+                
                 result = await self.properties_collection.insert_one(property_dict)
                 
                 # Trigger enrichment in background (non-blocking!)
@@ -682,11 +816,25 @@ class Database:
                         
                         if existing_hash == new_hash:
                             # Content unchanged - check if contacts need updating
+                            # FIXED: Check both scraped data AND existing nested data in database
+                            has_nested_agent = (existing_prop.get("agent") and 
+                                               (existing_prop.get("agent", {}).get("agent_name") or 
+                                                existing_prop.get("agent", {}).get("agent_email") or 
+                                                existing_prop.get("agent", {}).get("agent_phones")))
+                            has_nested_broker = (existing_prop.get("broker") and 
+                                                existing_prop.get("broker", {}).get("broker_name"))
+                            has_nested_builder = (existing_prop.get("builder") and 
+                                                 existing_prop.get("builder", {}).get("builder_name"))
+                            has_nested_office = (existing_prop.get("office") and 
+                                                (existing_prop.get("office", {}).get("office_name") or 
+                                                 existing_prop.get("office", {}).get("office_email") or 
+                                                 existing_prop.get("office", {}).get("office_phones")))
+                            
                             needs_contacts = (
-                                (prop.agent and prop.agent.agent_name and not existing_prop.get("agent_id")) or
-                                (prop.broker and prop.broker.broker_name and not existing_prop.get("broker_id")) or
-                                (prop.builder and prop.builder.builder_name and not existing_prop.get("builder_id")) or
-                                (prop.office and prop.office.office_name and not existing_prop.get("office_id"))
+                                ((prop.agent and prop.agent.agent_name) or has_nested_agent) and not existing_prop.get("agent_id") or
+                                ((prop.broker and prop.broker.broker_name) or has_nested_broker) and not existing_prop.get("broker_id") or
+                                ((prop.builder and prop.builder.builder_name) or has_nested_builder) and not existing_prop.get("builder_id") or
+                                ((prop.office and prop.office.office_name) or has_nested_office) and not existing_prop.get("office_id")
                             )
                         else:
                             # Content changed - always process contacts
@@ -718,13 +866,24 @@ class Database:
                 contact_key_map = {}  # Maps (property_id, contact_type) -> contact_key in batch
                 
                 for prop in properties_needing_contacts:
-                    # Agent contact
+                    info = property_processing_info.get(prop.property_id)
+                    existing_prop = info.get("existing_prop") if info else None
+                    
+                    # Agent contact - use scraped data or existing nested data
+                    agent_data = None
                     if prop.agent and prop.agent.agent_name:
+                        agent_data = prop.agent
+                    elif existing_prop and existing_prop.get("agent"):
+                        # Use existing nested data if scraped data doesn't have it
+                        from models import PropertyAgent
+                        agent_data = PropertyAgent(**existing_prop.get("agent", {}))
+                    
+                    if agent_data and agent_data.agent_name:
                         phones = None
                         phone = None
-                        if prop.agent.agent_phones:
+                        if agent_data.agent_phones:
                             phones = []
-                            for p in prop.agent.agent_phones:
+                            for p in agent_data.agent_phones:
                                 if isinstance(p, dict):
                                     phones.append({
                                         "number": p.get('number'),
@@ -742,45 +901,66 @@ class Database:
                         batch_contacts.append({
                             "key": contact_key,
                             "contact_type": "agent",
-                            "name": prop.agent.agent_name,
-                            "email": prop.agent.agent_email,
+                            "name": agent_data.agent_name,
+                            "email": agent_data.agent_email,
                             "phone": phone,
                             "phones": phones,
-                            "agent_id": prop.agent.agent_id,
-                            "agent_mls_set": prop.agent.agent_mls_set,
-                            "agent_nrds_id": prop.agent.agent_nrds_id,
+                            "agent_id": agent_data.agent_id,
+                            "agent_mls_set": agent_data.agent_mls_set,
+                            "agent_nrds_id": agent_data.agent_nrds_id,
                             "source": "scraper"
                         })
                     
-                    # Broker contact
+                    # Broker contact - use scraped data or existing nested data
+                    broker_data = None
                     if prop.broker and prop.broker.broker_name:
+                        broker_data = prop.broker
+                    elif existing_prop and existing_prop.get("broker"):
+                        from models import PropertyBroker
+                        broker_data = PropertyBroker(**existing_prop.get("broker", {}))
+                    
+                    if broker_data and broker_data.broker_name:
                         contact_key = f"{prop.property_id}_broker"
                         contact_key_map[(prop.property_id, 'broker')] = contact_key
                         batch_contacts.append({
                             "key": contact_key,
                             "contact_type": "broker",
-                            "name": prop.broker.broker_name,
+                            "name": broker_data.broker_name,
                             "source": "scraper"
                         })
                     
-                    # Builder contact
+                    # Builder contact - use scraped data or existing nested data
+                    builder_data = None
                     if prop.builder and prop.builder.builder_name:
+                        builder_data = prop.builder
+                    elif existing_prop and existing_prop.get("builder"):
+                        from models import PropertyBuilder
+                        builder_data = PropertyBuilder(**existing_prop.get("builder", {}))
+                    
+                    if builder_data and builder_data.builder_name:
                         contact_key = f"{prop.property_id}_builder"
                         contact_key_map[(prop.property_id, 'builder')] = contact_key
                         batch_contacts.append({
                             "key": contact_key,
                             "contact_type": "builder",
-                            "name": prop.builder.builder_name,
+                            "name": builder_data.builder_name,
                             "source": "scraper"
                         })
                     
-                    # Office contact
+                    # Office contact - use scraped data or existing nested data
+                    office_data = None
                     if prop.office and prop.office.office_name:
+                        office_data = prop.office
+                    elif existing_prop and existing_prop.get("office"):
+                        from models import PropertyOffice
+                        office_data = PropertyOffice(**existing_prop.get("office", {}))
+                    
+                    if office_data and office_data.office_name:
                         phones = None
                         phone = None
-                        if prop.office.office_phones:
+                        if office_data.office_phones:
                             phones = []
-                            for p in prop.office.office_phones:
+                            for p in office_data.office_phones:
                                 if isinstance(p, dict):
                                     phones.append({
                                         "number": p.get('number'),
@@ -798,12 +978,12 @@ class Database:
                         batch_contacts.append({
                             "key": contact_key,
                             "contact_type": "office",
-                            "name": prop.office.office_name,
-                            "email": prop.office.office_email,
+                            "name": office_data.office_name,
+                            "email": office_data.office_email,
                             "phone": phone,
                             "phones": phones,
-                            "office_id": prop.office.office_id,
-                            "office_mls_set": prop.office.office_mls_set,
+                            "office_id": office_data.office_id,
+                            "office_mls_set": office_data.office_mls_set,
                             "source": "scraper"
                         })
                 
@@ -866,6 +1046,7 @@ class Database:
                                 update_fields["last_scraped"] = prop.last_scraped
                             
                             # Add contact IDs if they were processed
+                            unset_fields = {}
                             if info["needs_contacts"]:
                                 contact_ids = contact_results.get(prop.property_id, {})
                                 # Preserve existing contact IDs if new ones weren't created
@@ -880,17 +1061,34 @@ class Database:
                                 
                                 if contact_ids.get("agent_id"):
                                     update_fields["agent_id"] = contact_ids["agent_id"]
+                                    # Remove nested data after successful linking
+                                    if existing_prop.get("agent"):
+                                        unset_fields["agent"] = ""
                                 if contact_ids.get("broker_id"):
                                     update_fields["broker_id"] = contact_ids["broker_id"]
+                                    if existing_prop.get("broker"):
+                                        unset_fields["broker"] = ""
                                 if contact_ids.get("builder_id"):
                                     update_fields["builder_id"] = contact_ids["builder_id"]
+                                    if existing_prop.get("builder"):
+                                        unset_fields["builder"] = ""
                                 if contact_ids.get("office_id"):
                                     update_fields["office_id"] = contact_ids["office_id"]
+                                    if existing_prop.get("office"):
+                                        unset_fields["office"] = ""
                             
-                            bulk_operations.append(UpdateOne(
-                                {"property_id": prop.property_id},
-                                {"$set": update_fields}
-                            ))
+                            # Build update operation
+                            update_op = {}
+                            if update_fields:
+                                update_op["$set"] = update_fields
+                            if unset_fields:
+                                update_op["$unset"] = unset_fields
+                            
+                            if update_op:
+                                bulk_operations.append(UpdateOne(
+                                    {"property_id": prop.property_id},
+                                    update_op
+                                ))
                             results["skipped"] += 1
                             results["details"].append({
                                 "action": "skipped",
@@ -928,6 +1126,16 @@ class Database:
                             if existing_prop.get("crm_property_ids"):
                                 property_dict["crm_property_ids"] = existing_prop["crm_property_ids"]
                             
+                            # FIXED: Remove nested contact data after linking
+                            if contact_ids.get("agent_id") and property_dict.get("agent"):
+                                property_dict.pop("agent", None)
+                            if contact_ids.get("broker_id") and property_dict.get("broker"):
+                                property_dict.pop("broker", None)
+                            if contact_ids.get("builder_id") and property_dict.get("builder"):
+                                property_dict.pop("builder", None)
+                            if contact_ids.get("office_id") and property_dict.get("office"):
+                                property_dict.pop("office", None)
+                            
                             bulk_operations.append(ReplaceOne(
                                 {"property_id": prop.property_id},
                                 property_dict,
@@ -962,6 +1170,17 @@ class Database:
                             prop.last_scraped = datetime.utcnow()
                         
                         property_dict = prop.dict(by_alias=True, exclude={"id"})
+                        
+                        # FIXED: Remove nested contact data for new properties after linking
+                        if contact_ids.get("agent_id") and property_dict.get("agent"):
+                            property_dict.pop("agent", None)
+                        if contact_ids.get("broker_id") and property_dict.get("broker"):
+                            property_dict.pop("broker", None)
+                        if contact_ids.get("builder_id") and property_dict.get("builder"):
+                            property_dict.pop("builder", None)
+                        if contact_ids.get("office_id") and property_dict.get("office"):
+                            property_dict.pop("office", None)
+                        
                         bulk_operations.append(InsertOne(property_dict))
                         results["inserted"] += 1
                         results["enrichment_queue"].append({
