@@ -799,7 +799,7 @@ class MLSScraper:
             # This prevents jobs from being marked as failed due to post-completion errors
             current_job = await db.get_job(job.job_id)
             if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED]:
-                status_str = current_job.status.value
+                status_str = getattr(current_job.status, 'value', current_job.status)
                 logger.warning(
                     f"Job {job.job_id} encountered an error after {status_str}, "
                     f"but keeping status as {status_str} since job already finished. Error: {e}"
@@ -1638,7 +1638,7 @@ class MLSScraper:
                             else:
                                 # Job is already COMPLETED/FAILED/CANCELLED, only update progress_logs without changing status
                                 if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
-                                    logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for enrichment")
+                                    logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for enrichment")
                                     await db.jobs_collection.update_one(
                                         {"job_id": job_id},
                                         {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
@@ -3119,7 +3119,7 @@ class MLSScraper:
                                 await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                             elif current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                                 # Job is already final, only update progress_logs without changing status
-                                logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check")
+                                logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for off-market check")
                                 await db.jobs_collection.update_one(
                                     {"job_id": job_id},
                                     {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
@@ -3301,7 +3301,7 @@ class MLSScraper:
                                 await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=latest_progress_logs)
                             elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                                 # Job is already final, only update progress_logs without changing status
-                                logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check completion")
+                                logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for off-market check completion")
                                 await db.jobs_collection.update_one(
                                     {"job_id": job_id},
                                     {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
@@ -3538,7 +3538,7 @@ class MLSScraper:
                             await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
                         elif current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                             # Job is already final, only update progress_logs without changing status
-                            logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check")
+                            logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for off-market check")
                             await db.jobs_collection.update_one(
                                 {"job_id": job_id},
                                 {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
@@ -3720,7 +3720,7 @@ class MLSScraper:
                                 await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=latest_progress_logs)
                             elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                                 # Job is already final, only update progress_logs without changing status
-                                logger.debug(f"Job {job_id} is {current_job.status.value}, updating only progress_logs for off-market check completion")
+                                logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for off-market check completion")
                                 await db.jobs_collection.update_one(
                                     {"job_id": job_id},
                                     {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}

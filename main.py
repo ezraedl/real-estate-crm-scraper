@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from starlette.responses import Response
 from fastapi.staticfiles import StaticFiles
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
@@ -1782,6 +1783,21 @@ async def get_scheduled_job_details(scheduled_job_id: str, include_runs: bool = 
         raise HTTPException(status_code=500, detail="Failed to get scheduled job details")
 
 # List all scheduled jobs
+@app.options("/scheduled-jobs")
+async def options_scheduled_jobs(request: Request):
+    """CORS preflight for /scheduled-jobs. Returns 200 so browser preflights succeed."""
+    origin = request.headers.get("Origin") or "*"
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
+
 @app.get("/scheduled-jobs")
 async def list_scheduled_jobs(
     status: Optional[str] = None,
@@ -2848,6 +2864,21 @@ async def full_reenrich(request: EnrichmentRecalcRequest, token_payload: dict = 
     except Exception as e:
         logger.error(f"Error in full re-enrichment: {e}")
         raise HTTPException(status_code=500, detail=f"Error in full re-enrichment: {str(e)}")
+
+@app.options("/enrichment/config")
+async def options_enrichment_config(request: Request):
+    """CORS preflight for /enrichment/config. Returns 200 so browser preflights succeed."""
+    origin = request.headers.get("Origin") or "*"
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
 
 @app.get("/enrichment/config", response_model=EnrichmentConfigResponse)
 async def get_enrichment_config(token_payload: dict = Depends(verify_token)):
