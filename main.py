@@ -79,6 +79,52 @@ else:
 
 logger.info(f"CORS configured with origins: {allowed_origins}, allow_credentials: {allow_creds}")
 
+# OPTIONS preflight for /enrichment/config and /scheduled-jobs (runs before CORSMiddleware)
+# CORSMiddleware was returning 400 for these preflights; handle them here and return 200.
+_OPTIONS_PREFLIGHT_PATHS = ("/enrichment/config", "/scheduled-jobs")
+
+
+class OptionsPreflightMiddleware:
+    def __init__(self, app, *, allowed_origins=None, allow_creds=False):
+        self.app = app
+        self.allowed_origins = allowed_origins or []
+        self.allow_creds = allow_creds
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") != "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path not in _OPTIONS_PREFLIGHT_PATHS:
+            await self.app(scope, receive, send)
+            return
+        origin = None
+        for k, v in scope.get("headers", []):
+            if k == b"origin":
+                origin = v.decode("latin-1")
+                break
+        if "*" in self.allowed_origins:
+            allow_origin = b"*"
+        elif origin:
+            norm_origin = origin.rstrip("/")
+            if any(o.rstrip("/") == norm_origin for o in self.allowed_origins):
+                allow_origin = origin.encode("latin-1")
+            else:
+                allow_origin = origin.encode("latin-1")  # reflect; browser may still reject if strict
+        else:
+            allow_origin = b"*"
+        headers = [
+            (b"access-control-allow-origin", allow_origin),
+            (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS, PATCH"),
+            (b"access-control-allow-headers", b"Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers"),
+            (b"access-control-max-age", b"86400"),
+        ]
+        if self.allow_creds and allow_origin != b"*":
+            headers.append((b"access-control-allow-credentials", b"true"))
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": b""})
+
+
 # #region agent log
 import json
 try:
@@ -111,6 +157,12 @@ try:
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
         allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"],  # Explicit headers instead of ["*"]
         expose_headers=["Content-Type", "Authorization"],  # Explicit headers instead of ["*"]
+    )
+    # Handle OPTIONS for /enrichment/config and /scheduled-jobs before CORS (CORS was returning 400)
+    app.add_middleware(
+        OptionsPreflightMiddleware,
+        allowed_origins=allowed_origins,
+        allow_creds=allow_creds,
     )
     # #region agent log
     try:
