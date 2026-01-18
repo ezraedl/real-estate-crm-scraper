@@ -30,8 +30,9 @@ def _is_realtor_block_exception(exc: Exception) -> bool:
     return False
 
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+import jwt
 import httpx
 import pandas as pd
 import numpy as np
@@ -85,6 +86,41 @@ except ImportError as e:
 except Exception as e:
     # Unexpected error during check - log at debug level since it's non-critical
     logger.debug(f"[HOMEHARVEST] Could not check curl_cffi status in homeharvest: {e}")
+
+
+async def _notify_census_backfill() -> None:
+    """POST to backend /api/census/backfill-properties to backfill tract geoid/class for properties missing them.
+    Auth: JWT signed with JWT_SECRET (aud: census-backfill). Skipped if BACKEND_URL is not set.
+    Fire-and-forget; errors are logged only.
+    """
+    url = getattr(settings, "BACKEND_URL", "") or ""
+    if not url.strip():
+        return
+    secret = getattr(settings, "JWT_SECRET", "") or ""
+    if not secret:
+        return
+    now = datetime.now(timezone.utc)
+    payload = {"sub": "scraper", "aud": "census-backfill", "iat": int(now.timestamp()), "exp": int(now.timestamp()) + 300}
+    try:
+        token = jwt.encode(payload, secret, algorithm="HS256")
+    except Exception as e:
+        logger.warning(f"[Census backfill] Failed to create JWT: {e}")
+        return
+    endpoint = f"{url.rstrip('/')}/api/census/backfill-properties"
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            r = await client.post(
+                endpoint,
+                json={"geoidOnlyMissing": True, "classOnlyMissing": True},
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            )
+            if r.is_success:
+                logger.info(f"[Census backfill] Backend backfill-properties completed: {r.status_code}")
+            else:
+                logger.warning(f"[Census backfill] Backend backfill-properties returned {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"[Census backfill] Failed to call backend backfill-properties: {e}")
+
 
 class MLSScraper:
     def __init__(self):
@@ -766,7 +802,11 @@ class MLSScraper:
                     f"Failed to update scheduled job run history for job {job.job_id}, "
                     f"but job completed successfully: {run_history_error}"
                 )
-            
+
+            # Notify backend to backfill census tract data for properties missing geoid/class (post-scrape)
+            if status_update_success and final_status == JobStatus.COMPLETED and getattr(settings, "BACKEND_URL", "").strip():
+                asyncio.create_task(_notify_census_backfill())
+
             logger.info(f"Job {job.job_id} {status_label.lower()}: {saved_properties} properties saved")
             
             # FINAL SAFETY CHECK: Ensure status matches final_status before exiting try block
