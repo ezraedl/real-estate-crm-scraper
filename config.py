@@ -75,4 +75,8 @@ class Settings:
     # CORS Configuration
     CORS_ORIGINS = get_required_env("CORS_ORIGINS", "*")
 
+    # Backend URL for post-scrape hooks (census backfill, etc.)
+    # If not set, census backfill is skipped. Auth uses JWT signed with JWT_SECRET (aud: census-backfill).
+    BACKEND_URL = (os.getenv("BACKEND_URL") or "").strip().rstrip("/")
+
 settings = Settings()

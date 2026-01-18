@@ -3,8 +3,15 @@
 # IMPORTANT: Must be the same value as JWT_SECRET in backend .env file
 JWT_SECRET=your-jwt-secret-key-here
 
+# Backend URL for post-scrape hooks (census backfill). Optional.
+# If set, after each completed scrape the scraper calls POST /api/census/backfill-properties
+# to backfill census_tract_geoid and census_tract_class_* for properties missing them.
+# Auth uses JWT signed with JWT_SECRET (aud: census-backfill)—no extra key needed.
+# BACKEND_URL=https://your-backend.railway.app
+
 # CORS Origins (comma-separated, use * for all origins)
-# For production, specify exact origins: http://localhost:5173,https://your-frontend-domain.com
+# Include every origin that will call the scraper API (frontend production, Vercel, preview URLs, etc.).
+# Example: https://rei.engreg.com,https://real-estate-crm-frontend-one.vercel.app
 # For development, you can use * to allow all origins
 CORS_ORIGINS=*
 
