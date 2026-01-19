@@ -913,8 +913,18 @@ async def _run_rent_backfill_task(limit: int) -> None:
         _rent_backfill_running = False
 
 
+@app.get("/rent-estimation/backfill")
+async def rent_estimation_backfill_info(token_payload: dict = Depends(verify_token)):
+    """GET: returns usage. Use POST with body {\"limit\": 500} to start the backfill."""
+    return {
+        "message": "Use POST to start rent-estimation backfill. Example: POST /rent-estimation/backfill with body {\"limit\": 500}",
+        "method": "POST",
+        "body_example": {"limit": 500},
+    }
+
+
 @app.post("/rent-estimation/backfill")
-async def rent_estimation_backfill(request: Optional[Dict[str, Any]] = Body(None), token_payload: dict = Depends(verify_token)):
+async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body(None), token_payload: dict = Depends(verify_token)):
     """
     Start a background job to fetch Rentcast rent estimates for all properties missing rent data.
     Only properties with an address (formatted_address or city) and without rent_estimation.rent are processed.
