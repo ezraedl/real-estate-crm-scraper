@@ -19,6 +19,9 @@ pyyaml==6.0.1
 
 PyJWT>=2.8.0
 
+beautifulsoup4>=4.12.0
+playwright>=1.40.0
+
 # OpenAI Agent Lookup library (local package)
 # Install the local package so it's available for imports
 # Dependencies will be installed automatically from setup.py/pyproject.toml
