@@ -1642,6 +1642,16 @@ class MLSScraper:
                     job_id=job_id
                 )
                 success = True
+                # Rentcast rent estimation only for for_sale and pending (sold/for_rent not relevant)
+                lt = listing_type or property_dict.get("listing_type") or ""
+                if getattr(settings, "RENTCAST_ENABLED", True) and lt in ("for_sale", "pending"):
+                    try:
+                        from services.rentcast_service import RentcastService
+                        if not hasattr(self, "_rentcast_service"):
+                            self._rentcast_service = RentcastService(db)
+                        await self._rentcast_service.fetch_and_save_rent_estimate(property_id, property_dict)
+                    except Exception as e:
+                        logger.warning(f"Rentcast rent estimate failed for {property_id}: {e}")
             except Exception as e:
                 logger.error(f"Error in enrichment task for property {property_id}: {e}")
             finally:
