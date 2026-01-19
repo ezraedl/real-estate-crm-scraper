@@ -82,4 +82,7 @@ class Settings:
     # Rentcast: scrape app.rentcast.io (unauthenticated) for rent estimates. Set to false to disable.
     RENTCAST_ENABLED = os.getenv("RENTCAST_ENABLED", "true").lower() in ("true", "1", "yes", "on")
 
+    # Optional: API key for /rent-estimation/backfill. If set, X-API-Key header can be used instead of JWT.
+    RENT_BACKFILL_API_KEY = (os.getenv("RENT_BACKFILL_API_KEY") or "").strip() or None
+
 settings = Settings()
