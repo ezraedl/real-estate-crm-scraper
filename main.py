@@ -37,7 +37,7 @@ from proxy_manager import proxy_manager
 from config import settings
 from services.zip_code_service import zip_code_service
 from services.rentcast_service import RentcastService
-from middleware.auth import verify_token
+from middleware.auth import verify_token, verify_rent_backfill_auth
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -914,7 +914,7 @@ async def _run_rent_backfill_task(limit: int) -> None:
 
 
 @app.get("/rent-estimation/backfill")
-async def rent_estimation_backfill_info(token_payload: dict = Depends(verify_token)):
+async def rent_estimation_backfill_info(token_payload: dict = Depends(verify_rent_backfill_auth)):
     """GET: returns usage. Use POST with body {\"limit\": 500} to start the backfill."""
     return {
         "message": "Use POST to start rent-estimation backfill. Example: POST /rent-estimation/backfill with body {\"limit\": 500}",
@@ -924,7 +924,7 @@ async def rent_estimation_backfill_info(token_payload: dict = Depends(verify_tok
 
 
 @app.post("/rent-estimation/backfill")
-async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body(None), token_payload: dict = Depends(verify_token)):
+async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body(None), token_payload: dict = Depends(verify_rent_backfill_auth)):
     """
     Start a background job to fetch Rentcast rent estimates for all properties missing rent data.
     Only properties with an address (formatted_address or city) and without rent_estimation.rent are processed.
