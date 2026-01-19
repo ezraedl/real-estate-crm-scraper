@@ -30,7 +30,7 @@ def _is_realtor_block_exception(exc: Exception) -> bool:
     return False
 
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import jwt
 import httpx
@@ -86,6 +86,34 @@ except ImportError as e:
 except Exception as e:
     # Unexpected error during check - log at debug level since it's non-critical
     logger.debug(f"[HOMEHARVEST] Could not check curl_cffi status in homeharvest: {e}")
+
+
+async def _delete_old_sold_properties() -> int:
+    """Delete SOLD properties whose sold date is more than 1 year ago.
+    Runs after each completed scraping job to enforce retention: we only keep sold
+    data for the last year (scheduled jobs typically scrape 180 days; this cleans
+    legacy and any API slip-through). Uses dates.last_sold_date or last_sold_date.
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=365)
+        query = {
+            "listing_type": "sold",
+            "$or": [
+                {"dates.last_sold_date": {"$lt": cutoff}},
+                {"last_sold_date": {"$lt": cutoff}},
+            ],
+        }
+        result = await db.properties_collection.delete_many(query)
+        if result.deleted_count > 0:
+            logger.info(
+                "[Old sold cleanup] Deleted %d sold properties with sold date > 1 year ago (cutoff: %s)",
+                result.deleted_count,
+                cutoff.isoformat(),
+            )
+        return result.deleted_count
+    except Exception as e:
+        logger.warning("[Old sold cleanup] Failed to delete old sold properties: %s", e)
+        return 0
 
 
 async def _notify_census_backfill() -> None:
@@ -802,6 +830,10 @@ class MLSScraper:
                     f"Failed to update scheduled job run history for job {job.job_id}, "
                     f"but job completed successfully: {run_history_error}"
                 )
+
+            # Delete sold properties with sold date > 1 year (enforce retention; past_days limits only new fetches)
+            if status_update_success and final_status == JobStatus.COMPLETED:
+                await _delete_old_sold_properties()
 
             # Notify backend to backfill census tract data for properties missing geoid/class (post-scrape)
             if status_update_success and final_status == JobStatus.COMPLETED and getattr(settings, "BACKEND_URL", "").strip():
