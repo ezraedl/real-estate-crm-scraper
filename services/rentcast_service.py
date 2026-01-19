@@ -59,8 +59,8 @@ def _build_address(property_dict: dict) -> Optional[str]:
     return built if built else None
 
 
-def _build_rentcast_url(property_dict: dict) -> Optional[str]:
-    """Build app.rentcast.io URL with address and optional type, bedrooms, bathrooms, area, year."""
+def _build_rentcast_params(property_dict: dict) -> Optional[Dict[str, Any]]:
+    """Build query params (address + optional type, bedrooms, bathrooms, area, year) for Rentcast app or API."""
     address = _build_address(property_dict)
     if not address:
         return None
@@ -80,8 +80,29 @@ def _build_rentcast_url(property_dict: dict) -> Optional[str]:
             params["area"] = int(desc["sqft"])
         if desc.get("year_built") is not None:
             params["year"] = int(desc["year_built"])
-    base = "https://app.rentcast.io/app"
-    return f"{base}?{urlencode(params)}"
+    return params
+
+
+def _build_rentcast_url(property_dict: dict) -> Optional[str]:
+    """Build app.rentcast.io app URL with address and optional type, bedrooms, bathrooms, area, year."""
+    params = _build_rentcast_params(property_dict)
+    if not params:
+        return None
+    return f"https://app.rentcast.io/app?{urlencode(params)}"
+
+
+def _build_http_proxy_url(proxy) -> Optional[str]:
+    """Build http://[user:pass@]host:port for use with httpx/curl_cffi. Adds session.{rand} to username if needed."""
+    if not proxy:
+        return None
+    user = (proxy.username or "").strip()
+    if user and "session." not in user:
+        user = f"{user};session.{secrets.randbelow(1_000_000)}"
+    if user and proxy.password:
+        return f"http://{user}:{proxy.password}@{proxy.host}:{proxy.port}"
+    if user or proxy.password:
+        return f"http://{user or ''}:{proxy.password or ''}@{proxy.host}:{proxy.port}"
+    return f"http://{proxy.host}:{proxy.port}"
 
 
 # Plausible monthly rent range: exclude per-sqft ($0.94, $1.04), per-bedroom ($563), etc.
@@ -204,6 +225,62 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _fetch_getrentdata_direct(property_dict: dict) -> Optional[Dict[str, Any]]:
+    """
+    Try GET https://app.rentcast.io/api/getRentData?{params} with proxy and browser-like headers.
+    Uses curl_cffi (TLS fingerprinting) if available, else httpx. Returns the same shape as
+    _extract_from_getrentdata_response (rent, rent_range_low, rent_range_high, comparables,
+    subject_property) or None.
+    """
+    params = _build_rentcast_params(property_dict)
+    if not params:
+        return None
+    url = f"https://app.rentcast.io/api/getRentData?{urlencode(params)}"
+    proxy = proxy_manager.get_next_proxy()
+    proxy_url = _build_http_proxy_url(proxy)
+    headers = {**(proxy_manager.get_random_headers()), "Accept": "application/json"}
+
+    # 1) curl_cffi (TLS fingerprinting, better anti-bot)
+    try:
+        from curl_cffi.requests import AsyncSession
+
+        kw: Dict[str, Any] = {"impersonate": "chrome120", "timeout": 20}
+        if proxy_url:
+            kw["proxy"] = proxy_url
+        async with AsyncSession() as session:
+            r = await session.get(url, headers=headers, **kw)
+        if r.status_code == 200:
+            obj = r.json()
+            data = _extract_from_getrentdata_response(obj)
+            if data is not None and data.get("rent") is not None:
+                logger.debug("Rentcast: direct API getRentData ok for %s", params.get("address", "")[:50])
+                return data
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug("Rentcast: direct API (curl_cffi) failed: %s", e)
+
+    # 2) httpx fallback
+    try:
+        import httpx
+
+        kw: Dict[str, Any] = {"timeout": 20}
+        if proxy_url:
+            kw["proxy"] = proxy_url
+        async with httpx.AsyncClient(**kw) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            obj = r.json()
+            data = _extract_from_getrentdata_response(obj)
+            if data is not None and data.get("rent") is not None:
+                logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
+                return data
+    except Exception as e:
+        logger.debug("Rentcast: direct API (httpx) failed: %s", e)
+
+    return None
+
+
 def _parse_rent_from_text(text: str) -> Dict[str, Any]:
     """
     Extract rent, rent_range_low, rent_range_high from page text.
@@ -308,18 +385,30 @@ class RentcastService:
         self.db = db
 
     async def _fetch_and_parse(self, property_dict: dict, jitter_key: str = "") -> Optional[Dict[str, Any]]:
-        """Fetch Rentcast page and parse rent. Returns rent_estimation dict or None. No DB."""
+        """Fetch Rentcast: try direct API (getRentData) first; if that fails, use Playwright. Returns rent_estimation dict or None."""
         url = _build_rentcast_url(property_dict)
         if not url:
             return None
         proxy = proxy_manager.get_next_proxy()
         proxy_dict = _playwright_proxy_dict(proxy)
-        # Browser-like headers (same concept as Realtor: rotating User-Agent + Accept, Accept-Language, etc.)
         headers = proxy_manager.get_random_headers()
         user_agent = headers.get("User-Agent") or ""
         extra_http_headers = {k: v for k, v in headers.items() if k != "User-Agent" and v}
         async with _RENTCAST_SEMAPHORE:
             await asyncio.sleep(1.0 + (hash(jitter_key) % 1000) / 1000.0)
+            # 1) Try direct GET /api/getRentData (avoids Playwright when Rentcast returns JSON)
+            data = await _fetch_getrentdata_direct(property_dict)
+            if data is not None and data.get("rent") is not None:
+                return {
+                    "rent": data["rent"],
+                    "rent_range_low": data.get("rent_range_low"),
+                    "rent_range_high": data.get("rent_range_high"),
+                    "comparables": data.get("comparables") or [],
+                    "subject_property": data.get("subject_property"),
+                    "fetched_at": datetime.utcnow(),
+                    "source": "rentcast",
+                }
+        # 2) Fallback: Playwright (page load + XHR/JSON/DOM parsing)
         try:
             from playwright.async_api import async_playwright
 

@@ -102,3 +102,10 @@ If 403 errors continue after redeployment:
    - Edit `homeharvest/core/scrapers/__init__.py`
    - Change `DEFAULT_IMPERSONATE = "chrome110"` to `"chrome116"` or `"edge99"`
    - Commit and push, then redeploy
+
+## Rentcast / Playwright on Railway
+
+The **rent-estimation backfill** (`POST /rent-estimation/backfill`) uses Playwright and Chromium to scrape app.rentcast.io. On Railway (Nixpacks), Chromium must be installed at **build** time.
+
+- **nixpacks.toml** runs `playwright install --with-deps chromium` after `pip install`, so a normal deploy installs Chromium and its system deps.
+- If you see `Executable doesn't exist at .../chrome-headless-shell...` or `playwright install`, ensure the redeploy completed and the build log shows the `playwright install` step. If `--with-deps` fails (e.g. no apt in the Nixpacks image), try changing `nixpacks.toml` to `playwright install chromium` only and add required apt packages via `[phases.setup] aptPkgs` if you hit missing `.so` errors at runtime.
