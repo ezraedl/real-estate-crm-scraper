@@ -864,14 +864,15 @@ _rent_backfill_running = False
 
 
 async def _run_rent_backfill_task(limit: int) -> None:
-    """Background task: fetch Rentcast rent estimates for properties missing rent_estimation.rent."""
+    """Background task: fetch Rentcast rent estimates for FOR_SALE and PENDING properties missing rent_estimation.rent."""
     global _rent_backfill_running
     _rent_backfill_running = True
     done, failed = 0, 0
     try:
-        # Properties missing rent: no rent_estimation.rent or it is null
+        # Properties missing rent: FOR_SALE or PENDING only (exclude OFF_MARKET, SOLD, etc.)
         q = {
             "address": {"$exists": True},
+            "status": {"$in": ["FOR_SALE", "PENDING"]},
             "$and": [
                 {"$or": [
                     {"address.formatted_address": {"$exists": True, "$ne": ""}},
@@ -917,8 +918,9 @@ async def _run_rent_backfill_task(limit: int) -> None:
 @app.post("/rent-estimation/backfill/")  # with trailing slash (Railway/proxies may normalize to this)
 async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body(None), token_payload: dict = Depends(verify_rent_backfill_auth)):
     """
-    Start a background job to fetch Rentcast rent estimates for all properties missing rent data.
-    Only properties with an address (formatted_address or city) and without rent_estimation.rent are processed.
+    Start a background job to fetch Rentcast rent estimates for properties missing rent data.
+    Only FOR_SALE and PENDING properties are processed (OFF_MARKET, SOLD, etc. are excluded).
+    Also requires: address (formatted_address or city) and no rent_estimation.rent.
     Requires JWT or X-API-Key. Run from production: POST /rent-estimation/backfill with body {"limit": 500}.
     """
     global _rent_backfill_running
@@ -927,8 +929,10 @@ async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body
     limit = 500
     if request and isinstance(request.get("limit"), (int, float)):
         limit = max(1, min(int(request["limit"]), 5000))
+    # FOR_SALE and PENDING only; exclude OFF_MARKET, SOLD, etc.
     q = {
         "address": {"$exists": True},
+        "status": {"$in": ["FOR_SALE", "PENDING"]},
         "$and": [
             {"$or": [
                 {"address.formatted_address": {"$exists": True, "$ne": ""}},
