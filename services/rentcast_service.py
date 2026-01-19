@@ -2,8 +2,10 @@
 Rentcast rent estimation service.
 
 Scrapes app.rentcast.io (unauthenticated) for rent, rent_range_low, rent_range_high,
-and comparables. Uses the same proxy rotation and browser-headers concept as Realtor.
-The app is Angular and loads data via JS, so we use Playwright.
+and comparables. Uses the same anti-bot measures as Realtor:
+- Rotating proxy (proxy_manager.get_next_proxy) with DataImpulse session.{random} for IP rotation
+- Browser-like headers (proxy_manager.get_random_headers: User-Agent, Accept, Accept-Language, etc.)
+- Playwright/Chromium for real-browser TLS and JS rendering
 
 Requires: playwright install chromium (run once per environment).
 """
@@ -312,6 +314,10 @@ class RentcastService:
             return None
         proxy = proxy_manager.get_next_proxy()
         proxy_dict = _playwright_proxy_dict(proxy)
+        # Browser-like headers (same concept as Realtor: rotating User-Agent + Accept, Accept-Language, etc.)
+        headers = proxy_manager.get_random_headers()
+        user_agent = headers.get("User-Agent") or ""
+        extra_http_headers = {k: v for k, v in headers.items() if k != "User-Agent" and v}
         async with _RENTCAST_SEMAPHORE:
             await asyncio.sleep(1.0 + (hash(jitter_key) % 1000) / 1000.0)
         try:
@@ -323,6 +329,10 @@ class RentcastService:
                     ctx_opts: Dict[str, Any] = {"ignore_https_errors": True}
                     if proxy_dict:
                         ctx_opts["proxy"] = proxy_dict
+                    if user_agent:
+                        ctx_opts["user_agent"] = user_agent
+                    if extra_http_headers:
+                        ctx_opts["extra_http_headers"] = extra_http_headers
                     context = await browser.new_context(**ctx_opts)
                     page = await context.new_page()
                     api_responses: List[Any] = []
