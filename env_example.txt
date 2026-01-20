@@ -9,6 +9,13 @@ JWT_SECRET=your-jwt-secret-key-here
 # Auth uses JWT signed with JWT_SECRET (aud: census-backfill)—no extra key needed.
 # BACKEND_URL=https://your-backend.railway.app
 
+# Rentcast: scrape app.rentcast.io (unauthenticated) for rent estimates. Set to false to disable.
+# RENTCAST_ENABLED=true
+
+# Optional: API key for POST /rent-estimation/backfill. If set, you can use header X-API-Key: <value>
+# instead of JWT. Useful for Postman, scripts, or when your token is not a JWT.
+# RENT_BACKFILL_API_KEY=your-secret-key-here
+
 # CORS Origins (comma-separated, use * for all origins)
 # Include every origin that will call the scraper API (frontend production, Vercel, preview URLs, etc.).
 # Example: https://rei.engreg.com,https://real-estate-crm-frontend-one.vercel.app

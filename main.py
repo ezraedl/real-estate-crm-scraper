@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from starlette.responses import Response
@@ -36,7 +36,8 @@ from scraper import scraper
 from proxy_manager import proxy_manager
 from config import settings
 from services.zip_code_service import zip_code_service
-from middleware.auth import verify_token
+from services.rentcast_service import RentcastService
+from middleware.auth import verify_token, verify_rent_backfill_auth
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -857,6 +858,102 @@ async def health_check():
             "version": "1.0.0",
             "warning": "Service running with limited functionality"
         }
+
+# Rent estimation backfill: in-memory lock to avoid overlapping runs
+_rent_backfill_running = False
+
+
+async def _run_rent_backfill_task(limit: int) -> None:
+    """Background task: fetch Rentcast rent estimates for FOR_SALE and PENDING properties missing rent_estimation.rent."""
+    global _rent_backfill_running
+    _rent_backfill_running = True
+    done, failed = 0, 0
+    try:
+        # Properties missing rent: FOR_SALE or PENDING only (exclude OFF_MARKET, SOLD, etc.)
+        q = {
+            "address": {"$exists": True},
+            "status": {"$in": ["FOR_SALE", "PENDING"]},
+            "$and": [
+                {"$or": [
+                    {"address.formatted_address": {"$exists": True, "$ne": ""}},
+                    {"address.city": {"$exists": True, "$ne": ""}},
+                ]},
+                {"$or": [
+                    {"rent_estimation.rent": {"$exists": False}},
+                    {"rent_estimation.rent": None},
+                ]},
+            ],
+        }
+        cursor = db.properties_collection.find(q).limit(limit)
+        properties = await cursor.to_list(length=limit)
+        total = len(properties)
+        if total == 0:
+            logger.info("Rent backfill: no properties missing rent data")
+            return
+        logger.info("Rent backfill: starting for %d properties (limit=%d)", total, limit)
+        svc = RentcastService(db)
+        for i, p in enumerate(properties, 1):
+            pid = p.get("property_id")
+            if not pid:
+                failed += 1
+                continue
+            pid = str(pid)
+            try:
+                ok = await svc.fetch_and_save_rent_estimate(pid, p)
+                if ok:
+                    done += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                logger.warning("Rent backfill: property_id=%s error: %s", pid, e)
+                failed += 1
+            if i % 50 == 0:
+                logger.info("Rent backfill: progress %d/%d (ok=%d, fail=%d)", i, total, done, failed)
+        logger.info("Rent backfill: completed done=%d failed=%d", done, failed)
+    finally:
+        _rent_backfill_running = False
+
+
+@app.post("/rent-estimation/backfill")
+@app.post("/rent-estimation/backfill/")  # with trailing slash (Railway/proxies may normalize to this)
+async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body(None), token_payload: dict = Depends(verify_rent_backfill_auth)):
+    """
+    Start a background job to fetch Rentcast rent estimates for properties missing rent data.
+    Only FOR_SALE and PENDING properties are processed (OFF_MARKET, SOLD, etc. are excluded).
+    Also requires: address (formatted_address or city) and no rent_estimation.rent.
+    Requires JWT or X-API-Key. Run from production: POST /rent-estimation/backfill with body {"limit": 500}.
+    """
+    global _rent_backfill_running
+    if _rent_backfill_running:
+        return {"status": "already_running", "message": "Rent estimation backfill is already running."}
+    limit = 500
+    if request and isinstance(request.get("limit"), (int, float)):
+        limit = max(1, min(int(request["limit"]), 5000))
+    # FOR_SALE and PENDING only; exclude OFF_MARKET, SOLD, etc.
+    q = {
+        "address": {"$exists": True},
+        "status": {"$in": ["FOR_SALE", "PENDING"]},
+        "$and": [
+            {"$or": [
+                {"address.formatted_address": {"$exists": True, "$ne": ""}},
+                {"address.city": {"$exists": True, "$ne": ""}},
+            ]},
+            {"$or": [
+                {"rent_estimation.rent": {"$exists": False}},
+                {"rent_estimation.rent": None},
+            ]},
+        ],
+    }
+    total = await db.properties_collection.count_documents(q)
+    total = min(total, limit)
+    asyncio.create_task(_run_rent_backfill_task(limit))
+    return {
+        "status": "started",
+        "total": total,
+        "limit": limit,
+        "message": f"Rent estimation backfill started for up to {total} properties. Check logs for progress.",
+    }
+
 
 # Get properties by ID endpoint
 @app.post("/properties/by-ids")
