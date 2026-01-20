@@ -1,6 +1,7 @@
 import motor.motor_asyncio
 from pymongo import ASCENDING, DESCENDING
 from pymongo.operations import InsertOne, UpdateOne, ReplaceOne
+from pymongo.errors import BulkWriteError
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import asyncio
@@ -1206,8 +1207,26 @@ class Database:
             
             # Execute bulk write operation
             if bulk_operations:
-                bulk_result = await self.properties_collection.bulk_write(bulk_operations, ordered=False)
-                logger.debug(f"Bulk write: {bulk_result.inserted_count} inserted, {bulk_result.modified_count} modified, {bulk_result.upserted_count} upserted")
+                try:
+                    bulk_result = await self.properties_collection.bulk_write(bulk_operations, ordered=False)
+                    logger.debug(f"Bulk write: {bulk_result.inserted_count} inserted, {bulk_result.modified_count} modified, {bulk_result.upserted_count} upserted")
+                except BulkWriteError as e:
+                    details = e.details
+                    results["inserted"] = details.get("nInserted", 0) + details.get("nUpserted", 0)
+                    results["updated"] = details.get("nModified", 0)
+                    results["errors"] = len(details.get("writeErrors", []))
+                    failed_ids = set()
+                    for we in details.get("writeErrors", []):
+                        kv = we.get("keyValue") or {}
+                        pid = kv.get("property_id")
+                        if pid is not None:
+                            failed_ids.add(pid)
+                            failed_ids.add(str(pid))
+                    results["enrichment_queue"] = [x for x in results["enrichment_queue"] if x.get("property_id") not in failed_ids]
+                    logger.warning(
+                        f"Bulk write partial failure: {results['errors']} writeErrors (e.g. duplicate key); "
+                        f"inserted={results['inserted']}, updated={results['updated']}"
+                    )
             
             logger.debug(f"Batch save results: {results['inserted']} inserted, {results['updated']} updated, {results['skipped']} skipped, {results['errors']} errors")
             return results
