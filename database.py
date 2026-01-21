@@ -14,6 +14,57 @@ from services.contact_service import ContactService
 
 logger = logging.getLogger(__name__)
 
+# Fields to preserve from existing property when rescraping with content change.
+# replace_one() overwrites the whole document. Only HomeHarvest-originated fields (from
+# Property model / convert_to_property_model) should be replaced; all other fields are
+# from enrichment, RentCast, CRM, or tracking and must be preserved.
+#
+# HomeHarvest-originated (replaced): property_id, mls_id, mls, status, mls_status, listing_type,
+# address, description, financial (only: list_price, list_price_min/max, sold_price, last_sold_price,
+# price_per_sqft, estimated_value, tax_assessed_value, hoa_fee, tax), dates, location,
+# agent/broker/builder/office (nested), agent_id/broker_id/builder_id/office_id, property_url,
+# listing_id, permalink, primary_photo, alt_photos, days_on_mls, new_construction, monthly_fees,
+# one_time_fees, tax_history, nearby_schools, content_hash, last_content_updated, scraped_at,
+# job_id, scheduled_job_id, last_scraped, source, is_comp, crm_property_ids (handled separately).
+_PRESERVE_ON_RECSCRAPE = frozenset([
+    # RentCast
+    "rent_estimation",
+    # Enrichment
+    "enrichment", "is_motivated_seller", "has_price_reduction", "has_distress_signals", "last_enriched_at",
+    # Change / price history (embedded)
+    "change_logs", "change_logs_updated_at",
+    # Tracking for enrichment (list_price_old etc. merged under financial)
+    "_old_values_scraped_at", "status_old", "mls_status_old", "listing_type_old",
+    # Census (backend)
+    "census_tract_geoid", "census_tract_class_label", "census_tract_class_numeric", "census_tract_class_score",
+    # CRM / frontend / GHL
+    "comps", "crm_status", "ghl_final_update_sent", "is_favorite",
+    "margin_percent", "renovation_cost_per_sqft", "renovation_enabled",
+    "updatedAt",
+])
+
+
+def _merge_preserved_fields_on_rescrape(existing: dict, target: dict) -> None:
+    """Copy non–HomeHarvest fields from existing into target before replace_one so only
+    HomeHarvest-originated data is replaced."""
+    for k in _PRESERVE_ON_RECSCRAPE:
+        if existing.get(k) is not None:
+            target[k] = existing[k]
+    # Merge financial fields that are NOT from HomeHarvest (PropertyFinancial has only
+    # list_price, list_price_min/max, sold_price, last_sold_price, price_per_sqft,
+    # estimated_value, tax_assessed_value, hoa_fee, tax). Preserve:
+    # - _old fields (enrichment change detection)
+    # - original_list_price (if set by enrichment or another source)
+    ef = existing.get("financial") or {}
+    if ef:
+        tf = target.get("financial")
+        if tf is None:
+            tf = {}
+            target["financial"] = tf
+        for f in ("list_price_old", "original_list_price_old", "price_per_sqft_old", "original_list_price"):
+            if ef.get(f) is not None:
+                tf[f] = ef[f]
+
 class Database:
     def __init__(self):
         self.client = None
@@ -654,6 +705,10 @@ class Database:
                     if existing_property.get("crm_property_ids"):
                         property_dict["crm_property_ids"] = existing_property["crm_property_ids"]
                     
+                    # Preserve rent_estimation (RentCast), enrichment, change_logs, and _old tracking fields.
+                    # replace_one overwrites the full document; without this, rescraping would delete them.
+                    _merge_preserved_fields_on_rescrape(existing_property, property_dict)
+                    
                     # FIXED: Remove nested contact data after linking contacts
                     # Use update_one with $unset instead of replace_one to avoid re-adding nested data
                     # First, replace the property with contact IDs set
@@ -1126,6 +1181,10 @@ class Database:
                             # This field is not in the Property model, so it gets lost during ReplaceOne
                             if existing_prop.get("crm_property_ids"):
                                 property_dict["crm_property_ids"] = existing_prop["crm_property_ids"]
+                            
+                            # Preserve rent_estimation (RentCast), enrichment, change_logs, and _old tracking.
+                            # ReplaceOne overwrites the full document; without this, rescraping would delete them.
+                            _merge_preserved_fields_on_rescrape(existing_prop, property_dict)
                             
                             # FIXED: Remove nested contact data after linking
                             if contact_ids.get("agent_id") and property_dict.get("agent"):
