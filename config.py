@@ -66,6 +66,9 @@ class Settings:
     _enrichment_batch_size = os.getenv("ENRICHMENT_BATCH_SIZE")
     ENRICHMENT_BATCH_SIZE = int(_enrichment_batch_size) if _enrichment_batch_size else None  # None = process all properties from location
     
+    # RentCast Configuration - Default values
+    RENTCAST_WORKERS = int(get_required_env("RENTCAST_WORKERS", "8"))  # Number of parallel RentCast workers
+    
     # Additional Configuration - Default values
     PORT = int(get_required_env("PORT", "8000"))
     JWT_SECRET = get_required_env("JWT_SECRET", "default-secret-key")

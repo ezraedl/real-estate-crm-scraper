@@ -157,6 +157,7 @@ class MLSScraper:
         self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
         # Use asyncio.Semaphore instead of ThreadPoolExecutor for enrichment to avoid event loop conflicts
         self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
+        self.rentcast_semaphore = asyncio.Semaphore(settings.RENTCAST_WORKERS)  # Limit concurrent RentCast tasks
         # Track if job runs were full scrapes (keyed by job_id)
         self.job_run_flags: Dict[str, Dict[str, Any]] = {}
         # Global rate limiter: Only allow 1 request to Realtor.com at a time across ALL jobs
@@ -1144,6 +1145,12 @@ class MLSScraper:
                     "completed": 0,
                     "failed": 0
                 },
+                "rentcast": {
+                    "status": "pending",
+                    "total": 0,
+                    "completed": 0,
+                    "failed": 0
+                },
                 "off_market_check": {
                     "status": "pending",
                     "checked": 0,
@@ -1161,6 +1168,7 @@ class MLSScraper:
                     "updated": 0,
                     "skipped": 0,
                     "enriched": 0,
+                    "rentcast": 0,
                     "off_market": 0
                 }
             
@@ -1601,6 +1609,67 @@ class MLSScraper:
                             )
                         )
             
+            # Queue RentCast for for_sale and pending properties (non-blocking, async tasks, parallel with enrichment)
+            if enrichment_queue and getattr(settings, "RENTCAST_ENABLED", True):
+                # Filter enrichment_queue for for_sale and pending properties
+                rentcast_queue = [
+                    item for item in enrichment_queue
+                    if (item.get("listing_type") or "").lower() in ("for_sale", "pending")
+                ]
+                
+                if rentcast_queue:
+                    rentcast_count = len(rentcast_queue)
+                    logger.info(f"   [RENTCAST] Starting RentCast for {rentcast_count} properties from {location}")
+                    
+                    # Initialize RentCast status in location entry
+                    if location_idx is not None and location_idx < len(progress_logs["locations"]):
+                        location_entry = progress_logs["locations"][location_idx]
+                        location_entry["rentcast"]["status"] = "in_progress"
+                        location_entry["rentcast"]["total"] = rentcast_count
+                        location_entry["rentcast"]["completed"] = 0
+                        location_entry["rentcast"]["failed"] = 0
+                    
+                    # Process RentCast in batches if configured (reuse ENRICHMENT_BATCH_SIZE)
+                    batch_size = settings.ENRICHMENT_BATCH_SIZE
+                    if batch_size and isinstance(batch_size, str):
+                        try:
+                            batch_size = int(batch_size)
+                        except ValueError:
+                            batch_size = None
+                    
+                    if batch_size and batch_size > 0:
+                        # Process in batches
+                        for i in range(0, len(rentcast_queue), batch_size):
+                            batch = rentcast_queue[i:i + batch_size]
+                            for rentcast_item in batch:
+                                # Create async task with semaphore for concurrency control
+                                asyncio.create_task(
+                                    self._rentcast_property_async(
+                                        rentcast_item["property_id"],
+                                        rentcast_item["property_dict"],
+                                        rentcast_item["job_id"],
+                                        location=location,
+                                        location_idx=location_idx,
+                                        listing_type=rentcast_item.get("listing_type"),
+                                        progress_logs=progress_logs
+                                    )
+                                )
+                    else:
+                        # Process all at once
+                        for rentcast_item in rentcast_queue:
+                            # Create async task with semaphore for concurrency control
+                            asyncio.create_task(
+                                self._rentcast_property_async(
+                                    rentcast_item["property_id"],
+                                    rentcast_item["property_dict"],
+                                    rentcast_item["job_id"],
+                                    location=location,
+                                    location_idx=location_idx,
+                                    listing_type=rentcast_item.get("listing_type"),
+                                    progress_logs=progress_logs
+                                )
+                            )
+            
             # Update database with final summary
             await db.update_job_status(
                 job.job_id,
@@ -1674,16 +1743,6 @@ class MLSScraper:
                     job_id=job_id
                 )
                 success = True
-                # Rentcast rent estimation only for for_sale and pending (sold/for_rent not relevant)
-                lt = listing_type or property_dict.get("listing_type") or ""
-                if getattr(settings, "RENTCAST_ENABLED", True) and lt in ("for_sale", "pending"):
-                    try:
-                        from services.rentcast_service import RentcastService
-                        if not hasattr(self, "_rentcast_service"):
-                            self._rentcast_service = RentcastService(db)
-                        await self._rentcast_service.fetch_and_save_rent_estimate(property_id, property_dict)
-                    except Exception as e:
-                        logger.warning(f"Rentcast rent estimate failed for {property_id}: {e}")
             except Exception as e:
                 logger.error(f"Error in enrichment task for property {property_id}: {e}")
             finally:
@@ -1727,6 +1786,74 @@ class MLSScraper:
                                     )
                         except Exception as e:
                             logger.error(f"Error updating job status with enrichment progress: {e}")
+    
+    async def _rentcast_property_async(
+        self, 
+        property_id: str, 
+        property_dict: Dict[str, Any], 
+        job_id: Optional[str],
+        location: Optional[str] = None,
+        location_idx: Optional[int] = None,
+        listing_type: Optional[str] = None,
+        progress_logs: Optional[Dict[str, Any]] = None
+    ):
+        """Async RentCast task with semaphore for concurrency control"""
+        # Only process for_sale and pending properties
+        lt = listing_type or property_dict.get("listing_type") or ""
+        if not getattr(settings, "RENTCAST_ENABLED", True) or lt not in ("for_sale", "pending"):
+            return
+        
+        async with self.rentcast_semaphore:
+            success = False
+            try:
+                from services.rentcast_service import RentcastService
+                if not hasattr(self, "_rentcast_service"):
+                    self._rentcast_service = RentcastService(db)
+                await self._rentcast_service.fetch_and_save_rent_estimate(property_id, property_dict)
+                success = True
+            except Exception as e:
+                logger.warning(f"Rentcast rent estimate failed for {property_id}: {e}")
+            finally:
+                # Update progress logs if provided
+                if progress_logs and location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                    location_entry = progress_logs["locations"][location_idx]
+                    rentcast_status = location_entry.get("rentcast", {})
+                    
+                    if success:
+                        rentcast_status["completed"] = rentcast_status.get("completed", 0) + 1
+                        # Update per-listing-type rentcast counter
+                        if listing_type and listing_type in location_entry.get("listing_types", {}):
+                            location_entry["listing_types"][listing_type]["rentcast"] = \
+                                location_entry["listing_types"][listing_type].get("rentcast", 0) + 1
+                    else:
+                        rentcast_status["failed"] = rentcast_status.get("failed", 0) + 1
+                    
+                    # Check if RentCast is complete
+                    total = rentcast_status.get("total", 0)
+                    completed = rentcast_status.get("completed", 0)
+                    failed = rentcast_status.get("failed", 0)
+                    
+                    if completed + failed >= total and total > 0:
+                        rentcast_status["status"] = "completed"
+                    
+                    # Update job status periodically (every 10 completions to avoid too many DB writes)
+                    # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                    if (completed + failed) % 10 == 0 or (completed + failed) >= total:
+                        try:
+                            # Check current job status before updating
+                            current_job = await db.get_job(job_id)
+                            if current_job and current_job.status == JobStatus.RUNNING:
+                                await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                            else:
+                                # Job is already COMPLETED/FAILED/CANCELLED, only update progress_logs without changing status
+                                if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                    logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for RentCast")
+                                    await db.jobs_collection.update_one(
+                                        {"job_id": job_id},
+                                        {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
+                                    )
+                        except Exception as e:
+                            logger.error(f"Error updating job status with RentCast progress: {e}")
     
     async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None, cancel_flag: Optional[dict] = None, location_last_update: Optional[dict] = None) -> Tuple[Dict[str, List[Property]], Optional[str]]:
         """Scrape properties for all listing types in a single request. Returns a tuple of (dict mapping listing_type to properties, error_message if any)."""
