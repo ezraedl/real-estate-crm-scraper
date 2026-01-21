@@ -2308,6 +2308,23 @@ class MLSScraper:
                                 if len(props) > 3:
                                     logger.warning(f"   [UNASSIGNED]     ... and {len(props) - 3} more with same status")
             
+            # Deduplicate by property_id (keep first) to avoid E11000 when the API
+            # returns the same property in multiple rows for the same listing_type
+            for lt in properties_by_type:
+                seen = set()
+                deduped = []
+                for p in properties_by_type[lt]:
+                    pid = getattr(p, 'property_id', None)
+                    if pid is None:
+                        deduped.append(p)
+                        continue
+                    if pid in seen:
+                        logger.debug(f"   [DEDUPE] Dropped duplicate property_id={pid} in {lt}")
+                        continue
+                    seen.add(pid)
+                    deduped.append(p)
+                properties_by_type[lt] = deduped
+
             return properties_by_type, None  # No error, got results
             
         except Exception as e:
