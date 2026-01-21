@@ -23,8 +23,8 @@ from proxy_manager import proxy_manager
 
 logger = logging.getLogger(__name__)
 
-# Rate limiting: max 2 concurrent Rentcast requests, 1–2s between requests
-_RENTCAST_SEMAPHORE = asyncio.Semaphore(2)
+# Note: Rate limiting is now handled by scraper.py using self.rentcast_semaphore
+# which respects the RENTCAST_WORKERS configuration (default: 8)
 
 
 def _playwright_proxy_dict(proxy) -> Optional[Dict[str, str]]:
@@ -225,7 +225,7 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _fetch_getrentdata_direct(property_dict: dict) -> Optional[Dict[str, Any]]:
+async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retry_count: int = 0) -> Optional[Dict[str, Any]]:
     """
     Try GET https://app.rentcast.io/api/getRentData?{params} with proxy and browser-like headers.
     Uses curl_cffi (TLS fingerprinting) if available, else httpx. Returns the same shape as
@@ -236,27 +236,57 @@ async def _fetch_getrentdata_direct(property_dict: dict) -> Optional[Dict[str, A
     if not params:
         return None
     url = f"https://app.rentcast.io/api/getRentData?{urlencode(params)}"
+    
+    # Get fresh proxy on retries to avoid using blocked IPs
     proxy = proxy_manager.get_next_proxy()
     proxy_url = _build_http_proxy_url(proxy)
-    headers = {**(proxy_manager.get_random_headers()), "Accept": "application/json"}
+    
+    # Build comprehensive headers that mimic a real browser
+    base_headers = proxy_manager.get_random_headers()
+    headers = {
+        **base_headers,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://app.rentcast.io/",  # Critical: RentCast checks Referer
+        "Origin": "https://app.rentcast.io",     # Critical: RentCast checks Origin
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
 
     # 1) curl_cffi (TLS fingerprinting, better anti-bot)
     try:
         from curl_cffi.requests import AsyncSession
 
-        kw: Dict[str, Any] = {"impersonate": "chrome120", "timeout": 20}
+        kw: Dict[str, Any] = {
+            "impersonate": "chrome120", 
+            "timeout": timeout,
+            "allow_redirects": True,
+        }
         if proxy_url:
             kw["proxy"] = proxy_url
         async with AsyncSession() as session:
             r = await session.get(url, headers=headers, **kw)
+        
         if r.status_code == 200:
-            obj = r.json()
-            data = _extract_from_getrentdata_response(obj)
-            if data is not None and data.get("rent") is not None:
-                logger.debug("Rentcast: direct API getRentData ok for %s", params.get("address", "")[:50])
-                return data
+            try:
+                obj = r.json()
+                data = _extract_from_getrentdata_response(obj)
+                if data is not None and data.get("rent") is not None:
+                    logger.debug("Rentcast: direct API getRentData ok (curl_cffi) for %s", params.get("address", "")[:50])
+                    return data
+                else:
+                    logger.debug("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
+            except Exception as json_err:
+                logger.debug("Rentcast: API returned 200 but JSON parse failed: %s", json_err)
+        elif r.status_code == 403:
+            logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
+        elif r.status_code == 429:
+            logger.warning("Rentcast: API returned 429 Too Many Requests (rate limited) for %s", params.get("address", "")[:50])
+        else:
+            logger.debug("Rentcast: API returned status %d (curl_cffi) for %s", r.status_code, params.get("address", "")[:50])
     except ImportError:
-        pass
+        pass  # curl_cffi not installed, try httpx
     except Exception as e:
         logger.debug("Rentcast: direct API (curl_cffi) failed: %s", e)
 
@@ -264,21 +294,37 @@ async def _fetch_getrentdata_direct(property_dict: dict) -> Optional[Dict[str, A
     try:
         import httpx
 
-        kw: Dict[str, Any] = {"timeout": 20}
+        kw: Dict[str, Any] = {
+            "timeout": timeout,
+            "follow_redirects": True,
+        }
         if proxy_url:
             kw["proxy"] = proxy_url
         async with httpx.AsyncClient(**kw) as client:
             r = await client.get(url, headers=headers)
+        
         if r.status_code == 200:
-            obj = r.json()
-            data = _extract_from_getrentdata_response(obj)
-            if data is not None and data.get("rent") is not None:
-                logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
-                return data
+            try:
+                obj = r.json()
+                data = _extract_from_getrentdata_response(obj)
+                if data is not None and data.get("rent") is not None:
+                    logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
+                    return data
+                else:
+                    logger.debug("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
+            except Exception as json_err:
+                logger.debug("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
+        elif r.status_code == 403:
+            logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
+        elif r.status_code == 429:
+            logger.warning("Rentcast: API returned 429 Too Many Requests (rate limited, httpx) for %s", params.get("address", "")[:50])
+        else:
+            logger.debug("Rentcast: API returned status %d (httpx) for %s", r.status_code, params.get("address", "")[:50])
     except Exception as e:
         logger.debug("Rentcast: direct API (httpx) failed: %s", e)
 
     return None
+
 
 
 def _parse_rent_from_text(text: str) -> Dict[str, Any]:
@@ -385,20 +431,24 @@ class RentcastService:
         self.db = db
 
     async def _fetch_and_parse(self, property_dict: dict, jitter_key: str = "") -> Optional[Dict[str, Any]]:
-        """Fetch Rentcast: try direct API (getRentData) first; if that fails, use Playwright. Returns rent_estimation dict or None."""
+        """Fetch Rentcast: try direct API (getRentData) with retries; if that fails, use Playwright. Returns rent_estimation dict or None."""
+        from config import settings
+        
         url = _build_rentcast_url(property_dict)
         if not url:
             return None
-        proxy = proxy_manager.get_next_proxy()
-        proxy_dict = _playwright_proxy_dict(proxy)
-        headers = proxy_manager.get_random_headers()
-        user_agent = headers.get("User-Agent") or ""
-        extra_http_headers = {k: v for k, v in headers.items() if k != "User-Agent" and v}
-        async with _RENTCAST_SEMAPHORE:
-            await asyncio.sleep(1.0 + (hash(jitter_key) % 1000) / 1000.0)
-            # 1) Try direct GET /api/getRentData (avoids Playwright when Rentcast returns JSON)
-            data = await _fetch_getrentdata_direct(property_dict)
+        
+        # Note: Semaphore is now managed by scraper.py (self.rentcast_semaphore)
+        # No need for local semaphore or jitter delay here
+        
+        # 1) Try direct GET /api/getRentData with retries (avoids Playwright when Rentcast returns JSON)
+        timeout = getattr(settings, "RENTCAST_API_TIMEOUT", 30)
+        retries = getattr(settings, "RENTCAST_API_RETRIES", 2)
+        
+        for attempt in range(retries):
+            data = await _fetch_getrentdata_direct(property_dict, timeout=timeout)
             if data is not None and data.get("rent") is not None:
+                logger.debug("Rentcast: direct API success on attempt %d/%d", attempt + 1, retries)
                 return {
                     "rent": data["rent"],
                     "rent_range_low": data.get("rent_range_low"),
@@ -408,6 +458,24 @@ class RentcastService:
                     "fetched_at": datetime.utcnow(),
                     "source": "rentcast",
                 }
+            if attempt < retries - 1:
+                # Brief delay before retry
+                await asyncio.sleep(0.5)
+        
+        logger.debug("Rentcast: direct API failed after %d attempts, checking Playwright fallback", retries)
+        
+        # Check if Playwright fallback is enabled
+        use_playwright = getattr(settings, "RENTCAST_USE_PLAYWRIGHT_FALLBACK", True)
+        if not use_playwright:
+            logger.debug("Rentcast: Playwright fallback disabled, skipping")
+            return None
+        
+        # Prepare for Playwright fallback
+        proxy = proxy_manager.get_next_proxy()
+        proxy_dict = _playwright_proxy_dict(proxy)
+        headers = proxy_manager.get_random_headers()
+        user_agent = headers.get("User-Agent") or ""
+        extra_http_headers = {k: v for k, v in headers.items() if k != "User-Agent" and v}
         # 2) Fallback: Playwright (page load + XHR/JSON/DOM parsing)
         try:
             from playwright.async_api import async_playwright
