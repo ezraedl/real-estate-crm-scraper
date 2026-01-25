@@ -181,15 +181,19 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
     try:
         d = obj.get("data")
         if not isinstance(d, dict):
+            logger.debug("Rentcast API: response missing 'data' dict, got keys: %s", list(obj.keys()) if isinstance(obj, dict) else type(obj))
             return None
         prop = d.get("property")
         if not isinstance(prop, dict):
+            logger.debug("Rentcast API: data.property missing or not dict, got keys: %s", list(d.keys()))
             return None
         re_ = prop.get("rentEstimate")
         if not isinstance(re_, dict):
+            logger.debug("Rentcast API: data.property.rentEstimate missing or not dict, property keys: %s", list(prop.keys()))
             return None
         rent = _num(re_.get("value"))
         if rent is None:
+            logger.debug("Rentcast API: rentEstimate.value is None, rentEstimate keys: %s, values: %s", list(re_.keys()), {k: re_.get(k) for k in list(re_.keys())[:5]})
             return None
         low = _num(re_.get("rangeMin"))
         high = _num(re_.get("rangeMax"))
@@ -214,6 +218,7 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
                 "daysOld": _num(lst.get("daysOld")),
                 "correlation": _num(c.get("correlation")),
             })
+        logger.debug("Rentcast API: successfully extracted rent=%s, low=%s, high=%s, comps=%d", rent, low, high, len(comps))
         return {
             "rent": rent,
             "rent_range_low": low,
@@ -221,7 +226,8 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
             "comparables": comps,
             "subject_property": subject,
         }
-    except Exception:
+    except Exception as e:
+        logger.debug("Rentcast API: exception during extraction: %s", e)
         return None
 
 
