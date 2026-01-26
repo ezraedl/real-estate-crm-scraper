@@ -80,13 +80,7 @@ else:
 
 logger.info(f"CORS configured with origins: {allowed_origins}, allow_credentials: {allow_creds}")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_creds,
-    allow_methods=["*"],
-)
+# Middleware removed for debugging
 
 # Helper function to determine remaining work from progress logs
 def get_remaining_locations(job: ScrapingJob) -> List[str]:
