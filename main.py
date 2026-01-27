@@ -85,7 +85,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=allow_creds,
-    allow_methods=["*"],
+    # Preflight failures were caused by missing/blocked headers like Authorization.
+    # Be explicit and permissive here so browser OPTIONS requests succeed.
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["Content-Type", "Authorization"],
+    max_age=86400,
 )
 
 # Helper function to determine remaining work from progress logs
