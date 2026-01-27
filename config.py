@@ -40,11 +40,12 @@ class Settings:
     
     # Scraping Configuration - Default values
     MAX_CONCURRENT_JOBS = int(get_required_env("MAX_CONCURRENT_JOBS", "3"))
+    THREAD_POOL_WORKERS = int(get_required_env("THREAD_POOL_WORKERS", "2"))
     REQUEST_DELAY = float(get_required_env("REQUEST_DELAY", "1.0"))
     MAX_RETRIES = int(get_required_env("MAX_RETRIES", "3"))
     # Location timeout: if a location hasn't added/updated properties in this many minutes, mark it as failed
-    # Default: 10 minutes - if no properties are added/updated in 10 minutes, the location is likely stuck
-    LOCATION_TIMEOUT_MINUTES = int(get_required_env("LOCATION_TIMEOUT_MINUTES", "10"))
+    # Default: 30 minutes - if no properties are added/updated in 30 minutes, the location is likely stuck
+    LOCATION_TIMEOUT_MINUTES = int(get_required_env("LOCATION_TIMEOUT_MINUTES", "30"))
     
     # Rate Limiting - Default values
     # Reduced from 60 to 10 requests per minute to avoid blocking

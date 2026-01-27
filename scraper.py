@@ -154,7 +154,7 @@ class MLSScraper:
     def __init__(self):
         self.is_running = False
         self.current_jobs = {}
-        self.executor = ThreadPoolExecutor(max_workers=3)  # Thread pool for blocking operations
+        self.executor = ThreadPoolExecutor(max_workers=settings.THREAD_POOL_WORKERS)  # Thread pool for blocking operations
         # Use asyncio.Semaphore instead of ThreadPoolExecutor for enrichment to avoid event loop conflicts
         self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
         self.rentcast_semaphore = asyncio.Semaphore(settings.RENTCAST_WORKERS)  # Limit concurrent RentCast tasks
