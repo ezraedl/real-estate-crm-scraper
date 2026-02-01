@@ -11,6 +11,7 @@ from config import settings
 from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
 from services import PropertyEnrichmentPipeline
 from services.history_tracker import HistoryTracker
+from services.property_differ import PropertyDiffer
 from services.contact_service import ContactService
 
 logger = logging.getLogger(__name__)
@@ -681,6 +682,8 @@ class Database:
                     }
                 else:
                     # Content changed - update the property
+                    differ = PropertyDiffer()
+                    history_tracker = HistoryTracker(self.db)
                     # First, create/update contacts and get contact IDs
                     try:
                         contact_ids = await self.contact_service.process_property_contacts(property_data)
@@ -756,6 +759,18 @@ class Database:
                             {"property_id": property_data.property_id},
                             {"$unset": unset_fields}
                         )
+
+                    # Record change logs for content changes (status/price/etc.)
+                    try:
+                        changes = differ.detect_changes(existing_property, property_dict)
+                        if changes.get("has_changes"):
+                            await history_tracker.record_change_logs(
+                                property_data.property_id,
+                                changes.get("field_changes", []),
+                                property_data.job_id
+                            )
+                    except Exception as e:
+                        logger.error(f"Error recording change logs for property {property_data.property_id}: {e}")
                     
                     # Update CRM properties that reference this MLS property
                     # Note: For internal scraper updates, we update all platforms
@@ -867,7 +882,7 @@ class Database:
             merged = {**existing_property, **update_fields}
 
             # Filter to Property model fields for hash generation
-            model_fields = set(Property.__fields__.keys())
+            model_fields = set(Property.model_fields.keys())
             prop_payload = {k: merged.get(k) for k in model_fields if k in merged}
 
             prop_model = Property(**prop_payload)
@@ -1155,6 +1170,8 @@ class Database:
                         }
             
             # Step 3: Build bulk operations using contact results
+            differ = PropertyDiffer()
+            history_tracker = HistoryTracker(self.db)
             for prop in properties:
                 try:
                     info = property_processing_info.get(prop.property_id)
@@ -1280,6 +1297,18 @@ class Database:
                                 property_dict,
                                 upsert=True
                             ))
+
+                            # Record change logs for content changes (status/price/etc.)
+                            try:
+                                changes = differ.detect_changes(existing_prop, property_dict)
+                                if changes.get("has_changes"):
+                                    await history_tracker.record_change_logs(
+                                        prop.property_id,
+                                        changes.get("field_changes", []),
+                                        prop.job_id
+                                    )
+                            except Exception as e:
+                                logger.error(f"Error recording change logs for property {prop.property_id}: {e}")
                             results["updated"] += 1
                             results["enrichment_queue"].append({
                                 "property_id": prop.property_id,
