@@ -398,7 +398,7 @@ class MotivatedSellerScorer:
         status_history = history_data.get('status_history', [])
         
         # Current status
-        current_status = property_data.get('status', '').upper()
+        current_status = (property_data.get('status') or '').upper()
         if current_status == 'PENDING':
             return None  # Currently pending, can't calculate
         
@@ -406,8 +406,8 @@ class MotivatedSellerScorer:
         for entry in status_history:
             if entry.get('change_type') == 'status_change':
                 data = entry.get('data', {})
-                old_status = data.get('old_status', '').upper()
-                new_status = data.get('new_status', '').upper()
+                old_status = (data.get('old_status') or '').upper()
+                new_status = (data.get('new_status') or '').upper()
                 
                 # Found a transition from PENDING to FOR_SALE
                 if old_status == 'PENDING' and new_status == 'FOR_SALE':

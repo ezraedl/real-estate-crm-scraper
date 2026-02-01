@@ -158,6 +158,8 @@ class MLSScraper:
         # Use asyncio.Semaphore instead of ThreadPoolExecutor for enrichment to avoid event loop conflicts
         self.enrichment_semaphore = asyncio.Semaphore(settings.ENRICHMENT_WORKERS)  # Limit concurrent enrichment tasks
         self.rentcast_semaphore = asyncio.Semaphore(settings.RENTCAST_WORKERS)  # Limit concurrent RentCast tasks
+        self._homeharvest_inflight = 0  # Tracks active HomeHarvest fetches to prioritize scraping
+        self._homeharvest_lock = asyncio.Lock()
         # Track if job runs were full scrapes (keyed by job_id)
         self.job_run_flags: Dict[str, Dict[str, Any]] = {}
         # Global rate limiter: Only allow 1 request to Realtor.com at a time across ALL jobs
@@ -242,6 +244,22 @@ class MLSScraper:
                     
         except Exception as e:
             logger.error(f"[MONITOR] Error in location timeout monitor: {e}")
+
+    async def _increment_homeharvest_inflight(self) -> None:
+        """Track HomeHarvest activity so Rentcast can yield priority."""
+        async with self._homeharvest_lock:
+            self._homeharvest_inflight += 1
+
+    async def _decrement_homeharvest_inflight(self) -> None:
+        """Track HomeHarvest activity so Rentcast can yield priority."""
+        async with self._homeharvest_lock:
+            if self._homeharvest_inflight > 0:
+                self._homeharvest_inflight -= 1
+
+    async def _is_homeharvest_busy(self) -> bool:
+        """Return True when HomeHarvest fetches are active (best-effort gate for Rentcast)."""
+        async with self._homeharvest_lock:
+            return self._homeharvest_inflight > 0
 
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
@@ -376,7 +394,6 @@ class MLSScraper:
                 # Check if this location has timed out
                 timed_out_locations = cancel_flag.get("timed_out_locations", [])
                 if location in timed_out_locations:
-                    from config import settings
                     location_failed = True
                     location_error = f"Location timeout: no properties added/updated in {settings.LOCATION_TIMEOUT_MINUTES} minutes"
                     logger.warning(f"[TIMEOUT] Location {location} timed out, marking as failed and moving to next location")
@@ -1218,7 +1235,6 @@ class MLSScraper:
                             if current_proxy_config:
                                 proxy_config = current_proxy_config  # Update for next location
                     # Proxy enforcement + sanitized logging
-                    from config import settings
                     proxy_url = (current_proxy_config or {}).get("proxy_url")
                     proxy_host = (current_proxy_config or {}).get("proxy_host")
                     proxy_port = (current_proxy_config or {}).get("proxy_port")
@@ -1281,24 +1297,27 @@ class MLSScraper:
                     
                     # Use job's limit (or None to get all properties)
                     # Wrap in timeout to prevent getting stuck
-                    from config import settings
                     scrape_timeout = min(settings.LOCATION_TIMEOUT_MINUTES * 60, 600)  # Max 10 minutes per location
                     scrape_error_info = None
                     try:
                         # Make a single call with all listing types
-                        all_properties_by_type, scrape_error_info = await asyncio.wait_for(
-                        self._scrape_all_listing_types(
-                            location, 
-                            job, 
-                            current_proxy_config, 
-                            listing_types_to_scrape,  # Pass full list including off_market for status inference
-                            limit=job.limit if job.limit else None,
-                            past_days=job.past_days if job.past_days else 90,
-                            cancel_flag=cancel_flag,
-                            location_last_update=location_last_update
-                        ),
-                            timeout=scrape_timeout
-                        )
+                        await self._increment_homeharvest_inflight()
+                        try:
+                            all_properties_by_type, scrape_error_info = await asyncio.wait_for(
+                            self._scrape_all_listing_types(
+                                location, 
+                                job, 
+                                current_proxy_config, 
+                                listing_types_to_scrape,  # Pass full list including off_market for status inference
+                                limit=job.limit if job.limit else None,
+                                past_days=job.past_days if job.past_days else 90,
+                                cancel_flag=cancel_flag,
+                                location_last_update=location_last_update
+                            ),
+                                timeout=scrape_timeout
+                            )
+                        finally:
+                            await self._decrement_homeharvest_inflight()
                     except asyncio.TimeoutError:
                         logger.warning(f"   [TIMEOUT] Scraping all listing types in {location} exceeded {scrape_timeout}s timeout")
                         all_properties_by_type = {lt: [] for lt in listing_types_to_scrape}  # Empty results for all types
@@ -1829,58 +1848,80 @@ class MLSScraper:
         lt = listing_type or property_dict.get("listing_type") or ""
         if not getattr(settings, "RENTCAST_ENABLED", True) or lt not in ("for_sale", "pending"):
             return
-        
-        async with self.rentcast_semaphore:
-            success = False
+
+        success = False
+        acquired = False
+        skipped = False
+        skip_reason = None
+
+        # Best-effort mode: yield to HomeHarvest and skip if scraping is active.
+        if await self._is_homeharvest_busy():
+            skipped = True
+            skip_reason = "homeharvest_busy"
+        else:
             try:
+                # Best-effort: only run if we can acquire immediately.
+                await asyncio.wait_for(self.rentcast_semaphore.acquire(), timeout=0.01)
+                acquired = True
+            except asyncio.TimeoutError:
+                skipped = True
+                skip_reason = "rentcast_busy"
+
+        try:
+            if skipped:
+                logger.debug(f"Rentcast skipped for {property_id}: {skip_reason}")
+            else:
                 from services.rentcast_service import RentcastService
                 if not hasattr(self, "_rentcast_service"):
                     self._rentcast_service = RentcastService(db)
                 await self._rentcast_service.fetch_and_save_rent_estimate(property_id, property_dict)
                 success = True
-            except Exception as e:
-                logger.warning(f"Rentcast rent estimate failed for {property_id}: {e}")
-            finally:
-                # Update progress logs if provided
-                if progress_logs and location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
-                    location_entry = progress_logs["locations"][location_idx]
-                    rentcast_status = location_entry.get("rentcast", {})
-                    
-                    if success:
-                        rentcast_status["completed"] = rentcast_status.get("completed", 0) + 1
-                        # Update per-listing-type rentcast counter
-                        if listing_type and listing_type in location_entry.get("listing_types", {}):
-                            location_entry["listing_types"][listing_type]["rentcast"] = \
-                                location_entry["listing_types"][listing_type].get("rentcast", 0) + 1
-                    else:
-                        rentcast_status["failed"] = rentcast_status.get("failed", 0) + 1
-                    
-                    # Check if RentCast is complete
-                    total = rentcast_status.get("total", 0)
-                    completed = rentcast_status.get("completed", 0)
-                    failed = rentcast_status.get("failed", 0)
-                    
-                    if completed + failed >= total and total > 0:
-                        rentcast_status["status"] = "completed"
-                    
-                    # Update job status periodically (every 10 completions to avoid too many DB writes)
-                    # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
-                    if (completed + failed) % 10 == 0 or (completed + failed) >= total:
-                        try:
-                            # Check current job status before updating
-                            current_job = await db.get_job(job_id)
-                            if current_job and current_job.status == JobStatus.RUNNING:
-                                await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
-                            else:
-                                # Job is already COMPLETED/FAILED/CANCELLED, only update progress_logs without changing status
-                                if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
-                                    logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for RentCast")
-                                    await db.jobs_collection.update_one(
-                                        {"job_id": job_id},
-                                        {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
-                                    )
-                        except Exception as e:
-                            logger.error(f"Error updating job status with RentCast progress: {e}")
+        except Exception as e:
+            logger.warning(f"Rentcast rent estimate failed for {property_id}: {e}")
+        finally:
+            if acquired:
+                self.rentcast_semaphore.release()
+
+            # Update progress logs if provided
+            if progress_logs and location_idx is not None and location_idx < len(progress_logs.get("locations", [])):
+                location_entry = progress_logs["locations"][location_idx]
+                rentcast_status = location_entry.get("rentcast", {})
+                
+                if success:
+                    rentcast_status["completed"] = rentcast_status.get("completed", 0) + 1
+                    # Update per-listing-type rentcast counter
+                    if listing_type and listing_type in location_entry.get("listing_types", {}):
+                        location_entry["listing_types"][listing_type]["rentcast"] = \
+                            location_entry["listing_types"][listing_type].get("rentcast", 0) + 1
+                else:
+                    rentcast_status["failed"] = rentcast_status.get("failed", 0) + 1
+                
+                # Check if RentCast is complete
+                total = rentcast_status.get("total", 0)
+                completed = rentcast_status.get("completed", 0)
+                failed = rentcast_status.get("failed", 0)
+                
+                if completed + failed >= total and total > 0:
+                    rentcast_status["status"] = "completed"
+                
+                # Update job status periodically (every 10 completions to avoid too many DB writes)
+                # CRITICAL: Only update if job is still RUNNING (don't overwrite COMPLETED status)
+                if (completed + failed) % 10 == 0 or (completed + failed) >= total:
+                    try:
+                        # Check current job status before updating
+                        current_job = await db.get_job(job_id)
+                        if current_job and current_job.status == JobStatus.RUNNING:
+                            await db.update_job_status(job_id, JobStatus.RUNNING, progress_logs=progress_logs)
+                        else:
+                            # Job is already COMPLETED/FAILED/CANCELLED, only update progress_logs without changing status
+                            if current_job and current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                                logger.debug(f"Job {job_id} is {getattr(current_job.status, 'value', current_job.status)}, updating only progress_logs for RentCast")
+                                await db.jobs_collection.update_one(
+                                    {"job_id": job_id},
+                                    {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
+                                )
+                    except Exception as e:
+                        logger.error(f"Error updating job status with RentCast progress: {e}")
     
     async def _scrape_all_listing_types(self, location: str, job: ScrapingJob, proxy_config: Optional[Dict[str, Any]], listing_types: List[str], limit: Optional[int] = None, past_days: Optional[int] = None, cancel_flag: Optional[dict] = None, location_last_update: Optional[dict] = None) -> Tuple[Dict[str, List[Property]], Optional[str]]:
         """Scrape properties for all listing types in a single request. Returns a tuple of (dict mapping listing_type to properties, error_message if any)."""

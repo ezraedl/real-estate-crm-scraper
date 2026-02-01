@@ -11,6 +11,10 @@ JWT_SECRET=your-jwt-secret-key-here
 
 # Rentcast: scrape app.rentcast.io (unauthenticated) for rent estimates. Set to false to disable.
 # RENTCAST_ENABLED=true
+# RENTCAST_WORKERS=2
+# RENTCAST_USE_PLAYWRIGHT_FALLBACK=true
+# RENTCAST_API_TIMEOUT=30
+# RENTCAST_API_RETRIES=2
 
 # Optional: API key for POST /rent-estimation/backfill. If set, you can use header X-API-Key: <value>
 # instead of JWT. Useful for Postman, scripts, or when your token is not a JWT.
