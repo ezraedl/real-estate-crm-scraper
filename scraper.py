@@ -6,6 +6,7 @@ import logging
 import traceback
 import secrets
 import os
+import json
 
 # Ensure curl_cffi is available and configured for anti-bot measures
 # homeharvest should automatically use curl_cffi if available
@@ -2181,6 +2182,15 @@ class MLSScraper:
                     
                     num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
                     logger.info(f"   [HOMEHARVEST] Received {num_properties} total properties for location='{location}', listing_types={listing_types}")
+                    self._dump_homeharvest_df(
+                        properties_df,
+                        context="all_listing_types",
+                        location=location,
+                        listing_type=None,
+                        listing_types=listing_types_for_homeharvest,
+                        job_id=job.job_id,
+                        scheduled_job_id=job.scheduled_job_id,
+                    )
                     
                     # Update location_last_update when properties are actually found
                     if num_properties > 0 and location_last_update is not None:
@@ -2286,6 +2296,15 @@ class MLSScraper:
                         if individual_df is not None and not individual_df.empty:
                             num_individual = len(individual_df)
                             logger.info(f"   [FALLBACK] Individual call for '{listing_type}' returned {num_individual} properties")
+                            self._dump_homeharvest_df(
+                                individual_df,
+                                context="listing_type_fallback",
+                                location=location,
+                                listing_type=listing_type,
+                                listing_types=None,
+                                job_id=job.job_id,
+                                scheduled_job_id=job.scheduled_job_id,
+                            )
                             
                             # Update location_last_update when properties are actually found
                             if location_last_update is not None:
@@ -2789,6 +2808,15 @@ class MLSScraper:
                 # Log the number of properties returned by homeharvest
                 num_properties = len(properties_df) if properties_df is not None and not properties_df.empty else 0
                 logger.info(f"   [HOMEHARVEST] Received {num_properties} properties for location='{location}', listing_type='{listing_type}'")
+                self._dump_homeharvest_df(
+                    properties_df,
+                    context="listing_type",
+                    location=location,
+                    listing_type=listing_type,
+                    listing_types=None,
+                    job_id=job.job_id,
+                    scheduled_job_id=job.scheduled_job_id,
+                )
                 
                 # Extract expected zip code from location string (e.g., "Indianapolis, IN 46201" -> "46201")
                 zip_match = re.search(r'\b(\d{5})\b', location)
@@ -3095,9 +3123,7 @@ class MLSScraper:
                 last_scraped=datetime.utcnow()  # Set last_scraped timestamp
             )
             
-            # CRITICAL: Check if property status indicates it's off-market
-            # This ensures properties are correctly marked as OFF_MARKET even if HomeHarvest
-            # returns them with a different status (e.g., if they're off-market on Zillow/Realtor)
+            # Normalize/override status based on listing_type and raw status fields.
             raw_status = safe_get('status')
             raw_mls_status = safe_get('mls_status')
             # Ensure raw_mls_status is not pandas NA before using in boolean context
@@ -3109,7 +3135,17 @@ class MLSScraper:
                 # If pd.isna fails, treat as None
                 raw_mls_status = None
             
-            if self.is_off_market_status(raw_status, raw_mls_status):
+            listing_type_value = str(property_obj.listing_type).lower() if property_obj.listing_type else ""
+            if listing_type_value == "sold":
+                # Listing type should win for SOLD to avoid OFF_MARKET misclassification.
+                property_obj.status = "SOLD"
+                if not property_obj.mls_status:
+                    property_obj.mls_status = "SOLD"
+            elif self.is_sold_status(raw_status, raw_mls_status):
+                property_obj.status = "SOLD"
+                if not property_obj.mls_status:
+                    property_obj.mls_status = raw_mls_status or "SOLD"
+            elif self.is_off_market_status(raw_status, raw_mls_status):
                 # Property is off-market - update status accordingly
                 property_obj.status = "OFF_MARKET"
                 # If mls_status indicates off-market but isn't already set, set it
@@ -3286,6 +3322,16 @@ class MLSScraper:
                 print(f"   [TIMEOUT] Querying {formatted_address} timed out")
                 return None
             
+            self._dump_homeharvest_df(
+                properties_df,
+                context="address_query",
+                location=formatted_address,
+                listing_type=None,
+                listing_types=None,
+                job_id=None,
+                scheduled_job_id=None,
+            )
+
             # Convert DataFrame to Property model
             if properties_df is not None and not properties_df.empty:
                 # Take the first property found
@@ -3308,6 +3354,16 @@ class MLSScraper:
                 print(f"   [TIMEOUT] Querying SOLD for {formatted_address} timed out")
                 return None
 
+            self._dump_homeharvest_df(
+                sold_df,
+                context="address_query_sold",
+                location=formatted_address,
+                listing_type="sold",
+                listing_types=None,
+                job_id=None,
+                scheduled_job_id=None,
+            )
+
             if sold_df is not None and not sold_df.empty:
                 row = sold_df.iloc[0]
                 property_obj = self.convert_to_property_model(row, "off_market_check", "sold", None)
@@ -3318,6 +3374,58 @@ class MLSScraper:
         except Exception as e:
             print(f"Error querying property by address {formatted_address}: {e}")
             return None
+
+    def _is_dev_env(self) -> bool:
+        env = (settings.NODE_ENV or "").lower()
+        return env in ("dev", "development", "local")
+
+    def _dump_homeharvest_df(
+        self,
+        df: Optional[pd.DataFrame],
+        *,
+        context: str,
+        location: Optional[str],
+        listing_type: Optional[str],
+        listing_types: Optional[List[str]],
+        job_id: Optional[str],
+        scheduled_job_id: Optional[str],
+    ) -> None:
+        if not self._is_dev_env() or df is None:
+            return
+        try:
+            base_dir = os.path.join(os.getcwd(), "temp", "homeharvest_raw")
+            os.makedirs(base_dir, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            safe_location = re.sub(r"[^A-Za-z0-9._-]+", "_", location or "unknown")
+            if listing_types:
+                listing_types_str = "-".join([str(lt) for lt in listing_types])
+            else:
+                listing_types_str = listing_type or "unknown"
+            safe_listing_types = re.sub(r"[^A-Za-z0-9._-]+", "_", listing_types_str)
+            filename = f"{ts}_{context}_{safe_location}_{safe_listing_types}.json"
+            path = os.path.join(base_dir, filename)
+
+            cleaned_df = df.where(pd.notna(df), None)
+            records = cleaned_df.to_dict(orient="records")
+            payload = {
+                "meta": {
+                    "context": context,
+                    "location": location,
+                    "listing_type": listing_type,
+                    "listing_types": listing_types,
+                    "job_id": job_id,
+                    "scheduled_job_id": scheduled_job_id,
+                    "row_count": len(df),
+                    "columns": list(df.columns),
+                    "saved_at": datetime.utcnow().isoformat() + "Z",
+                },
+                "records": records,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True)
+            logger.info(f"   [DEV] Saved raw HomeHarvest data: {path}")
+        except Exception as e:
+            logger.warning(f"   [DEV] Failed to save raw HomeHarvest data: {e}")
     
     def _parse_city_state_from_location(self, location: str) -> Tuple[Optional[str], Optional[str]]:
         """Parse city and state from location string (e.g., 'Indianapolis, IN' or 'Indianapolis, IN 46201')"""
@@ -3675,6 +3783,7 @@ class MLSScraper:
                                     update_fields={
                                         "status": "SOLD",
                                         "mls_status": queried_property.mls_status or prop_data.get("mls_status") or "SOLD",
+                                        "listing_type": "sold",
                                         "scraped_at": datetime.utcnow(),
                                         "last_scraped": datetime.utcnow()
                                     },
@@ -4174,6 +4283,7 @@ class MLSScraper:
                                     update_fields={
                                         "status": "SOLD",
                                         "mls_status": queried_property.mls_status or prop_data.get("mls_status") or "SOLD",
+                                        "listing_type": "sold",
                                         "scraped_at": datetime.utcnow(),
                                         "last_scraped": datetime.utcnow()
                                     },
