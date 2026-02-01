@@ -160,6 +160,8 @@ class MLSScraper:
         self.rentcast_semaphore = asyncio.Semaphore(settings.RENTCAST_WORKERS)  # Limit concurrent RentCast tasks
         self._homeharvest_inflight = 0  # Tracks active HomeHarvest fetches to prioritize scraping
         self._homeharvest_lock = asyncio.Lock()
+        self._rentcast_retry_queues: Dict[str, asyncio.Queue] = {}
+        self._rentcast_retry_tasks: Dict[str, asyncio.Task] = {}
         # Track if job runs were full scrapes (keyed by job_id)
         self.job_run_flags: Dict[str, Dict[str, Any]] = {}
         # Global rate limiter: Only allow 1 request to Realtor.com at a time across ALL jobs
@@ -260,6 +262,63 @@ class MLSScraper:
         """Return True when HomeHarvest fetches are active (best-effort gate for Rentcast)."""
         async with self._homeharvest_lock:
             return self._homeharvest_inflight > 0
+
+    def _get_rentcast_retry_queue(self, job_id: Optional[str]) -> Optional[asyncio.Queue]:
+        if not job_id:
+            return None
+        if job_id not in self._rentcast_retry_queues:
+            self._rentcast_retry_queues[job_id] = asyncio.Queue()
+        return self._rentcast_retry_queues[job_id]
+
+    async def _enqueue_rentcast_retry(
+        self,
+        job_id: Optional[str],
+        property_id: str,
+        property_dict: Dict[str, Any],
+    ) -> None:
+        queue = self._get_rentcast_retry_queue(job_id)
+        if queue is None:
+            return
+        await queue.put(
+            {
+                "property_id": property_id,
+                "property_dict": property_dict,
+                "job_id": job_id,
+            }
+        )
+
+    async def _drain_rentcast_retry_queue(self, job_id: str) -> None:
+        queue = self._get_rentcast_retry_queue(job_id)
+        if queue is None:
+            return
+        # Best-effort: keep this lightweight and yield to HomeHarvest if it resumes.
+        while not queue.empty():
+            if await self._is_homeharvest_busy():
+                await asyncio.sleep(2)
+                continue
+            try:
+                await asyncio.wait_for(self.rentcast_semaphore.acquire(), timeout=0.5)
+            except asyncio.TimeoutError:
+                await asyncio.sleep(1)
+                continue
+            try:
+                item = await queue.get()
+            except Exception:
+                self.rentcast_semaphore.release()
+                continue
+            try:
+                from services.rentcast_service import RentcastService
+                if not hasattr(self, "_rentcast_service"):
+                    self._rentcast_service = RentcastService(db)
+                await self._rentcast_service.fetch_and_save_rent_estimate(
+                    item["property_id"],
+                    item["property_dict"],
+                )
+            except Exception as e:
+                logger.warning(f"Rentcast retry failed for {item.get('property_id')}: {e}")
+            finally:
+                self.rentcast_semaphore.release()
+                queue.task_done()
 
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
@@ -858,6 +917,13 @@ class MLSScraper:
                 asyncio.create_task(_notify_census_backfill())
 
             logger.info(f"Job {job.job_id} {status_label.lower()}: {saved_properties} properties saved")
+
+            # Best-effort: retry any Rentcast items skipped during scraping
+            if status_update_success and final_status == JobStatus.COMPLETED:
+                if job.job_id not in self._rentcast_retry_tasks:
+                    self._rentcast_retry_tasks[job.job_id] = asyncio.create_task(
+                        self._drain_rentcast_retry_queue(job.job_id)
+                    )
             
             # FINAL SAFETY CHECK: Ensure status matches final_status before exiting try block
             # This is the last chance to fix it if something went wrong
@@ -1166,7 +1232,8 @@ class MLSScraper:
                     "status": "pending",
                     "total": 0,
                     "completed": 0,
-                    "failed": 0
+                    "failed": 0,
+                    "skipped": 0
                 },
                 "off_market_check": {
                     "status": "pending",
@@ -1186,6 +1253,7 @@ class MLSScraper:
                     "skipped": 0,
                     "enriched": 0,
                     "rentcast": 0,
+                    "rentcast_skipped": 0,
                     "off_market": 0
                 }
             
@@ -1674,6 +1742,7 @@ class MLSScraper:
                         location_entry["rentcast"]["total"] = rentcast_count
                         location_entry["rentcast"]["completed"] = 0
                         location_entry["rentcast"]["failed"] = 0
+                        location_entry["rentcast"]["skipped"] = 0
                     
                     # Process RentCast in batches if configured (reuse ENRICHMENT_BATCH_SIZE)
                     batch_size = settings.ENRICHMENT_BATCH_SIZE
@@ -1870,6 +1939,7 @@ class MLSScraper:
         try:
             if skipped:
                 logger.debug(f"Rentcast skipped for {property_id}: {skip_reason}")
+                await self._enqueue_rentcast_retry(job_id, property_id, property_dict)
             else:
                 from services.rentcast_service import RentcastService
                 if not hasattr(self, "_rentcast_service"):
@@ -1893,6 +1963,12 @@ class MLSScraper:
                     if listing_type and listing_type in location_entry.get("listing_types", {}):
                         location_entry["listing_types"][listing_type]["rentcast"] = \
                             location_entry["listing_types"][listing_type].get("rentcast", 0) + 1
+                elif skipped:
+                    rentcast_status["skipped"] = rentcast_status.get("skipped", 0) + 1
+                    # Update per-listing-type rentcast skipped counter
+                    if listing_type and listing_type in location_entry.get("listing_types", {}):
+                        location_entry["listing_types"][listing_type]["rentcast_skipped"] = \
+                            location_entry["listing_types"][listing_type].get("rentcast_skipped", 0) + 1
                 else:
                     rentcast_status["failed"] = rentcast_status.get("failed", 0) + 1
                 
@@ -1900,8 +1976,9 @@ class MLSScraper:
                 total = rentcast_status.get("total", 0)
                 completed = rentcast_status.get("completed", 0)
                 failed = rentcast_status.get("failed", 0)
+                skipped_count = rentcast_status.get("skipped", 0)
                 
-                if completed + failed >= total and total > 0:
+                if completed + failed + skipped_count >= total and total > 0:
                     rentcast_status["status"] = "completed"
                 
                 # Update job status periodically (every 10 completions to avoid too many DB writes)
