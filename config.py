@@ -68,7 +68,7 @@ class Settings:
     ENRICHMENT_BATCH_SIZE = int(_enrichment_batch_size) if _enrichment_batch_size else None  # None = process all properties from location
     
     # RentCast Configuration - Default values
-    RENTCAST_WORKERS = int(get_required_env("RENTCAST_WORKERS", "8"))  # Number of parallel RentCast workers
+    RENTCAST_WORKERS = int(get_required_env("RENTCAST_WORKERS", "2"))  # Number of parallel RentCast workers (kept low to prioritize HomeHarvest)
     RENTCAST_API_TIMEOUT = int(get_required_env("RENTCAST_API_TIMEOUT", "30"))  # Timeout for direct API calls (seconds)
     RENTCAST_USE_PLAYWRIGHT_FALLBACK = os.getenv("RENTCAST_USE_PLAYWRIGHT_FALLBACK", "true").lower() in ("true", "1", "yes", "on")  # Use Playwright if API fails
     RENTCAST_API_RETRIES = int(get_required_env("RENTCAST_API_RETRIES", "2"))  # Number of retries for direct API before falling back

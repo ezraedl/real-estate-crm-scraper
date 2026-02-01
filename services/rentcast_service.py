@@ -24,7 +24,7 @@ from proxy_manager import proxy_manager
 logger = logging.getLogger(__name__)
 
 # Note: Rate limiting is now handled by scraper.py using self.rentcast_semaphore
-# which respects the RENTCAST_WORKERS configuration (default: 8)
+# which respects the RENTCAST_WORKERS configuration (default: 2)
 
 
 def _playwright_proxy_dict(proxy) -> Optional[Dict[str, str]]:
