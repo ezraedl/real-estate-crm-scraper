@@ -3531,13 +3531,15 @@ class MLSScraper:
                                 
                                 # Update property status and keep hash/change_logs consistent
                                 old_status = prop_data.get("status") or 'UNKNOWN'
-                                change_entry = {
-                                    "field": "status",
-                                    "old_value": old_status,
-                                    "new_value": "OFF_MARKET",
-                                    "change_type": "modified",
-                                    "timestamp": datetime.utcnow()
-                                }
+                                change_entries = []
+                                if old_status != "OFF_MARKET":
+                                    change_entries.append({
+                                        "field": "status",
+                                        "old_value": old_status,
+                                        "new_value": "OFF_MARKET",
+                                        "change_type": "modified",
+                                        "timestamp": datetime.utcnow()
+                                    })
                                 await db.update_property_with_hash_and_logs(
                                     property_id=property_id,
                                     update_fields={
@@ -3546,7 +3548,7 @@ class MLSScraper:
                                         "scraped_at": datetime.utcnow(),
                                         "last_scraped": datetime.utcnow()
                                     },
-                                    change_entries=[change_entry],
+                                    change_entries=change_entries,
                                     job_id="off_market_detection"
                                 )
                                 
@@ -3567,13 +3569,15 @@ class MLSScraper:
                             
                             # Update property status to OFF_MARKET since it's no longer available
                             old_status = prop_data.get("status") or 'UNKNOWN'
-                            change_entry = {
-                                "field": "status",
-                                "old_value": old_status,
-                                "new_value": "OFF_MARKET",
-                                "change_type": "modified",
-                                "timestamp": datetime.utcnow()
-                            }
+                            change_entries = []
+                            if old_status != "OFF_MARKET":
+                                change_entries.append({
+                                    "field": "status",
+                                    "old_value": old_status,
+                                    "new_value": "OFF_MARKET",
+                                    "change_type": "modified",
+                                    "timestamp": datetime.utcnow()
+                                })
                             await db.update_property_with_hash_and_logs(
                                 property_id=property_id,
                                 update_fields={
@@ -3582,7 +3586,7 @@ class MLSScraper:
                                     "scraped_at": datetime.utcnow(),
                                     "last_scraped": datetime.utcnow()
                                 },
-                                change_entries=[change_entry],
+                                change_entries=change_entries,
                                 job_id="off_market_detection"
                             )
                             
@@ -3926,13 +3930,15 @@ class MLSScraper:
                                 
                                 # Update property status and keep hash/change_logs consistent
                                 old_status = prop_data.get("status") or 'UNKNOWN'
-                                change_entry = {
-                                    "field": "status",
-                                    "old_value": old_status,
-                                    "new_value": "OFF_MARKET",
-                                    "change_type": "modified",
-                                    "timestamp": datetime.utcnow()
-                                }
+                                change_entries = []
+                                if old_status != "OFF_MARKET":
+                                    change_entries.append({
+                                        "field": "status",
+                                        "old_value": old_status,
+                                        "new_value": "OFF_MARKET",
+                                        "change_type": "modified",
+                                        "timestamp": datetime.utcnow()
+                                    })
                                 await db.update_property_with_hash_and_logs(
                                     property_id=property_id,
                                     update_fields={
@@ -3941,7 +3947,7 @@ class MLSScraper:
                                         "scraped_at": datetime.utcnow(),
                                         "last_scraped": datetime.utcnow()
                                     },
-                                    change_entries=[change_entry],
+                                    change_entries=change_entries,
                                     job_id="off_market_detection"
                                 )
                                 
@@ -3962,13 +3968,15 @@ class MLSScraper:
                             
                             # Update property status to OFF_MARKET since it's no longer available
                             old_status = prop_data.get("status") or 'UNKNOWN'
-                            change_entry = {
-                                "field": "status",
-                                "old_value": old_status,
-                                "new_value": "OFF_MARKET",
-                                "change_type": "modified",
-                                "timestamp": datetime.utcnow()
-                            }
+                            change_entries = []
+                            if old_status != "OFF_MARKET":
+                                change_entries.append({
+                                    "field": "status",
+                                    "old_value": old_status,
+                                    "new_value": "OFF_MARKET",
+                                    "change_type": "modified",
+                                    "timestamp": datetime.utcnow()
+                                })
                             await db.update_property_with_hash_and_logs(
                                 property_id=property_id,
                                 update_fields={
@@ -3977,7 +3985,7 @@ class MLSScraper:
                                     "scraped_at": datetime.utcnow(),
                                     "last_scraped": datetime.utcnow()
                                 },
-                                change_entries=[change_entry],
+                                change_entries=change_entries,
                                 job_id="off_market_detection"
                             )
                             
