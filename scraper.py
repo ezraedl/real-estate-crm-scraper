@@ -3201,6 +3201,10 @@ class MLSScraper:
         if not status_is_valid and not mls_status_is_valid:
             return False
         
+        # If MLS status indicates SOLD, it should override OFF_MARKET
+        if self.is_sold_status(status, mls_status):
+            return False
+
         # Check status field
         if status_is_valid and str(status).upper() == 'OFF_MARKET':
             return True
