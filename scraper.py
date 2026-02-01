@@ -1647,7 +1647,13 @@ class MLSScraper:
                         # Run off-market detection in background (non-blocking)
                         # This allows the location to be marked as complete immediately
                         # Only check properties for THIS specific location (zip code), not all properties in the job
-                        logger.info(f"   [OFF-MARKET] Starting background off-market detection for location {location}")
+                        logger.info(
+                            "   [OFF-MARKET] Starting background off-market detection for location %s "
+                            "(found_ids=%s, listing_types=%s)",
+                            location,
+                            len(found_property_ids) if found_property_ids else 0,
+                            listing_types_to_scrape
+                        )
                         asyncio.create_task(
                             self._run_off_market_detection_background(
                                 job=job,
@@ -1662,11 +1668,14 @@ class MLSScraper:
                         )
                     else:
                         logger.info(
-                            "   [OFF-MARKET] Skipping background off-market detection for location %s (full_scrape=%s, found=%s, errors=%s)",
+                            "   [OFF-MARKET] Skipping background off-market detection for location %s "
+                            "(full_scrape=%s, found=%s, errors=%s, listing_types=%s, found_ids=%s)",
                             location,
                             was_full_scrape,
                             location_total_found,
-                            location_had_errors
+                            location_had_errors,
+                            listing_types_to_scrape,
+                            len(found_property_ids) if found_property_ids else 0
                         )
             
             # Queue enrichment for all properties from this location (non-blocking, async tasks)
@@ -3314,6 +3323,20 @@ class MLSScraper:
         total_missing = 0
         
         try:
+            logger.info(
+                "   [OFF-MARKET] Start check_missing_properties_for_off_market "
+                "(scheduled_job_id=%s, job_id=%s, location=%s, listing_types_scraped=%s, found_ids=%s, "
+                "job_start_time=%s, batch_size=%s, has_progress_logs=%s, cancel_flag=%s)",
+                scheduled_job_id,
+                job_id,
+                location,
+                listing_types_scraped,
+                len(found_property_ids) if found_property_ids else 0,
+                job_start_time.isoformat() if job_start_time else None,
+                batch_size,
+                bool(progress_logs),
+                bool(cancel_flag)
+            )
             # Only check for for_sale and pending properties
             listing_types_to_check = ['for_sale', 'pending']
             
@@ -3374,6 +3397,12 @@ class MLSScraper:
                         # Could not parse location - log warning but continue with scheduled_job_id filter only
                         logger.warning(f"   [OFF-MARKET] Could not parse location '{location}' - checking all properties for scheduled job (may be slow)")
             
+            logger.debug(
+                "   [OFF-MARKET] Querying missing properties (scheduled_job_id=%s, base_id=%s, location=%s)",
+                scheduled_job_id,
+                base_scheduled_job_id,
+                location
+            )
             # Optimize query: only fetch property_id and address fields needed for checking
             # This reduces memory usage and speeds up the query significantly
             cursor = db.properties_collection.find(
@@ -3398,6 +3427,13 @@ class MLSScraper:
             
             if not missing_properties:
                 logger.debug(f"   [OFF-MARKET] No missing properties found for scheduled job {scheduled_job_id}")
+                logger.info(
+                    "   [OFF-MARKET] No missing properties (scheduled_job_id=%s, job_id=%s, location=%s). "
+                    "Will mark off_market_check completed in progress logs if possible.",
+                    scheduled_job_id,
+                    job_id,
+                    location
+                )
                 # Still mark the check as completed even if there are no missing properties
                 if location and job_id:
                     try:
@@ -3425,6 +3461,19 @@ class MLSScraper:
                                         {"job_id": job_id},
                                         {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
                                     )
+                                logger.info(
+                                    "   [OFF-MARKET] Marked off_market_check completed (job_id=%s, location=%s, status=%s)",
+                                    job_id,
+                                    location,
+                                    getattr(current_job.status, "value", current_job.status)
+                                )
+                            else:
+                                logger.warning(
+                                    "   [OFF-MARKET] Location entry not found when marking completed "
+                                    "(job_id=%s, location=%s).",
+                                    job_id,
+                                    location
+                                )
                     except Exception as e:
                         logger.error(f"   [OFF-MARKET] Error updating progress logs for no missing properties: {e}")
                 
@@ -3437,6 +3486,20 @@ class MLSScraper:
             
             total_missing = len(missing_properties)
             logger.info(f"   [OFF-MARKET] Found {total_missing} missing properties, processing in batches of {batch_size}")
+            if total_missing > 0:
+                sample_ids = [p.get("property_id") for p in missing_properties[:5]]
+                logger.debug(
+                    "   [OFF-MARKET] Sample missing property IDs (first %s): %s",
+                    len(sample_ids),
+                    sample_ids
+                )
+            if total_missing > 0:
+                sample_ids = [p.get("property_id") for p in missing_properties[:5]]
+                logger.debug(
+                    "   [OFF-MARKET] Sample missing property IDs (first %s): %s",
+                    len(sample_ids),
+                    sample_ids
+                )
             
             off_market_count = 0
             error_count = 0
@@ -3491,6 +3554,15 @@ class MLSScraper:
                                     {"job_id": job_id},
                                     {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
                                 )
+                            logger.debug(
+                                "   [OFF-MARKET] Updated progress logs (job_id=%s, location=%s, status=%s, checked=%s, found=%s, errors=%s)",
+                                job_id,
+                                location,
+                                getattr(current_job.status, "value", current_job.status) if current_job else None,
+                                total_checked,
+                                off_market_count,
+                                error_count
+                            )
                     except Exception as e:
                         logger.error(f"   [OFF-MARKET] Error updating progress logs: {e}")
                 
@@ -3657,6 +3729,15 @@ class MLSScraper:
                                     {"job_id": job_id},
                                     {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
                                 )
+                            logger.info(
+                                "   [OFF-MARKET] Completed off-market check (job_id=%s, location=%s, status=%s, checked=%s, found=%s, errors=%s)",
+                                job_id,
+                                location,
+                                getattr(current_job.status, "value", current_job.status),
+                                total_checked,
+                                off_market_count,
+                                error_count
+                            )
                         else:
                             logger.warning(f"   [OFF-MARKET] Location entry not found in progress_logs for location {location}")
                 except Exception as e:
@@ -3677,11 +3758,21 @@ class MLSScraper:
                 "skipped": False
             }
             
-            logger.info(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
+            logger.info(
+                f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, "
+                f"{error_count} errors, {batch_number} batches (job_id={job_id}, location={location})"
+            )
             return result
             
         except Exception as e:
-            logger.error(f"   [OFF-MARKET] Error in off-market detection: {e}")
+            logger.error(
+                "   [OFF-MARKET] Error in off-market detection (scheduled job) "
+                "(job_id=%s, scheduled_job_id=%s, location=%s): %s",
+                job_id,
+                scheduled_job_id,
+                location,
+                e
+            )
             try:
                 import traceback as tb
                 logger.debug(f"Traceback: {tb.format_exc()}")
@@ -3746,6 +3837,19 @@ class MLSScraper:
         Uses city+state matching to find properties that weren't scraped in the current run.
         """
         try:
+            logger.info(
+                "   [OFF-MARKET] Start check_missing_properties_for_off_market_by_location "
+                "(job_id=%s, location=%s, listing_types_scraped=%s, found_ids=%s, "
+                "job_start_time=%s, batch_size=%s, has_progress_logs=%s, cancel_flag=%s)",
+                job_id,
+                location,
+                listing_types_scraped,
+                len(found_property_ids) if found_property_ids else 0,
+                job_start_time.isoformat() if job_start_time else None,
+                batch_size,
+                bool(progress_logs),
+                bool(cancel_flag)
+            )
             # Only check for for_sale and pending properties
             listing_types_to_check = ['for_sale', 'pending']
             
@@ -3753,6 +3857,12 @@ class MLSScraper:
             city, state = self._parse_city_state_from_location(location)
             if not city or not state:
                 logger.warning(f"   [OFF-MARKET] Could not parse city/state from location '{location}', skipping check")
+                logger.info(
+                    "   [OFF-MARKET] Skipping location-based off-market check due to parse failure "
+                    "(job_id=%s, location=%s)",
+                    job_id,
+                    location
+                )
                 return {
                     "missing_checked": 0,
                     "off_market_found": 0,
@@ -3777,6 +3887,13 @@ class MLSScraper:
                 ]
             }
             
+            logger.debug(
+                "   [OFF-MARKET] Querying missing properties (city=%s, state=%s, location=%s, job_id=%s)",
+                city,
+                state,
+                location,
+                job_id
+            )
             # Optimize query: only fetch needed fields
             cursor = db.properties_collection.find(
                 query,
@@ -3798,6 +3915,12 @@ class MLSScraper:
             
             if not missing_properties:
                 logger.debug(f"   [OFF-MARKET] No missing properties found in database for {city}, {state}")
+                logger.info(
+                    "   [OFF-MARKET] No missing properties for location-based check "
+                    "(job_id=%s, location=%s). Will mark completed if possible.",
+                    job_id,
+                    location
+                )
                 # Still mark the check as completed even if there are no missing properties
                 if location and job_id:
                     try:
@@ -3825,6 +3948,19 @@ class MLSScraper:
                                         {"job_id": job_id},
                                         {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
                                     )
+                                logger.info(
+                                    "   [OFF-MARKET] Marked off_market_check completed (job_id=%s, location=%s, status=%s)",
+                                    job_id,
+                                    location,
+                                    getattr(current_job.status, "value", current_job.status)
+                                )
+                            else:
+                                logger.warning(
+                                    "   [OFF-MARKET] Location entry not found when marking completed "
+                                    "(job_id=%s, location=%s).",
+                                    job_id,
+                                    location
+                                )
                     except Exception as e:
                         logger.error(f"   [OFF-MARKET] Error updating progress logs for no missing properties: {e}")
                 
@@ -3890,6 +4026,15 @@ class MLSScraper:
                                 {"job_id": job_id},
                                 {"$set": {"progress_logs": progress_logs, "updated_at": datetime.utcnow()}}
                             )
+                        logger.debug(
+                            "   [OFF-MARKET] Updated progress logs (job_id=%s, location=%s, status=%s, checked=%s, found=%s, errors=%s)",
+                            job_id,
+                            location,
+                            getattr(current_job.status, "value", current_job.status) if current_job else None,
+                            total_checked,
+                            off_market_count,
+                            error_count
+                        )
                     except Exception as e:
                         logger.error(f"   [OFF-MARKET] Error updating progress logs: {e}")
                 
@@ -4056,6 +4201,15 @@ class MLSScraper:
                                     {"job_id": job_id},
                                     {"$set": {"progress_logs": latest_progress_logs, "updated_at": datetime.utcnow()}}
                                 )
+                            logger.info(
+                                "   [OFF-MARKET] Completed off-market check (job_id=%s, location=%s, status=%s, checked=%s, found=%s, errors=%s)",
+                                job_id,
+                                location,
+                                getattr(current_job.status, "value", current_job.status),
+                                total_checked,
+                                off_market_count,
+                                error_count
+                            )
                         else:
                             logger.warning(f"   [OFF-MARKET] Location entry not found in progress_logs for location {location}")
                 except Exception as e:
@@ -4076,11 +4230,20 @@ class MLSScraper:
                 "skipped": False
             }
             
-            logger.info(f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, {error_count} errors, {batch_number} batches")
+            logger.info(
+                f"   [OFF-MARKET] Check complete: {total_checked} checked, {off_market_count} off-market, "
+                f"{error_count} errors, {batch_number} batches (job_id={job_id}, location={location})"
+            )
             return result
             
         except Exception as e:
-            logger.error(f"   [OFF-MARKET] Error in off-market detection (location-based): {e}")
+            logger.error(
+                "   [OFF-MARKET] Error in off-market detection (location-based) "
+                "(job_id=%s, location=%s): %s",
+                job_id,
+                location,
+                e
+            )
             try:
                 import traceback as tb
                 logger.debug(tb.format_exc())
@@ -4107,9 +4270,17 @@ class MLSScraper:
     ):
         """Background task to run off-market detection without blocking location completion"""
         try:
+            logger.info(
+                "   [OFF-MARKET] Background start (job_id=%s, scheduled_job_id=%s, location=%s, listing_types=%s, found_ids=%s)",
+                job.job_id,
+                job.scheduled_job_id,
+                location,
+                listing_types_to_scrape,
+                len(found_property_ids) if found_property_ids else 0
+            )
             if job.scheduled_job_id:
                 # Scheduled job: use scheduled_job_id with location filter
-                await self.check_missing_properties_for_off_market(
+                result = await self.check_missing_properties_for_off_market(
                     scheduled_job_id=job.scheduled_job_id,
                     listing_types_scraped=listing_types_to_scrape,
                     found_property_ids=found_property_ids,
@@ -4123,7 +4294,7 @@ class MLSScraper:
                 )
             else:
                 # One-time job: use location-based matching
-                await self.check_missing_properties_for_off_market_by_location(
+                result = await self.check_missing_properties_for_off_market_by_location(
                     location=location,
                     listing_types_scraped=listing_types_to_scrape,
                     found_property_ids=found_property_ids,
@@ -4134,6 +4305,12 @@ class MLSScraper:
                     progress_logs=progress_logs,
                     job_id=job.job_id
                 )
+            logger.info(
+                "   [OFF-MARKET] Background complete (job_id=%s, location=%s, result=%s)",
+                job.job_id,
+                location,
+                result
+            )
         except Exception as e:
             logger.error(f"Error in background off-market detection for location {location}: {e}")
     
