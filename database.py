@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from config import settings
 from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
 from services import PropertyEnrichmentPipeline
+from services.history_tracker import HistoryTracker
 from services.contact_service import ContactService
 
 logger = logging.getLogger(__name__)
@@ -827,6 +828,63 @@ class Database:
                 "reason": str(e),
                 "property_id": property_data.property_id
             }
+
+    async def update_property_with_hash_and_logs(
+        self,
+        property_id: str,
+        update_fields: Dict[str, Any],
+        change_entries: Optional[List[Dict[str, Any]]] = None,
+        job_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Update a property and ensure content_hash/last_content_updated and change_logs stay consistent."""
+        try:
+            existing_property = await self.properties_collection.find_one({"property_id": property_id})
+            if not existing_property:
+                return {"action": "not_found", "property_id": property_id}
+
+            # Merge updates onto existing document for hash recalculation
+            merged = {**existing_property, **update_fields}
+
+            # Filter to Property model fields for hash generation
+            model_fields = set(Property.__fields__.keys())
+            prop_payload = {k: merged.get(k) for k in model_fields if k in merged}
+
+            prop_model = Property(**prop_payload)
+            new_hash = prop_model.generate_content_hash()
+            existing_hash = existing_property.get("content_hash")
+
+            set_fields = dict(update_fields)
+            set_fields["last_updated"] = datetime.utcnow()
+            if existing_hash != new_hash:
+                set_fields["content_hash"] = new_hash
+                set_fields["last_content_updated"] = datetime.utcnow()
+
+            if set_fields:
+                await self.properties_collection.update_one(
+                    {"property_id": property_id},
+                    {"$set": set_fields}
+                )
+
+            if change_entries:
+                history_tracker = HistoryTracker(self.db)
+                await history_tracker.record_change_logs(
+                    property_id,
+                    change_entries,
+                    job_id or "property_update"
+                )
+
+            return {
+                "action": "updated",
+                "property_id": property_id,
+                "hash_changed": existing_hash != new_hash
+            }
+        except Exception as e:
+            logger.error(f"Error updating property {property_id} with hash/logs: {e}")
+            return {
+                "action": "error",
+                "reason": str(e),
+                "property_id": property_id
+            }
     
     async def save_properties_batch(self, properties: List[Property]) -> Dict[str, Any]:
         """Save multiple properties in batch with hash-based change detection using bulk operations"""
@@ -1464,7 +1522,7 @@ class Database:
                         {"crm_property_ids": {"$type": "array"}}  # Legacy array format
                     ]
                 },
-                {"$set": {"crm_property_ids": {}}}
+                {"$set": {"crm_property_ids": {}, "last_updated": datetime.utcnow()}}
             )
             
             # Initialize platform array if it doesn't exist
@@ -1473,7 +1531,7 @@ class Database:
                     "property_id": mls_property_id,
                     f"crm_property_ids.{platform}": {"$exists": False}
                 },
-                {"$set": {f"crm_property_ids.{platform}": []}}
+                {"$set": {f"crm_property_ids.{platform}": [], "last_updated": datetime.utcnow()}}
             )
             
             # Add the CRM property ID to the platform-specific array
@@ -1481,7 +1539,7 @@ class Database:
                 {"property_id": mls_property_id},
                 {
                     "$addToSet": {f"crm_property_ids.{platform}": crm_property_id},
-                    "$set": {"last_content_updated": datetime.utcnow()}
+                    "$set": {"last_updated": datetime.utcnow()}
                 }
             )
             return result.modified_count > 0
@@ -1496,7 +1554,7 @@ class Database:
                 {"property_id": mls_property_id},
                 {
                     "$pull": {f"crm_property_ids.{platform}": crm_property_id},
-                    "$set": {"last_content_updated": datetime.utcnow()}
+                    "$set": {"last_updated": datetime.utcnow()}
                 }
             )
             return result.modified_count > 0

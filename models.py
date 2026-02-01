@@ -317,6 +317,7 @@ class Property(BaseModel):
     last_content_updated: Optional[datetime] = None  # When content_hash last changed
     
     # Metadata
+    last_updated: Optional[datetime] = None  # When any update (content or metadata) last occurred
     scraped_at: datetime = Field(default_factory=datetime.utcnow)
     job_id: Optional[str] = None
     scheduled_job_id: Optional[str] = Field(None, description="ID of the scheduled job that scrapes this property")
