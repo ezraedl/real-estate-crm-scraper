@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from config import settings
 from models import ScrapingJob, Property, JobStatus, JobPriority, ScheduledJob, ScheduledJobStatus
 from services import PropertyEnrichmentPipeline
+from services.history_tracker import HistoryTracker
 from services.contact_service import ContactService
 
 logger = logging.getLogger(__name__)
@@ -540,6 +541,7 @@ class Database:
                     # FIXED: Check both scraped data AND existing nested data in database
                     # This handles cases where existing property has nested data but scraped data doesn't include it
                     needs_contact_processing = False
+                    contact_ids_changed = False
                     unset_fields = {}
                     
                     # Check agent
@@ -626,6 +628,16 @@ class Database:
                                 contact_ids["builder_id"] = existing_property.get("builder_id")
                             if existing_property.get("office_id"):
                                 contact_ids["office_id"] = existing_property.get("office_id")
+
+                            # Detect contact ID changes (only if new IDs were produced)
+                            if contact_ids.get("agent_id") and contact_ids.get("agent_id") != existing_property.get("agent_id"):
+                                contact_ids_changed = True
+                            if contact_ids.get("broker_id") and contact_ids.get("broker_id") != existing_property.get("broker_id"):
+                                contact_ids_changed = True
+                            if contact_ids.get("builder_id") and contact_ids.get("builder_id") != existing_property.get("builder_id"):
+                                contact_ids_changed = True
+                            if contact_ids.get("office_id") and contact_ids.get("office_id") != existing_property.get("office_id"):
+                                contact_ids_changed = True
                             
                             # Add contact IDs to update
                             if contact_ids.get("agent_id"):
@@ -641,6 +653,9 @@ class Database:
                             if contact_ids.get("office_id"):
                                 update_fields["office_id"] = contact_ids["office_id"]
                                 unset_fields["office"] = ""
+
+                            if contact_ids_changed:
+                                update_fields["contacts_updated_at"] = datetime.utcnow()
                         except Exception as e:
                             logger.error(f"Error processing contacts for property {property_data.property_id}: {e}")
                             # Continue without contact processing - don't fail the entire save
@@ -691,6 +706,13 @@ class Database:
                     property_data.broker_id = contact_ids.get("broker_id")
                     property_data.builder_id = contact_ids.get("builder_id")
                     property_data.office_id = contact_ids.get("office_id")
+
+                    # Track contact ID changes
+                    if (contact_ids.get("agent_id") and contact_ids.get("agent_id") != existing_property.get("agent_id")) or \
+                       (contact_ids.get("broker_id") and contact_ids.get("broker_id") != existing_property.get("broker_id")) or \
+                       (contact_ids.get("builder_id") and contact_ids.get("builder_id") != existing_property.get("builder_id")) or \
+                       (contact_ids.get("office_id") and contact_ids.get("office_id") != existing_property.get("office_id")):
+                        property_data.contacts_updated_at = datetime.utcnow()
                     
                     # Ensure scheduled_job_id and last_scraped are set
                     if property_data.scheduled_job_id:
@@ -826,6 +848,63 @@ class Database:
                 "action": "error",
                 "reason": str(e),
                 "property_id": property_data.property_id
+            }
+
+    async def update_property_with_hash_and_logs(
+        self,
+        property_id: str,
+        update_fields: Dict[str, Any],
+        change_entries: Optional[List[Dict[str, Any]]] = None,
+        job_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Update a property and ensure content_hash/last_content_updated and change_logs stay consistent."""
+        try:
+            existing_property = await self.properties_collection.find_one({"property_id": property_id})
+            if not existing_property:
+                return {"action": "not_found", "property_id": property_id}
+
+            # Merge updates onto existing document for hash recalculation
+            merged = {**existing_property, **update_fields}
+
+            # Filter to Property model fields for hash generation
+            model_fields = set(Property.__fields__.keys())
+            prop_payload = {k: merged.get(k) for k in model_fields if k in merged}
+
+            prop_model = Property(**prop_payload)
+            new_hash = prop_model.generate_content_hash()
+            existing_hash = existing_property.get("content_hash")
+
+            set_fields = dict(update_fields)
+            set_fields["last_updated"] = datetime.utcnow()
+            if existing_hash != new_hash:
+                set_fields["content_hash"] = new_hash
+                set_fields["last_content_updated"] = datetime.utcnow()
+
+            if set_fields:
+                await self.properties_collection.update_one(
+                    {"property_id": property_id},
+                    {"$set": set_fields}
+                )
+
+            if change_entries:
+                history_tracker = HistoryTracker(self.db)
+                await history_tracker.record_change_logs(
+                    property_id,
+                    change_entries,
+                    job_id or "property_update"
+                )
+
+            return {
+                "action": "updated",
+                "property_id": property_id,
+                "hash_changed": existing_hash != new_hash
+            }
+        except Exception as e:
+            logger.error(f"Error updating property {property_id} with hash/logs: {e}")
+            return {
+                "action": "error",
+                "reason": str(e),
+                "property_id": property_id
             }
     
     async def save_properties_batch(self, properties: List[Property]) -> Dict[str, Any]:
@@ -1464,7 +1543,7 @@ class Database:
                         {"crm_property_ids": {"$type": "array"}}  # Legacy array format
                     ]
                 },
-                {"$set": {"crm_property_ids": {}}}
+                {"$set": {"crm_property_ids": {}, "last_updated": datetime.utcnow()}}
             )
             
             # Initialize platform array if it doesn't exist
@@ -1473,7 +1552,7 @@ class Database:
                     "property_id": mls_property_id,
                     f"crm_property_ids.{platform}": {"$exists": False}
                 },
-                {"$set": {f"crm_property_ids.{platform}": []}}
+                {"$set": {f"crm_property_ids.{platform}": [], "last_updated": datetime.utcnow()}}
             )
             
             # Add the CRM property ID to the platform-specific array
@@ -1481,7 +1560,7 @@ class Database:
                 {"property_id": mls_property_id},
                 {
                     "$addToSet": {f"crm_property_ids.{platform}": crm_property_id},
-                    "$set": {"last_content_updated": datetime.utcnow()}
+                    "$set": {"last_updated": datetime.utcnow()}
                 }
             )
             return result.modified_count > 0
@@ -1496,7 +1575,7 @@ class Database:
                 {"property_id": mls_property_id},
                 {
                     "$pull": {f"crm_property_ids.{platform}": crm_property_id},
-                    "$set": {"last_content_updated": datetime.utcnow()}
+                    "$set": {"last_updated": datetime.utcnow()}
                 }
             )
             return result.modified_count > 0

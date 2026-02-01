@@ -362,7 +362,8 @@ class HistoryTracker:
                 {
                     "$set": {
                         "change_logs": current_change_logs,
-                        "change_logs_updated_at": datetime.utcnow()
+                        "change_logs_updated_at": datetime.utcnow(),
+                        "last_updated": datetime.utcnow()
                     }
                 }
             )

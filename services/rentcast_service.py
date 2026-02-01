@@ -639,7 +639,7 @@ class RentcastService:
         try:
             await self.db.properties_collection.update_one(
                 {"property_id": property_id},
-                {"$set": {"rent_estimation": data}},
+                {"$set": {"rent_estimation": data, "last_updated": datetime.utcnow()}},
             )
         except Exception as e:
             logger.warning("Rentcast: db update error for property_id=%s: %s", property_id, e)
