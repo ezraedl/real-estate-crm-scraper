@@ -3216,6 +3216,39 @@ class MLSScraper:
                 return True
         
         return False
+
+    def is_sold_status(self, status: Optional[str], mls_status: Optional[str]) -> bool:
+        """Check if a property status indicates it's sold"""
+        status_is_valid = False
+        mls_status_is_valid = False
+
+        try:
+            if status is not None:
+                if not pd.isna(status):
+                    status_is_valid = True
+        except (TypeError, ValueError):
+            status_is_valid = (status is not None)
+
+        try:
+            if mls_status is not None:
+                if not pd.isna(mls_status):
+                    mls_status_is_valid = True
+        except (TypeError, ValueError):
+            mls_status_is_valid = (mls_status is not None)
+
+        if not status_is_valid and not mls_status_is_valid:
+            return False
+
+        status_upper = str(status).upper() if status_is_valid else ""
+        mls_status_upper = str(mls_status).upper() if mls_status_is_valid else ""
+
+        sold_indicators = ["SOLD", "CLOSED", "SETTLED"]
+        if any(indicator in status_upper for indicator in sold_indicators):
+            return True
+        if any(indicator in mls_status_upper for indicator in sold_indicators):
+            return True
+
+        return False
     
     async def query_property_by_address(self, formatted_address: str, proxy_config: Optional[Dict[str, Any]] = None) -> Optional[Property]:
         """Query a property directly by address using HomeHarvest"""
@@ -3254,6 +3287,26 @@ class MLSScraper:
                 # Take the first property found
                 row = properties_df.iloc[0]
                 property_obj = self.convert_to_property_model(row, "off_market_check", None, None)
+                return property_obj
+
+            # Fallback: try sold listing_type explicitly (address lookups often miss sold)
+            scrape_params_sold = dict(scrape_params)
+            scrape_params_sold["listing_type"] = "sold"
+            try:
+                sold_df = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self.executor,
+                        lambda: scrape_property(**scrape_params_sold)
+                    ),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                print(f"   [TIMEOUT] Querying SOLD for {formatted_address} timed out")
+                return None
+
+            if sold_df is not None and not sold_df.empty:
+                row = sold_df.iloc[0]
+                property_obj = self.convert_to_property_model(row, "off_market_check", "sold", None)
                 return property_obj
             
             return None
@@ -3597,8 +3650,35 @@ class MLSScraper:
                         )
                         
                         if queried_property:
+                            # Check if property is sold first (avoid misclassifying as off-market)
+                            if self.is_sold_status(queried_property.status, queried_property.mls_status):
+                                logger.info(
+                                    f"   [OFF-MARKET] [SOLD] Property {property_id} is SOLD "
+                                    f"(status={queried_property.status}, mls_status={queried_property.mls_status})"
+                                )
+                                old_status = prop_data.get("status") or 'UNKNOWN'
+                                change_entries = []
+                                if old_status != "SOLD":
+                                    change_entries.append({
+                                        "field": "status",
+                                        "old_value": old_status,
+                                        "new_value": "SOLD",
+                                        "change_type": "modified",
+                                        "timestamp": datetime.utcnow()
+                                    })
+                                await db.update_property_with_hash_and_logs(
+                                    property_id=property_id,
+                                    update_fields={
+                                        "status": "SOLD",
+                                        "mls_status": queried_property.mls_status or prop_data.get("mls_status") or "SOLD",
+                                        "scraped_at": datetime.utcnow(),
+                                        "last_scraped": datetime.utcnow()
+                                    },
+                                    change_entries=change_entries,
+                                    job_id="off_market_detection"
+                                )
                             # Check if property is off-market
-                            if self.is_off_market_status(queried_property.status, queried_property.mls_status):
+                            elif self.is_off_market_status(queried_property.status, queried_property.mls_status):
                                 logger.info(f"   [OFF-MARKET] [OK] Property {property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
                                 
                                 # Update property status and keep hash/change_logs consistent
@@ -4069,8 +4149,35 @@ class MLSScraper:
                         )
                         
                         if queried_property:
+                            # Check if property is sold first (avoid misclassifying as off-market)
+                            if self.is_sold_status(queried_property.status, queried_property.mls_status):
+                                logger.info(
+                                    f"   [OFF-MARKET] [SOLD] Property {property_id} is SOLD "
+                                    f"(status={queried_property.status}, mls_status={queried_property.mls_status})"
+                                )
+                                old_status = prop_data.get("status") or 'UNKNOWN'
+                                change_entries = []
+                                if old_status != "SOLD":
+                                    change_entries.append({
+                                        "field": "status",
+                                        "old_value": old_status,
+                                        "new_value": "SOLD",
+                                        "change_type": "modified",
+                                        "timestamp": datetime.utcnow()
+                                    })
+                                await db.update_property_with_hash_and_logs(
+                                    property_id=property_id,
+                                    update_fields={
+                                        "status": "SOLD",
+                                        "mls_status": queried_property.mls_status or prop_data.get("mls_status") or "SOLD",
+                                        "scraped_at": datetime.utcnow(),
+                                        "last_scraped": datetime.utcnow()
+                                    },
+                                    change_entries=change_entries,
+                                    job_id="off_market_detection"
+                                )
                             # Check if property is off-market
-                            if self.is_off_market_status(queried_property.status, queried_property.mls_status):
+                            elif self.is_off_market_status(queried_property.status, queried_property.mls_status):
                                 logger.info(f"   [OFF-MARKET] [OK] Property {property_id} is OFF_MARKET (status={queried_property.status}, mls_status={queried_property.mls_status})")
                                 
                                 # Update property status and keep hash/change_logs consistent
