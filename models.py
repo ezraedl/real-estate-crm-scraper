@@ -294,6 +294,7 @@ class Property(BaseModel):
     broker_id: Optional[str] = None  # Reference to Contact._id
     builder_id: Optional[str] = None  # Reference to Contact._id
     office_id: Optional[str] = None  # Reference to Contact._id
+    contacts_updated_at: Optional[datetime] = None  # When contact references last changed
     
     # URLs and references
     property_url: Optional[str] = None
@@ -461,13 +462,7 @@ class Property(BaseModel):
             "primary_photo": self.primary_photo,
             "alt_photos": normalize_list(self.alt_photos),
             
-            # Contact information - use IDs only (not full contact data)
-            # This ensures content_hash doesn't change when contact info changes
-            # Full contact data is stored in separate Contact collection
-            "agent_id": self.agent.agent_id if self.agent else None,
-            "broker_id": self.broker.broker_id if self.broker else None,
-            "builder_id": self.builder.builder_id if self.builder else None,
-            "office_id": self.office.office_id if self.office else None,
+            # Contact information intentionally excluded from content hash
             
             # Additional data - normalize lists
             "new_construction": self.new_construction,

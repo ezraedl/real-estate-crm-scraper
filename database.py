@@ -541,6 +541,7 @@ class Database:
                     # FIXED: Check both scraped data AND existing nested data in database
                     # This handles cases where existing property has nested data but scraped data doesn't include it
                     needs_contact_processing = False
+                    contact_ids_changed = False
                     unset_fields = {}
                     
                     # Check agent
@@ -627,6 +628,16 @@ class Database:
                                 contact_ids["builder_id"] = existing_property.get("builder_id")
                             if existing_property.get("office_id"):
                                 contact_ids["office_id"] = existing_property.get("office_id")
+
+                            # Detect contact ID changes (only if new IDs were produced)
+                            if contact_ids.get("agent_id") and contact_ids.get("agent_id") != existing_property.get("agent_id"):
+                                contact_ids_changed = True
+                            if contact_ids.get("broker_id") and contact_ids.get("broker_id") != existing_property.get("broker_id"):
+                                contact_ids_changed = True
+                            if contact_ids.get("builder_id") and contact_ids.get("builder_id") != existing_property.get("builder_id"):
+                                contact_ids_changed = True
+                            if contact_ids.get("office_id") and contact_ids.get("office_id") != existing_property.get("office_id"):
+                                contact_ids_changed = True
                             
                             # Add contact IDs to update
                             if contact_ids.get("agent_id"):
@@ -642,6 +653,9 @@ class Database:
                             if contact_ids.get("office_id"):
                                 update_fields["office_id"] = contact_ids["office_id"]
                                 unset_fields["office"] = ""
+
+                            if contact_ids_changed:
+                                update_fields["contacts_updated_at"] = datetime.utcnow()
                         except Exception as e:
                             logger.error(f"Error processing contacts for property {property_data.property_id}: {e}")
                             # Continue without contact processing - don't fail the entire save
@@ -692,6 +706,13 @@ class Database:
                     property_data.broker_id = contact_ids.get("broker_id")
                     property_data.builder_id = contact_ids.get("builder_id")
                     property_data.office_id = contact_ids.get("office_id")
+
+                    # Track contact ID changes
+                    if (contact_ids.get("agent_id") and contact_ids.get("agent_id") != existing_property.get("agent_id")) or \
+                       (contact_ids.get("broker_id") and contact_ids.get("broker_id") != existing_property.get("broker_id")) or \
+                       (contact_ids.get("builder_id") and contact_ids.get("builder_id") != existing_property.get("builder_id")) or \
+                       (contact_ids.get("office_id") and contact_ids.get("office_id") != existing_property.get("office_id")):
+                        property_data.contacts_updated_at = datetime.utcnow()
                     
                     # Ensure scheduled_job_id and last_scraped are set
                     if property_data.scheduled_job_id:
