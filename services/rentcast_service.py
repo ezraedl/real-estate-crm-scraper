@@ -363,6 +363,15 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                 else:
                     logger.warning("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
             except Exception as json_err:
+                ct = None
+                try:
+                    ct = r.headers.get("Content-Type")
+                except Exception:
+                    pass
+                logger.warning(
+                    "Rentcast: JSON parse failed (curl_cffi) content_type=%s",
+                    ct,
+                )
                 logger.warning("Rentcast: API returned 200 but JSON parse failed (curl_cffi): %s", json_err)
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
@@ -415,6 +424,15 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                 else:
                     logger.warning("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
             except Exception as json_err:
+                ct = None
+                try:
+                    ct = r.headers.get("Content-Type")
+                except Exception:
+                    pass
+                logger.warning(
+                    "Rentcast: JSON parse failed (httpx) content_type=%s",
+                    ct,
+                )
                 logger.warning("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
