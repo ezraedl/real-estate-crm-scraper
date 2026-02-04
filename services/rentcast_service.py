@@ -15,7 +15,6 @@ import json
 import logging
 import re
 import secrets
-import gzip
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlencode
@@ -45,35 +44,16 @@ def _playwright_proxy_dict(proxy) -> Optional[Dict[str, str]]:
 def _build_address(property_dict: dict) -> Optional[str]:
     """Build address string from property_dict. Prefer formatted_address."""
     addr = property_dict.get("address")
-    if isinstance(addr, str):
-        return addr.strip() or None
     if not isinstance(addr, dict):
-        addr = {}
-    fa = (
-        addr.get("formatted_address")
-        or addr.get("formattedAddress")
-        or property_dict.get("formatted_address")
-        or property_dict.get("formattedAddress")
-    )
+        return None
+    fa = addr.get("formatted_address")
     if fa and str(fa).strip():
         return str(fa).strip()
-    street = (
-        addr.get("street")
-        or addr.get("full_street_line")
-        or addr.get("line")
-        or addr.get("line1")
-        or ""
-    ).strip()
-    unit = (addr.get("unit") or addr.get("line2") or addr.get("apt") or "").strip()
+    street = (addr.get("street") or addr.get("full_street_line") or "").strip()
+    unit = (addr.get("unit") or "").strip()
     city = (addr.get("city") or "").strip()
     state = (addr.get("state") or "").strip()
-    zip_code = (
-        addr.get("zip_code")
-        or addr.get("zip")
-        or addr.get("zipcode")
-        or addr.get("postal_code")
-        or ""
-    ).strip()
+    zip_code = (addr.get("zip_code") or "").strip()
     parts = [f"{street} {unit}".strip(), city, f"{state} {zip_code}".strip()]
     built = ", ".join(p for p in parts if p)
     return built if built else None
@@ -227,28 +207,6 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
             formatted = ", ".join(str(p) for p in parts if p)
             lst = c.get("listing") or {}
             desc = c.get("description") or {}
-            location = c.get("location") or {}
-            if isinstance(location, (list, tuple)) and len(location) >= 2:
-                location_lat, location_lng = location[0], location[1]
-            else:
-                location_lat, location_lng = None, None
-            latitude = (
-                c.get("latitude")
-                or c.get("lat")
-                or location.get("latitude")
-                or location.get("lat")
-                or location_lat
-            )
-            longitude = (
-                c.get("longitude")
-                or c.get("lng")
-                or location.get("longitude")
-                or location.get("lng")
-                or location_lng
-            )
-            comp_location = None
-            if latitude is not None and longitude is not None:
-                comp_location = [latitude, longitude]
             comps.append({
                 "id": c.get("id"),
                 "formattedAddress": formatted or c.get("id"),
@@ -259,9 +217,6 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
                 "distance": _num(c.get("distance")),
                 "daysOld": _num(lst.get("daysOld")),
                 "correlation": _num(c.get("correlation")),
-                "latitude": _num(latitude),
-                "longitude": _num(longitude),
-                "location": comp_location,
             })
         logger.debug("Rentcast API: successfully extracted rent=%s, low=%s, high=%s, comps=%d", rent, low, high, len(comps))
         return {
@@ -305,23 +260,6 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         "Sec-Fetch-Site": "same-origin",
     }
 
-    def _try_parse_json_from_bytes(raw: bytes) -> Optional[Dict[str, Any]]:
-        if not raw:
-            return None
-        data = raw
-        if data[:2] == b"\x1f\x8b":
-            try:
-                data = gzip.decompress(data)
-            except Exception:
-                return None
-        try:
-            return json.loads(data.decode("utf-8", errors="strict"))
-        except Exception:
-            try:
-                return json.loads(data.decode("utf-8", errors="ignore"))
-            except Exception:
-                return None
-
     # 1) curl_cffi (TLS fingerprinting, better anti-bot)
     try:
         from curl_cffi.requests import AsyncSession
@@ -339,40 +277,14 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         if r.status_code == 200:
             try:
                 obj = r.json()
-            except Exception:
-                obj = _try_parse_json_from_bytes(getattr(r, "content", b"") or b"")
-            try:
-                if obj is None:
-                    raise ValueError("empty-or-non-json")
                 data = _extract_from_getrentdata_response(obj)
-                if data is None:
-                    found = _find_rentcast_data(obj)
-                    if found:
-                        data = _extract_rent_estimation_from_obj(found)
-                if data is not None:
-                    logger.warning(
-                        "Rentcast: parsed data (curl_cffi) rent=%s low=%s high=%s comps=%s",
-                        data.get("rent"),
-                        data.get("rent_range_low"),
-                        data.get("rent_range_high"),
-                        len(data.get("comparables") or []),
-                    )
                 if data is not None and data.get("rent") is not None:
                     logger.debug("Rentcast: direct API getRentData ok (curl_cffi) for %s", params.get("address", "")[:50])
                     return data
                 else:
-                    logger.warning("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
+                    logger.debug("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
             except Exception as json_err:
-                ct = None
-                try:
-                    ct = r.headers.get("Content-Type")
-                except Exception:
-                    pass
-                logger.warning(
-                    "Rentcast: JSON parse failed (curl_cffi) content_type=%s",
-                    ct,
-                )
-                logger.warning("Rentcast: API returned 200 but JSON parse failed (curl_cffi): %s", json_err)
+                logger.debug("Rentcast: API returned 200 but JSON parse failed: %s", json_err)
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
@@ -400,40 +312,14 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         if r.status_code == 200:
             try:
                 obj = r.json()
-            except Exception:
-                obj = _try_parse_json_from_bytes(r.content or b"")
-            try:
-                if obj is None:
-                    raise ValueError("empty-or-non-json")
                 data = _extract_from_getrentdata_response(obj)
-                if data is None:
-                    found = _find_rentcast_data(obj)
-                    if found:
-                        data = _extract_rent_estimation_from_obj(found)
-                if data is not None:
-                    logger.warning(
-                        "Rentcast: parsed data (httpx) rent=%s low=%s high=%s comps=%s",
-                        data.get("rent"),
-                        data.get("rent_range_low"),
-                        data.get("rent_range_high"),
-                        len(data.get("comparables") or []),
-                    )
                 if data is not None and data.get("rent") is not None:
                     logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
                     return data
                 else:
-                    logger.warning("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
+                    logger.debug("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
             except Exception as json_err:
-                ct = None
-                try:
-                    ct = r.headers.get("Content-Type")
-                except Exception:
-                    pass
-                logger.warning(
-                    "Rentcast: JSON parse failed (httpx) content_type=%s",
-                    ct,
-                )
-                logger.warning("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
+                logger.debug("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
@@ -503,103 +389,28 @@ async def _parse_comps_from_page(page) -> List[Dict[str, Any]]:
     """
     comps: List[Dict[str, Any]] = []
     try:
-        def _first_number(text: str) -> Optional[float]:
-            if not text:
-                return None
-            m = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
-            if not m:
-                return None
-            try:
-                return float(m.group(0))
-            except Exception:
-                return None
-
-        def _parse_money(text: str) -> Optional[int]:
-            if not text:
-                return None
-            m = re.search(r"\$[\s]?([0-9,]+)(?:\.[0-9]{2})?", text)
-            if not m:
-                return None
-            try:
-                return int(m.group(1).replace(",", ""))
-            except Exception:
-                return None
-
-        def _parse_days_old(text: str) -> Optional[int]:
-            if not text:
-                return None
-            m = re.search(r"(\d+)\s+day", text, re.I)
-            if m:
-                try:
-                    return int(m.group(1))
-                except Exception:
-                    return None
-            return None
-
         # Try table rows first (common for comps)
-        table = await page.query_selector("table")
-        if table:
-            header_cells = await table.query_selector_all("thead tr th")
-            headers = []
-            for th in header_cells:
-                headers.append(((await th.inner_text()) or "").strip().lower())
-
-            rows = await table.query_selector_all("tbody tr")
-            for row in rows[:20]:
-                cells = await row.query_selector_all("td")
-                if not cells:
-                    continue
-                row_text = (await row.inner_text()).strip()
-                if not row_text:
-                    continue
-
-                cell_texts = []
-                for td in cells:
-                    cell_texts.append(((await td.inner_text()) or "").strip())
-
-                def _cell_by_header(name: str) -> Optional[str]:
-                    for idx, header in enumerate(headers):
-                        if name in header and idx < len(cell_texts):
-                            return cell_texts[idx]
-                    return None
-
-                address_cell = _cell_by_header("address") or cell_texts[0]
-                address_lines = [p.strip() for p in address_cell.split("\n") if p.strip()]
-                if len(address_lines) >= 2:
-                    formatted_address = f"{address_lines[0]}, {address_lines[1]}"
-                else:
-                    formatted_address = address_lines[0] if address_lines else address_cell[:120]
-
-                rent_cell = _cell_by_header("listed rent") or _cell_by_header("rent") or ""
-                rent = _parse_money(rent_cell) or _parse_money(row_text)
-                if rent is not None and not (_RENT_MIN <= rent <= _RENT_MAX):
-                    rent = None
-
-                similarity_cell = _cell_by_header("similarity") or ""
-                similarity = _first_number(similarity_cell)
-                correlation = similarity / 100 if similarity and similarity > 1 else similarity
-
-                distance_cell = _cell_by_header("distance") or ""
-                distance = _first_number(distance_cell)
-
-                beds_cell = _cell_by_header("beds") or ""
-                baths_cell = _cell_by_header("baths") or ""
-                sqft_cell = _cell_by_header("sq.ft") or _cell_by_header("sqft") or _cell_by_header("sq ft") or ""
-
-                days_cell = _cell_by_header("last seen") or ""
-                days_old = _parse_days_old(days_cell)
-
-                comp = {
-                    "formattedAddress": formatted_address,
-                    "rent": rent,
-                    "bedrooms": _first_number(beds_cell),
-                    "bathrooms": _first_number(baths_cell),
-                    "squareFootage": _first_number(sqft_cell),
-                    "distance": distance,
-                    "daysOld": days_old,
-                    "correlation": correlation,
-                }
-                comps.append(comp)
+        rows = await page.query_selector_all("table tbody tr")
+        for row in rows[:15]:
+            text = (await row.inner_text()).strip()
+            if not text:
+                continue
+            # Rent: first $ amount in plausible monthly range
+            m = re.search(r"\$[\s]?([0-9,]+)(?:\.[0-9]{2})?", text)
+            rent = None
+            if m:
+                v = int(m.group(1).replace(",", ""))
+                if _RENT_MIN <= v <= _RENT_MAX:
+                    rent = v
+            # Address: look for "City, ST" or "..., ST 12345" or "123 X St"
+            addr = None
+            if re.search(r",\s*[A-Za-z]{2}\s*,?\s*\d{5}", text):
+                # "City, ST 12345" or "City, ST, 12345"
+                addr = re.sub(r"\s+", " ", text.split("\n")[0] if "\n" in text else text)[:120]
+            elif re.search(r"\d+\s+[\w\s]+(?:St|Street|Ave|Avenue|Dr|Lane|Ln|Blvd|Rd)\b", text, re.I):
+                addr = re.sub(r"\s+", " ", text)[:120]
+            if rent is not None:
+                comps.append({"formattedAddress": addr or text[:100], "rent": rent})
         # If no table, try elements with "comparab" or "comp" or "recent" in class
         if not comps:
             nodes = await page.query_selector_all(
@@ -784,15 +595,14 @@ class RentcastService:
         key = _build_address(property_dict) or str(property_dict.get("address", ""))
         return await self._fetch_and_parse(property_dict, key)
 
-    async def fetch_and_save_rent_estimate(self, property_id: str, property_dict: dict, force: bool = False) -> bool:
+    async def fetch_and_save_rent_estimate(self, property_id: str, property_dict: dict) -> bool:
         """
         Fetch rent estimate from Rentcast app and save to property.rent_estimation.
         Uses proxy (same as Realtor) and Playwright for JS-rendered content.
-        Skips fetch if rent_estimation.fetched_at exists and is within the last 60 days
-        unless force=True.
+        Skips fetch if rent_estimation.fetched_at exists and is within the last 60 days.
         Returns True on success, False on skip/error. Never raises.
         """
-        if self.db is not None and not force:
+        if self.db is not None:
             doc = await self.db.properties_collection.find_one(
                 {"property_id": property_id},
                 {"rent_estimation.fetched_at": 1},

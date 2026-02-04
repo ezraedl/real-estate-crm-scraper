@@ -58,12 +58,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
-class RentEstimationPropertyRequest(BaseModel):
-    property_id: Optional[str] = None
-    address: Optional[str] = None
-    force: bool = False
-
 # Add CORS middleware
 # Allow frontend domain and Authorization header for JWT tokens
 cors_origins_str = settings.CORS_ORIGINS.strip() if settings.CORS_ORIGINS else "*"
@@ -871,60 +865,6 @@ async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body
         "total": total,
         "limit": limit,
         "message": f"Rent estimation backfill started for up to {total} properties. Check logs for progress.",
-    }
-
-
-@app.post("/rent-estimation/property")
-@app.post("/rent-estimation/property/")  # with trailing slash for proxy normalization
-async def rent_estimation_property_post(request: RentEstimationPropertyRequest, token_payload: dict = Depends(verify_rent_backfill_auth)):
-    """
-    Fetch Rentcast rent estimate for a single property and save it to rent_estimation.
-    Requires JWT or X-API-Key. Accepts property_id or address (formatted or partial).
-    """
-    if not request.property_id and not request.address:
-        raise HTTPException(status_code=400, detail="property_id or address is required")
-
-    prop = None
-    if request.property_id:
-        prop = await db.get_property(request.property_id)
-
-    if not prop and request.address:
-        matches = await db.find_properties_by_location(request.address, radius=0.1, limit=5)
-        if matches:
-            prop = matches[0]
-
-    if not prop:
-        raise HTTPException(status_code=404, detail="Property not found for rent estimation")
-
-    property_id = str(prop.property_id)
-    property_dict = prop.dict()
-
-    previous = await db.properties_collection.find_one(
-        {"property_id": prop.property_id},
-        {"rent_estimation.fetched_at": 1}
-    )
-    previous_ts = None
-    if isinstance(previous, dict):
-        prev_re = previous.get("rent_estimation") or {}
-        previous_ts = prev_re.get("fetched_at")
-
-    svc = RentcastService(db)
-    ok = await svc.fetch_and_save_rent_estimate(property_id, property_dict, force=request.force)
-
-    updated = await db.properties_collection.find_one({"property_id": prop.property_id})
-    rent_estimation = updated.get("rent_estimation") if isinstance(updated, dict) else None
-    new_ts = None
-    if isinstance(rent_estimation, dict):
-        new_ts = rent_estimation.get("fetched_at")
-
-    status = "updated" if ok and (request.force or str(previous_ts) != str(new_ts)) else "skipped"
-    if not ok:
-        status = "failed"
-
-    return {
-        "status": status,
-        "property_id": property_id,
-        "rent_estimation": rent_estimation,
     }
 
 
