@@ -297,7 +297,7 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
     headers = {
         **base_headers,
         "Accept": "application/json, text/plain, */*",
-        "Accept-Encoding": "identity",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://app.rentcast.io/",  # Critical: RentCast checks Referer
         "Origin": "https://app.rentcast.io",     # Critical: RentCast checks Origin
         "Sec-Fetch-Dest": "empty",
