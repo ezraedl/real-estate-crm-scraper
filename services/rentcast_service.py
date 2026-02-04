@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import secrets
+import gzip
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlencode
@@ -44,16 +45,35 @@ def _playwright_proxy_dict(proxy) -> Optional[Dict[str, str]]:
 def _build_address(property_dict: dict) -> Optional[str]:
     """Build address string from property_dict. Prefer formatted_address."""
     addr = property_dict.get("address")
+    if isinstance(addr, str):
+        return addr.strip() or None
     if not isinstance(addr, dict):
-        return None
-    fa = addr.get("formatted_address")
+        addr = {}
+    fa = (
+        addr.get("formatted_address")
+        or addr.get("formattedAddress")
+        or property_dict.get("formatted_address")
+        or property_dict.get("formattedAddress")
+    )
     if fa and str(fa).strip():
         return str(fa).strip()
-    street = (addr.get("street") or addr.get("full_street_line") or "").strip()
-    unit = (addr.get("unit") or "").strip()
+    street = (
+        addr.get("street")
+        or addr.get("full_street_line")
+        or addr.get("line")
+        or addr.get("line1")
+        or ""
+    ).strip()
+    unit = (addr.get("unit") or addr.get("line2") or addr.get("apt") or "").strip()
     city = (addr.get("city") or "").strip()
     state = (addr.get("state") or "").strip()
-    zip_code = (addr.get("zip_code") or "").strip()
+    zip_code = (
+        addr.get("zip_code")
+        or addr.get("zip")
+        or addr.get("zipcode")
+        or addr.get("postal_code")
+        or ""
+    ).strip()
     parts = [f"{street} {unit}".strip(), city, f"{state} {zip_code}".strip()]
     built = ", ".join(p for p in parts if p)
     return built if built else None
@@ -207,6 +227,28 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
             formatted = ", ".join(str(p) for p in parts if p)
             lst = c.get("listing") or {}
             desc = c.get("description") or {}
+            location = c.get("location") or {}
+            if isinstance(location, (list, tuple)) and len(location) >= 2:
+                location_lat, location_lng = location[0], location[1]
+            else:
+                location_lat, location_lng = None, None
+            latitude = (
+                c.get("latitude")
+                or c.get("lat")
+                or location.get("latitude")
+                or location.get("lat")
+                or location_lat
+            )
+            longitude = (
+                c.get("longitude")
+                or c.get("lng")
+                or location.get("longitude")
+                or location.get("lng")
+                or location_lng
+            )
+            comp_location = None
+            if latitude is not None and longitude is not None:
+                comp_location = [latitude, longitude]
             comps.append({
                 "id": c.get("id"),
                 "formattedAddress": formatted or c.get("id"),
@@ -217,6 +259,9 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
                 "distance": _num(c.get("distance")),
                 "daysOld": _num(lst.get("daysOld")),
                 "correlation": _num(c.get("correlation")),
+                "latitude": _num(latitude),
+                "longitude": _num(longitude),
+                "location": comp_location,
             })
         logger.debug("Rentcast API: successfully extracted rent=%s, low=%s, high=%s, comps=%d", rent, low, high, len(comps))
         return {
@@ -252,13 +297,30 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
     headers = {
         **base_headers,
         "Accept": "application/json, text/plain, */*",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "identity",
         "Referer": "https://app.rentcast.io/",  # Critical: RentCast checks Referer
         "Origin": "https://app.rentcast.io",     # Critical: RentCast checks Origin
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
     }
+
+    def _try_parse_json_from_bytes(raw: bytes) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
+        data = raw
+        if data[:2] == b"\x1f\x8b":
+            try:
+                data = gzip.decompress(data)
+            except Exception:
+                return None
+        try:
+            return json.loads(data.decode("utf-8", errors="strict"))
+        except Exception:
+            try:
+                return json.loads(data.decode("utf-8", errors="ignore"))
+            except Exception:
+                return None
 
     # 1) curl_cffi (TLS fingerprinting, better anti-bot)
     try:
@@ -277,14 +339,42 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         if r.status_code == 200:
             try:
                 obj = r.json()
+            except Exception:
+                obj = _try_parse_json_from_bytes(getattr(r, "content", b"") or b"")
+            try:
+                if obj is None:
+                    raise ValueError("empty-or-non-json")
                 data = _extract_from_getrentdata_response(obj)
+                if data is None:
+                    found = _find_rentcast_data(obj)
+                    if found:
+                        data = _extract_rent_estimation_from_obj(found)
+                if data is not None:
+                    logger.warning(
+                        "Rentcast: parsed data (curl_cffi) rent=%s low=%s high=%s comps=%s",
+                        data.get("rent"),
+                        data.get("rent_range_low"),
+                        data.get("rent_range_high"),
+                        len(data.get("comparables") or []),
+                    )
                 if data is not None and data.get("rent") is not None:
                     logger.debug("Rentcast: direct API getRentData ok (curl_cffi) for %s", params.get("address", "")[:50])
                     return data
                 else:
-                    logger.debug("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
+                    logger.warning("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
+                    try:
+                        logger.warning("Rentcast: raw response (curl_cffi, truncated)=%s", json.dumps(obj)[:4000])
+                    except Exception:
+                        logger.warning("Rentcast: raw response (curl_cffi) could not be serialized")
             except Exception as json_err:
-                logger.debug("Rentcast: API returned 200 but JSON parse failed: %s", json_err)
+                logger.warning("Rentcast: API returned 200 but JSON parse failed (curl_cffi): %s", json_err)
+                try:
+                    raw = getattr(r, "content", None) or (r.text or "").encode("utf-8", errors="ignore")
+                    if raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                    logger.warning("Rentcast: raw response text (curl_cffi, truncated)=%s", raw[:4000].decode("utf-8", errors="ignore"))
+                except Exception:
+                    logger.warning("Rentcast: raw response text (curl_cffi) unavailable")
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
@@ -312,14 +402,42 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         if r.status_code == 200:
             try:
                 obj = r.json()
+            except Exception:
+                obj = _try_parse_json_from_bytes(r.content or b"")
+            try:
+                if obj is None:
+                    raise ValueError("empty-or-non-json")
                 data = _extract_from_getrentdata_response(obj)
+                if data is None:
+                    found = _find_rentcast_data(obj)
+                    if found:
+                        data = _extract_rent_estimation_from_obj(found)
+                if data is not None:
+                    logger.warning(
+                        "Rentcast: parsed data (httpx) rent=%s low=%s high=%s comps=%s",
+                        data.get("rent"),
+                        data.get("rent_range_low"),
+                        data.get("rent_range_high"),
+                        len(data.get("comparables") or []),
+                    )
                 if data is not None and data.get("rent") is not None:
                     logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
                     return data
                 else:
-                    logger.debug("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
+                    logger.warning("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
+                    try:
+                        logger.warning("Rentcast: raw response (httpx, truncated)=%s", json.dumps(obj)[:4000])
+                    except Exception:
+                        logger.warning("Rentcast: raw response (httpx) could not be serialized")
             except Exception as json_err:
-                logger.debug("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
+                logger.warning("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
+                try:
+                    raw = r.content or b""
+                    if raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                    logger.warning("Rentcast: raw response text (httpx, truncated)=%s", raw[:4000].decode("utf-8", errors="ignore"))
+                except Exception:
+                    logger.warning("Rentcast: raw response text (httpx) unavailable")
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
@@ -595,14 +713,15 @@ class RentcastService:
         key = _build_address(property_dict) or str(property_dict.get("address", ""))
         return await self._fetch_and_parse(property_dict, key)
 
-    async def fetch_and_save_rent_estimate(self, property_id: str, property_dict: dict) -> bool:
+    async def fetch_and_save_rent_estimate(self, property_id: str, property_dict: dict, force: bool = False) -> bool:
         """
         Fetch rent estimate from Rentcast app and save to property.rent_estimation.
         Uses proxy (same as Realtor) and Playwright for JS-rendered content.
-        Skips fetch if rent_estimation.fetched_at exists and is within the last 60 days.
+        Skips fetch if rent_estimation.fetched_at exists and is within the last 60 days
+        unless force=True.
         Returns True on success, False on skip/error. Never raises.
         """
-        if self.db is not None:
+        if self.db is not None and not force:
             doc = await self.db.properties_collection.find_one(
                 {"property_id": property_id},
                 {"rent_estimation.fetched_at": 1},
