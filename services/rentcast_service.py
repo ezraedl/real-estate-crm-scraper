@@ -362,19 +362,8 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                     return data
                 else:
                     logger.warning("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
-                    try:
-                        logger.warning("Rentcast: raw response (curl_cffi, truncated)=%s", json.dumps(obj)[:4000])
-                    except Exception:
-                        logger.warning("Rentcast: raw response (curl_cffi) could not be serialized")
             except Exception as json_err:
                 logger.warning("Rentcast: API returned 200 but JSON parse failed (curl_cffi): %s", json_err)
-                try:
-                    raw = getattr(r, "content", None) or (r.text or "").encode("utf-8", errors="ignore")
-                    if raw[:2] == b"\x1f\x8b":
-                        raw = gzip.decompress(raw)
-                    logger.warning("Rentcast: raw response text (curl_cffi, truncated)=%s", raw[:4000].decode("utf-8", errors="ignore"))
-                except Exception:
-                    logger.warning("Rentcast: raw response text (curl_cffi) unavailable")
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
@@ -425,19 +414,8 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                     return data
                 else:
                     logger.warning("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
-                    try:
-                        logger.warning("Rentcast: raw response (httpx, truncated)=%s", json.dumps(obj)[:4000])
-                    except Exception:
-                        logger.warning("Rentcast: raw response (httpx) could not be serialized")
             except Exception as json_err:
                 logger.warning("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
-                try:
-                    raw = r.content or b""
-                    if raw[:2] == b"\x1f\x8b":
-                        raw = gzip.decompress(raw)
-                    logger.warning("Rentcast: raw response text (httpx, truncated)=%s", raw[:4000].decode("utf-8", errors="ignore"))
-                except Exception:
-                    logger.warning("Rentcast: raw response text (httpx) unavailable")
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
