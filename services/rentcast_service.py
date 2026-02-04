@@ -485,28 +485,103 @@ async def _parse_comps_from_page(page) -> List[Dict[str, Any]]:
     """
     comps: List[Dict[str, Any]] = []
     try:
-        # Try table rows first (common for comps)
-        rows = await page.query_selector_all("table tbody tr")
-        for row in rows[:15]:
-            text = (await row.inner_text()).strip()
+        def _first_number(text: str) -> Optional[float]:
             if not text:
-                continue
-            # Rent: first $ amount in plausible monthly range
+                return None
+            m = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+            if not m:
+                return None
+            try:
+                return float(m.group(0))
+            except Exception:
+                return None
+
+        def _parse_money(text: str) -> Optional[int]:
+            if not text:
+                return None
             m = re.search(r"\$[\s]?([0-9,]+)(?:\.[0-9]{2})?", text)
-            rent = None
+            if not m:
+                return None
+            try:
+                return int(m.group(1).replace(",", ""))
+            except Exception:
+                return None
+
+        def _parse_days_old(text: str) -> Optional[int]:
+            if not text:
+                return None
+            m = re.search(r"(\d+)\s+day", text, re.I)
             if m:
-                v = int(m.group(1).replace(",", ""))
-                if _RENT_MIN <= v <= _RENT_MAX:
-                    rent = v
-            # Address: look for "City, ST" or "..., ST 12345" or "123 X St"
-            addr = None
-            if re.search(r",\s*[A-Za-z]{2}\s*,?\s*\d{5}", text):
-                # "City, ST 12345" or "City, ST, 12345"
-                addr = re.sub(r"\s+", " ", text.split("\n")[0] if "\n" in text else text)[:120]
-            elif re.search(r"\d+\s+[\w\s]+(?:St|Street|Ave|Avenue|Dr|Lane|Ln|Blvd|Rd)\b", text, re.I):
-                addr = re.sub(r"\s+", " ", text)[:120]
-            if rent is not None:
-                comps.append({"formattedAddress": addr or text[:100], "rent": rent})
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    return None
+            return None
+
+        # Try table rows first (common for comps)
+        table = await page.query_selector("table")
+        if table:
+            header_cells = await table.query_selector_all("thead tr th")
+            headers = []
+            for th in header_cells:
+                headers.append(((await th.inner_text()) or "").strip().lower())
+
+            rows = await table.query_selector_all("tbody tr")
+            for row in rows[:20]:
+                cells = await row.query_selector_all("td")
+                if not cells:
+                    continue
+                row_text = (await row.inner_text()).strip()
+                if not row_text:
+                    continue
+
+                cell_texts = []
+                for td in cells:
+                    cell_texts.append(((await td.inner_text()) or "").strip())
+
+                def _cell_by_header(name: str) -> Optional[str]:
+                    for idx, header in enumerate(headers):
+                        if name in header and idx < len(cell_texts):
+                            return cell_texts[idx]
+                    return None
+
+                address_cell = _cell_by_header("address") or cell_texts[0]
+                address_lines = [p.strip() for p in address_cell.split("\n") if p.strip()]
+                if len(address_lines) >= 2:
+                    formatted_address = f"{address_lines[0]}, {address_lines[1]}"
+                else:
+                    formatted_address = address_lines[0] if address_lines else address_cell[:120]
+
+                rent_cell = _cell_by_header("listed rent") or _cell_by_header("rent") or ""
+                rent = _parse_money(rent_cell) or _parse_money(row_text)
+                if rent is not None and not (_RENT_MIN <= rent <= _RENT_MAX):
+                    rent = None
+
+                similarity_cell = _cell_by_header("similarity") or ""
+                similarity = _first_number(similarity_cell)
+                correlation = similarity / 100 if similarity and similarity > 1 else similarity
+
+                distance_cell = _cell_by_header("distance") or ""
+                distance = _first_number(distance_cell)
+
+                beds_cell = _cell_by_header("beds") or ""
+                baths_cell = _cell_by_header("baths") or ""
+                sqft_cell = _cell_by_header("sq.ft") or _cell_by_header("sqft") or _cell_by_header("sq ft") or ""
+
+                days_cell = _cell_by_header("last seen") or ""
+                days_old = _parse_days_old(days_cell)
+
+                comp = {
+                    "formattedAddress": formatted_address,
+                    "rent": rent,
+                    "bedrooms": _first_number(beds_cell),
+                    "bathrooms": _first_number(baths_cell),
+                    "squareFootage": _first_number(sqft_cell),
+                    "distance": distance,
+                    "daysOld": days_old,
+                    "correlation": correlation,
+                }
+                comps.append(comp)
         # If no table, try elements with "comparab" or "comp" or "recent" in class
         if not comps:
             nodes = await page.query_selector_all(
