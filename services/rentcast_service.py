@@ -207,6 +207,21 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
             formatted = ", ".join(str(p) for p in parts if p)
             lst = c.get("listing") or {}
             desc = c.get("description") or {}
+            location = c.get("location")
+            latitude = None
+            longitude = None
+            if isinstance(location, (list, tuple)) and len(location) >= 2:
+                latitude, longitude = location[0], location[1]
+            elif isinstance(location, dict):
+                latitude = location.get("latitude") or location.get("lat")
+                longitude = location.get("longitude") or location.get("lng")
+            if latitude is None:
+                latitude = c.get("latitude") or c.get("lat")
+            if longitude is None:
+                longitude = c.get("longitude") or c.get("lng")
+            comp_location = None
+            if latitude is not None and longitude is not None:
+                comp_location = [_num(latitude), _num(longitude)]
             comps.append({
                 "id": c.get("id"),
                 "formattedAddress": formatted or c.get("id"),
@@ -217,6 +232,9 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
                 "distance": _num(c.get("distance")),
                 "daysOld": _num(lst.get("daysOld")),
                 "correlation": _num(c.get("correlation")),
+                "latitude": _num(latitude),
+                "longitude": _num(longitude),
+                "location": comp_location,
             })
         logger.debug("Rentcast API: successfully extracted rent=%s, low=%s, high=%s, comps=%d", rent, low, high, len(comps))
         return {
