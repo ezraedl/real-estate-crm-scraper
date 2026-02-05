@@ -613,14 +613,15 @@ class RentcastService:
         key = _build_address(property_dict) or str(property_dict.get("address", ""))
         return await self._fetch_and_parse(property_dict, key)
 
-    async def fetch_and_save_rent_estimate(self, property_id: str, property_dict: dict) -> bool:
+    async def fetch_and_save_rent_estimate(self, property_id: str, property_dict: dict, force: bool = False) -> bool:
         """
         Fetch rent estimate from Rentcast app and save to property.rent_estimation.
         Uses proxy (same as Realtor) and Playwright for JS-rendered content.
-        Skips fetch if rent_estimation.fetched_at exists and is within the last 60 days.
+        Skips fetch if rent_estimation.fetched_at exists and is within the last 60 days,
+        unless force=True.
         Returns True on success, False on skip/error. Never raises.
         """
-        if self.db is not None:
+        if self.db is not None and not force:
             doc = await self.db.properties_collection.find_one(
                 {"property_id": property_id},
                 {"rent_estimation.fetched_at": 1},
