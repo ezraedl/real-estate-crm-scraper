@@ -838,21 +838,64 @@ async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body
     Requires JWT or X-API-Key. Run from production: POST /rent-estimation/backfill with body {"limit": 500}.
     """
     global _rent_backfill_running
+    force = False
+    if request and isinstance(request.get("force"), bool):
+        force = request.get("force")
     if request and isinstance(request.get("address"), str) and request.get("address").strip():
         address = request.get("address").strip()
         svc = RentcastService(db)
-        data = await svc.fetch_rent_estimate({"address": {"formatted_address": address}})
+        # Try to find property by formatted address (exact match)
+        prop = await db.properties_collection.find_one(
+            {"address.formatted_address": address}
+        )
+        if not prop:
+            # Fallback: try matching by city (if user passed only city)
+            prop = await db.properties_collection.find_one(
+                {"address.city": address}
+            )
+        if not prop:
+            # No property to save; return scrape result only
+            data = await svc.fetch_rent_estimate({"address": {"formatted_address": address}})
+            return {
+                "status": "completed",
+                "address": address,
+                "rent_estimation": data,
+                "saved": False,
+                "message": "No matching property found to save.",
+            }
+        if not prop.get("property_id"):
+            data = await svc.fetch_rent_estimate({"address": {"formatted_address": address}})
+            return {
+                "status": "completed",
+                "address": address,
+                "rent_estimation": data,
+                "saved": False,
+                "message": "Matching property missing property_id; not saved.",
+            }
+        prop_id = str(prop.get("property_id"))
+        if not force:
+            existing = (prop.get("rent_estimation") or {}).get("rent")
+            if existing is not None:
+                return {
+                    "status": "skipped",
+                    "address": address,
+                    "saved": False,
+                    "message": "Rent estimation already exists. Use force=true to overwrite.",
+                }
+        saved = await svc.fetch_and_save_rent_estimate(prop_id, prop)
+        updated = await db.properties_collection.find_one(
+            {"property_id": prop_id},
+            {"rent_estimation": 1, "property_id": 1, "address": 1},
+        )
         return {
-            "status": "completed",
+            "status": "completed" if saved else "failed",
             "address": address,
-            "rent_estimation": data,
+            "saved": bool(saved),
+            "rent_estimation": (updated or {}).get("rent_estimation"),
         }
     if _rent_backfill_running:
         return {"status": "already_running", "message": "Rent estimation backfill is already running."}
     limit = 500
-    force = False
-    if request and isinstance(request.get("force"), bool):
-        force = request.get("force")
     if request and isinstance(request.get("limit"), (int, float)):
         limit = max(1, min(int(request["limit"]), 5000))
     # FOR_SALE and PENDING only; exclude OFF_MARKET, SOLD, etc.
