@@ -926,6 +926,34 @@ async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body
     }
 
 
+@app.post("/rent-estimation/custom")
+async def update_rent_estimation_custom(request: Dict[str, Any] = Body(...), token_payload: dict = Depends(verify_token)):
+    """
+    Update rent_estimation_custom for a property in the MLS scraper DB.
+    Requires: property_id and rent_estimation_custom payload.
+    """
+    property_id = request.get("property_id")
+    custom = request.get("rent_estimation_custom")
+    if not property_id or not isinstance(property_id, str):
+        raise HTTPException(status_code=400, detail="property_id is required")
+    if not isinstance(custom, dict):
+        raise HTTPException(status_code=400, detail="rent_estimation_custom is required")
+
+    await db.properties_collection.update_one(
+        {"property_id": property_id},
+        {"$set": {"rent_estimation_custom": custom, "last_updated": datetime.utcnow()}},
+    )
+    updated = await db.properties_collection.find_one(
+        {"property_id": property_id},
+        {"rent_estimation_custom": 1, "property_id": 1},
+    )
+    return {
+        "status": "completed",
+        "property_id": property_id,
+        "rent_estimation_custom": (updated or {}).get("rent_estimation_custom") or custom,
+    }
+
+
 # Get properties by ID endpoint
 @app.post("/properties/by-ids")
 async def get_properties_by_ids(request: PropertyIdsRequest, token_payload: dict = Depends(verify_token)):
