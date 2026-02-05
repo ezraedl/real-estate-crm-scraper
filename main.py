@@ -837,6 +837,15 @@ async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body
     Requires JWT or X-API-Key. Run from production: POST /rent-estimation/backfill with body {"limit": 500}.
     """
     global _rent_backfill_running
+    if request and isinstance(request.get("address"), str) and request.get("address").strip():
+        address = request.get("address").strip()
+        svc = RentcastService(db)
+        data = await svc.fetch_rent_estimate({"address": {"formatted_address": address}})
+        return {
+            "status": "completed",
+            "address": address,
+            "rent_estimation": data,
+        }
     if _rent_backfill_running:
         return {"status": "already_running", "message": "Rent estimation backfill is already running."}
     limit = 500
