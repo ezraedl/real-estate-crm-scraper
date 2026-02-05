@@ -14,6 +14,7 @@ class JobScheduler:
     def __init__(self):
         self.is_running = False
         self.scheduled_jobs = {}
+        self.last_sold_cleanup_at: Optional[datetime] = None
     
     async def start(self):
         """Start the scheduler service"""
@@ -22,6 +23,9 @@ class JobScheduler:
         
         while self.is_running:
             try:
+                # Daily maintenance (e.g., cleanup old sold properties)
+                await self.check_maintenance_jobs()
+
                 # Check for scheduled jobs
                 await self.check_scheduled_jobs()
                 
@@ -34,6 +38,25 @@ class JobScheduler:
             except Exception as e:
                 logger.error(f"Error in scheduler main loop: {e}")
                 await asyncio.sleep(60)
+
+    async def check_maintenance_jobs(self):
+        """Run lightweight maintenance tasks on a daily cadence."""
+        try:
+            now = datetime.utcnow()
+            if self.last_sold_cleanup_at and (now - self.last_sold_cleanup_at) < timedelta(hours=24):
+                return
+
+            # Run once per day (best-effort)
+            from scraper import _delete_old_sold_properties
+            deleted = await _delete_old_sold_properties()
+            self.last_sold_cleanup_at = now
+            logger.info(
+                "[Maintenance] Daily sold cleanup completed (deleted=%d, ran_at=%s)",
+                deleted,
+                now.isoformat(),
+            )
+        except Exception as e:
+            logger.warning(f"[Maintenance] Daily sold cleanup failed: {e}")
     
     async def stop(self):
         """Stop the scheduler service"""
