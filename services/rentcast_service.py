@@ -336,52 +336,7 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
     except Exception as e:
         logger.debug("Rentcast: direct API (curl_cffi) failed: %s", e)
 
-    # 2) httpx fallback
-    try:
-        import httpx
-
-        kw: Dict[str, Any] = {
-            "timeout": timeout,
-            "follow_redirects": True,
-        }
-        if proxy_url:
-            kw["proxy"] = proxy_url
-        async with httpx.AsyncClient(**kw) as client:
-            r = await client.get(url, headers=headers)
-        
-        if r.status_code == 200:
-            try:
-                obj = r.json()
-                data = _extract_from_getrentdata_response(obj)
-                if data is not None and data.get("rent") is not None:
-                    logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
-                    return data
-                else:
-                    logger.warning(
-                        "Rentcast: API 200 but no valid rent data (httpx) addr=%s ua=%s",
-                        params.get("address", "")[:50],
-                        ua[:80],
-                    )
-            except Exception as json_err:
-                ct = None
-                try:
-                    ct = r.headers.get("Content-Type")
-                except Exception:
-                    pass
-                logger.warning(
-                    "Rentcast: JSON parse failed (httpx) addr=%s content_type=%s err=%s",
-                    params.get("address", "")[:50],
-                    ct,
-                    json_err,
-                )
-        elif r.status_code == 403:
-            logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
-        elif r.status_code == 429:
-            logger.warning("Rentcast: API returned 429 Too Many Requests (rate limited, httpx) for %s", params.get("address", "")[:50])
-        else:
-            logger.debug("Rentcast: API returned status %d (httpx) for %s", r.status_code, params.get("address", "")[:50])
-    except Exception as e:
-        logger.debug("Rentcast: direct API (httpx) failed: %s", e)
+    # 2) httpx fallback disabled (to avoid double-hitting the same proxy/session)
 
     return None
 
