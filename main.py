@@ -813,7 +813,7 @@ async def _run_rent_backfill_task(limit: int, force: bool = False) -> None:
                 continue
             pid = str(pid)
             try:
-                ok = await svc.fetch_and_save_rent_estimate(pid, p)
+                ok = await svc.fetch_and_save_rent_estimate(pid, p, force=force)
                 if ok:
                     done += 1
                 else:
@@ -882,7 +882,7 @@ async def rent_estimation_backfill_post(request: Optional[Dict[str, Any]] = Body
                     "saved": False,
                     "message": "Rent estimation already exists. Use force=true to overwrite.",
                 }
-        saved = await svc.fetch_and_save_rent_estimate(prop_id, prop)
+        saved = await svc.fetch_and_save_rent_estimate(prop_id, prop, force=force)
         updated = await db.properties_collection.find_one(
             {"property_id": prop_id},
             {"rent_estimation": 1, "property_id": 1, "address": 1},
