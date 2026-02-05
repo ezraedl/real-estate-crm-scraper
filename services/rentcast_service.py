@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import secrets
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlencode
@@ -207,6 +208,28 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
             formatted = ", ".join(str(p) for p in parts if p)
             lst = c.get("listing") or {}
             desc = c.get("description") or {}
+            location = c.get("location") or {}
+            if isinstance(location, (list, tuple)) and len(location) >= 2:
+                location_lat, location_lng = location[0], location[1]
+            else:
+                location_lat, location_lng = None, None
+            latitude = (
+                c.get("latitude")
+                or c.get("lat")
+                or location.get("latitude")
+                or location.get("lat")
+                or location_lat
+            )
+            longitude = (
+                c.get("longitude")
+                or c.get("lng")
+                or location.get("longitude")
+                or location.get("lng")
+                or location_lng
+            )
+            comp_location = None
+            if latitude is not None and longitude is not None:
+                comp_location = [latitude, longitude]
             comps.append({
                 "id": c.get("id"),
                 "formattedAddress": formatted or c.get("id"),
@@ -217,6 +240,9 @@ def _extract_from_getrentdata_response(obj: dict) -> Optional[Dict[str, Any]]:
                 "distance": _num(c.get("distance")),
                 "daysOld": _num(lst.get("daysOld")),
                 "correlation": _num(c.get("correlation")),
+                "latitude": _num(latitude),
+                "longitude": _num(longitude),
+                "location": comp_location,
             })
         logger.debug("Rentcast API: successfully extracted rent=%s, low=%s, high=%s, comps=%d", rent, low, high, len(comps))
         return {
@@ -249,6 +275,7 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
     
     # Build comprehensive headers that mimic a real browser
     base_headers = proxy_manager.get_random_headers()
+    ua = base_headers.get("User-Agent") or ""
     headers = {
         **base_headers,
         "Accept": "application/json, text/plain, */*",
@@ -260,8 +287,14 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         "Sec-Fetch-Site": "same-origin",
     }
 
+    disable_curl_cffi = str(os.getenv("RENTCAST_DISABLE_CURL_CFFI", "0")).lower() in ("1", "true", "yes")
+    if disable_curl_cffi:
+        logger.info("Rentcast: curl_cffi disabled via RENTCAST_DISABLE_CURL_CFFI; using httpx only")
+
     # 1) curl_cffi (TLS fingerprinting, better anti-bot)
     try:
+        if disable_curl_cffi:
+            raise ImportError("curl_cffi disabled")
         from curl_cffi.requests import AsyncSession
 
         kw: Dict[str, Any] = {
@@ -282,9 +315,23 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                     logger.debug("Rentcast: direct API getRentData ok (curl_cffi) for %s", params.get("address", "")[:50])
                     return data
                 else:
-                    logger.debug("Rentcast: API returned 200 but no valid rent data for %s", params.get("address", "")[:50])
+                    logger.warning(
+                        "Rentcast: API 200 but no valid rent data (curl_cffi) addr=%s ua=%s",
+                        params.get("address", "")[:50],
+                        ua[:80],
+                    )
             except Exception as json_err:
-                logger.debug("Rentcast: API returned 200 but JSON parse failed: %s", json_err)
+                ct = None
+                try:
+                    ct = r.headers.get("Content-Type")
+                except Exception:
+                    pass
+                logger.warning(
+                    "Rentcast: JSON parse failed (curl_cffi) addr=%s content_type=%s err=%s",
+                    params.get("address", "")[:50],
+                    ct,
+                    json_err,
+                )
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:
@@ -292,7 +339,7 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         else:
             logger.debug("Rentcast: API returned status %d (curl_cffi) for %s", r.status_code, params.get("address", "")[:50])
     except ImportError:
-        pass  # curl_cffi not installed, try httpx
+        pass  # curl_cffi not installed/disabled, try httpx
     except Exception as e:
         logger.debug("Rentcast: direct API (curl_cffi) failed: %s", e)
 
@@ -317,9 +364,23 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                     logger.debug("Rentcast: direct API getRentData ok (httpx) for %s", params.get("address", "")[:50])
                     return data
                 else:
-                    logger.debug("Rentcast: API returned 200 but no valid rent data (httpx) for %s", params.get("address", "")[:50])
+                    logger.warning(
+                        "Rentcast: API 200 but no valid rent data (httpx) addr=%s ua=%s",
+                        params.get("address", "")[:50],
+                        ua[:80],
+                    )
             except Exception as json_err:
-                logger.debug("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
+                ct = None
+                try:
+                    ct = r.headers.get("Content-Type")
+                except Exception:
+                    pass
+                logger.warning(
+                    "Rentcast: JSON parse failed (httpx) addr=%s content_type=%s err=%s",
+                    params.get("address", "")[:50],
+                    ct,
+                    json_err,
+                )
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
         elif r.status_code == 429:

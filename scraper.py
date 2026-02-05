@@ -263,6 +263,107 @@ class MLSScraper:
         async with self._homeharvest_lock:
             return self._homeharvest_inflight > 0
 
+    @staticmethod
+    def _normalize_datetime(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = pd.to_datetime(value, errors="coerce", utc=True)
+            except Exception:
+                return None
+        if dt is None or pd.isna(dt):
+            return None
+        if hasattr(dt, "to_pydatetime"):
+            dt = dt.to_pydatetime()
+        if isinstance(dt, datetime) and dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt if isinstance(dt, datetime) else None
+
+    @staticmethod
+    def _parse_date_input(value: Optional[str], *, is_end: bool) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str) and len(value.strip()) <= 10:
+            try:
+                dt = datetime.strptime(value.strip(), "%Y-%m-%d")
+                if is_end:
+                    dt = dt + timedelta(days=1) - timedelta(microseconds=1)
+            except ValueError:
+                dt = None
+        else:
+            dt = MLSScraper._normalize_datetime(value)
+        if dt and dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    def _filter_sold_properties_by_date(
+        self,
+        properties: List[Property],
+        job: ScrapingJob,
+        *,
+        past_days: Optional[int] = None,
+        location: Optional[str] = None,
+        listing_type: Optional[str] = None,
+    ) -> List[Property]:
+        if not properties:
+            return properties
+
+        # Determine filter window (date_from/date_to take precedence over past_days)
+        start_date = None
+        end_date = None
+        if job.date_from or job.date_to:
+            start_date = self._parse_date_input(job.date_from, is_end=False)
+            end_date = self._parse_date_input(job.date_to, is_end=True)
+        else:
+            effective_past_days = past_days or job.past_days
+            if effective_past_days:
+                start_date = datetime.utcnow() - timedelta(days=int(effective_past_days))
+
+        if not start_date and not end_date:
+            return properties
+
+        kept: List[Property] = []
+        missing_date = 0
+        out_of_range = 0
+
+        for prop in properties:
+            sold_date = None
+            if prop.dates and prop.dates.last_sold_date:
+                sold_date = self._normalize_datetime(prop.dates.last_sold_date)
+            if sold_date is None:
+                legacy = getattr(prop, "last_sold_date", None)
+                sold_date = self._normalize_datetime(legacy)
+
+            if sold_date is None:
+                missing_date += 1
+                continue
+
+            if start_date and sold_date < start_date:
+                out_of_range += 1
+                continue
+            if end_date and sold_date > end_date:
+                out_of_range += 1
+                continue
+            kept.append(prop)
+
+        logger.info(
+            "   [SOLD-FILTER] %s kept %d/%d (missing_date=%d, out_of_range=%d, window=%s..%s) location=%s",
+            listing_type or "sold",
+            len(kept),
+            len(properties),
+            missing_date,
+            out_of_range,
+            start_date.isoformat() if start_date else "None",
+            end_date.isoformat() if end_date else "None",
+            location or "unknown",
+        )
+        return kept
+
     def _get_rentcast_retry_queue(self, job_id: Optional[str]) -> Optional[asyncio.Queue]:
         if not job_id:
             return None
@@ -2606,6 +2707,17 @@ class MLSScraper:
                     deduped.append(p)
                 properties_by_type[lt] = deduped
 
+            # Enforce sold date window for sold listings (past_days/date_from/date_to)
+            for lt in properties_by_type:
+                if str(lt).lower() == "sold":
+                    properties_by_type[lt] = self._filter_sold_properties_by_date(
+                        properties_by_type[lt],
+                        job,
+                        past_days=past_days,
+                        location=location,
+                        listing_type=str(lt),
+                    )
+
             return properties_by_type, None  # No error, got results
             
         except Exception as e:
@@ -2846,6 +2958,15 @@ class MLSScraper:
                 except Exception as e:
                     logger.error(f"Error converting property: {e}")
                     continue
+
+            if str(listing_type).lower() == "sold":
+                properties = self._filter_sold_properties_by_date(
+                    properties,
+                    job,
+                    past_days=past_days,
+                    location=location,
+                    listing_type=str(listing_type),
+                )
             
             return properties
             
