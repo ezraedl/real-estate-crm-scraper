@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import secrets
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlencode
@@ -286,8 +287,14 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         "Sec-Fetch-Site": "same-origin",
     }
 
+    disable_curl_cffi = str(os.getenv("RENTCAST_DISABLE_CURL_CFFI", "0")).lower() in ("1", "true", "yes")
+    if disable_curl_cffi:
+        logger.info("Rentcast: curl_cffi disabled via RENTCAST_DISABLE_CURL_CFFI; using httpx only")
+
     # 1) curl_cffi (TLS fingerprinting, better anti-bot)
     try:
+        if disable_curl_cffi:
+            raise ImportError("curl_cffi disabled")
         from curl_cffi.requests import AsyncSession
 
         kw: Dict[str, Any] = {
@@ -332,7 +339,7 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
         else:
             logger.debug("Rentcast: API returned status %d (curl_cffi) for %s", r.status_code, params.get("address", "")[:50])
     except ImportError:
-        pass  # curl_cffi not installed, try httpx
+        pass  # curl_cffi not installed/disabled, try httpx
     except Exception as e:
         logger.debug("Rentcast: direct API (curl_cffi) failed: %s", e)
 
