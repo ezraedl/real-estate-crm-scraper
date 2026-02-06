@@ -211,6 +211,43 @@ async def create_active_properties_rescraping_job():
     except Exception as e:
         logger.error(f"Error creating active properties re-scraping job: {e}")
 
+# Helper function to create daily property cleanup job
+async def create_daily_property_cleanup_job():
+    """
+    Create a scheduled job that runs daily to clean up old properties.
+    This job runs at 3 AM UTC to avoid peak hours.
+    """
+    try:
+        # Check if the job already exists
+        existing_job = await db.scheduled_jobs_collection.find_one({
+            "scheduled_job_id": "daily_property_cleanup"
+        })
+        
+        if existing_job:
+            logger.info("Daily property cleanup job already exists")
+            return
+        
+        # Create the scheduled job (runs daily at 3 AM UTC)
+        scheduled_job = ScheduledJob(
+            scheduled_job_id="daily_property_cleanup",
+            name="Daily Property Cleanup",
+            description="Deletes old properties: sold >1yr, rent >2yr, others >1yr",
+            status=ScheduledJobStatus.ACTIVE,
+            cron_expression="0 3 * * *",  # Daily at 3 AM UTC
+            timezone="UTC",
+            locations=[],  # No locations needed for cleanup job
+            listing_types=[],  # No listing types needed
+            priority=JobPriority.LOW,
+            created_by="system"
+        )
+        
+        # Save to database
+        await db.scheduled_jobs_collection.insert_one(scheduled_job.dict(by_alias=True, exclude={"id"}))
+        logger.info("Created daily property cleanup job (runs daily at 3 AM UTC)")
+        
+    except Exception as e:
+        logger.error(f"Error creating daily property cleanup job: {e}")
+
 # Helper function to handle stuck jobs on startup
 async def handle_stuck_jobs():
     """
@@ -488,6 +525,13 @@ async def startup_event():
         except Exception as scheduler_error:
             logger.error(f"Scheduler service failed to start: {scheduler_error}")
             logger.error("CRITICAL: Cron jobs will not run automatically!")
+        
+        # Create scheduled jobs if they don't exist
+        try:
+            await create_active_properties_rescraping_job()
+            await create_daily_property_cleanup_job()
+        except Exception as job_creation_error:
+            logger.warning(f"Failed to create scheduled jobs: {job_creation_error}")
         
         logger.info("Service startup completed")
         
@@ -3067,6 +3111,21 @@ async def update_dom_all(limit: Optional[int] = None, token_payload: dict = Depe
     except Exception as e:
         logger.error(f"Error updating DOM: {e}")
         raise HTTPException(status_code=500, detail=f"Error updating DOM: {str(e)}")
+
+@app.post("/properties/cleanup-old")
+async def cleanup_old_properties_endpoint(token_payload: dict = Depends(verify_token)):
+    """
+    Manually trigger cleanup of old properties:
+    - Properties sold more than 1 year ago
+    - Rent properties with listing date more than 2 years ago
+    - All other properties with last updated listing date more than 1 year ago
+    """
+    try:
+        result = await db.cleanup_old_properties()
+        return result
+    except Exception as e:
+        logger.error(f"Error cleaning up old properties: {e}")
+        raise HTTPException(status_code=500, detail=f"Error cleaning up old properties: {str(e)}")
 
 @app.post("/enrichment/recover-pending", response_model=EnrichmentRecalcResponse)
 async def recover_pending_enrichment(limit: Optional[int] = None, batch_size: int = 50, token_payload: dict = Depends(verify_token)):
