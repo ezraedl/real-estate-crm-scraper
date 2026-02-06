@@ -1479,7 +1479,7 @@ class MLSScraper:
                         # Save properties immediately after each listing type fetch
                         if properties:
                             logger.debug(f"   [DEBUG] Entering save block for {listing_type}...")
-                            save_results = await db.save_properties_batch(properties)
+                            save_results = await db.save_properties_batch(properties, job=job)
                             location_total_found += len(properties)
                             location_total_inserted += save_results["inserted"]
                             location_total_updated += save_results["updated"]

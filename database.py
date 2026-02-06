@@ -3,7 +3,7 @@ from pymongo import ASCENDING, DESCENDING
 from pymongo.operations import InsertOne, UpdateOne, ReplaceOne
 from pymongo.errors import BulkWriteError
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import logging
 from urllib.parse import urlparse
@@ -922,11 +922,81 @@ class Database:
                 "property_id": property_id
             }
     
-    async def save_properties_batch(self, properties: List[Property]) -> Dict[str, Any]:
+    def _validate_property_date_compliance(self, property_data: Property, job: Optional[ScrapingJob] = None) -> tuple[bool, Optional[str]]:
+        """
+        Validate that a property complies with job date requirements.
+        Returns (is_valid, reason_if_invalid)
+        
+        Rules:
+        - If job has past_days, check that property dates are within that range
+        - For sold properties: check dates.last_sold_date or dates.list_date
+        - For rent properties: check dates.list_date
+        - For other properties: check dates.list_date or dates.last_sold_date
+        """
+        if not job or not job.past_days:
+            # No date restriction, allow all properties
+            return True, None
+        
+        cutoff_date = datetime.utcnow() - timedelta(days=job.past_days)
+        
+        # Get relevant date based on listing type
+        property_date = None
+        if property_data.listing_type == "sold":
+            # For sold properties, check last_sold_date first, then list_date
+            property_date = property_data.dates.last_sold_date if property_data.dates else None
+            if not property_date and property_data.dates:
+                property_date = property_data.dates.list_date
+        elif property_data.listing_type == "for_rent":
+            # For rent properties, check list_date
+            property_date = property_data.dates.list_date if property_data.dates else None
+        else:
+            # For other properties (for_sale, pending), check list_date or last_sold_date
+            if property_data.dates:
+                property_date = property_data.dates.list_date or property_data.dates.last_sold_date
+        
+        if not property_date:
+            # No date available - allow it (might be a new listing without date yet)
+            return True, None
+        
+        # Check if property date is within the allowed range
+        if property_date < cutoff_date:
+            days_old = (datetime.utcnow() - property_date).days
+            return False, f"Property date ({property_date.date()}) is {days_old} days old, exceeds job limit of {job.past_days} days"
+        
+        return True, None
+    
+    async def save_properties_batch(self, properties: List[Property], job: Optional[ScrapingJob] = None) -> Dict[str, Any]:
         """Save multiple properties in batch with hash-based change detection using bulk operations"""
         try:
             if not properties:
                 return {"total": 0, "inserted": 0, "updated": 0, "skipped": 0, "errors": 0, "enrichment_queue": []}
+            
+            # Filter out properties that don't comply with job date requirements
+            valid_properties = []
+            date_filtered_count = 0
+            date_filtered_reasons = []
+            
+            for prop in properties:
+                is_valid, reason = self._validate_property_date_compliance(prop, job)
+                if is_valid:
+                    valid_properties.append(prop)
+                else:
+                    date_filtered_count += 1
+                    date_filtered_reasons.append(f"{prop.property_id}: {reason}")
+                    logger.debug(f"[DATE FILTER] Filtered out property {prop.property_id}: {reason}")
+            
+            if date_filtered_count > 0:
+                logger.info(f"[DATE FILTER] Filtered out {date_filtered_count} properties that don't comply with job date requirements (past_days={job.past_days if job else None})")
+                if len(date_filtered_reasons) <= 5:
+                    for reason in date_filtered_reasons:
+                        logger.debug(f"[DATE FILTER]   - {reason}")
+                else:
+                    for reason in date_filtered_reasons[:5]:
+                        logger.debug(f"[DATE FILTER]   - {reason}")
+                    logger.debug(f"[DATE FILTER]   ... and {len(date_filtered_reasons) - 5} more")
+            
+            # Use only valid properties for the rest of the batch save
+            properties = valid_properties
             
             # Extract property IDs for batch fetch
             property_ids = [prop.property_id for prop in properties if prop.property_id]
@@ -1864,6 +1934,87 @@ class Database:
                 "completed_at": datetime.utcnow(),
                 "duration_seconds": (datetime.utcnow() - start_time).total_seconds(),
                 "errors": errors + [str(e)]
+            }
+    
+    async def cleanup_old_properties(self) -> Dict[str, int]:
+        """
+        Daily cleanup job to delete non-relevant properties:
+        - Properties sold more than 1 year ago
+        - Rent properties with listing date more than 2 years ago
+        - All other properties with last updated listing date more than 1 year ago
+        
+        Returns dict with counts of deleted properties by type.
+        """
+        try:
+            now = datetime.utcnow()
+            results = {
+                "sold_deleted": 0,
+                "rent_deleted": 0,
+                "other_deleted": 0,
+                "total_deleted": 0
+            }
+            
+            # 1. Delete sold properties sold more than 1 year ago
+            sold_cutoff = now - timedelta(days=365)
+            sold_query = {
+                "listing_type": "sold",
+                "$or": [
+                    {"dates.last_sold_date": {"$lt": sold_cutoff}},
+                    {"dates.list_date": {"$lt": sold_cutoff}},  # Fallback to list_date if no last_sold_date
+                ],
+            }
+            sold_result = await self.properties_collection.delete_many(sold_query)
+            results["sold_deleted"] = sold_result.deleted_count
+            
+            # 2. Delete rent properties with listing date more than 2 years ago
+            rent_cutoff = now - timedelta(days=730)  # 2 years
+            rent_query = {
+                "listing_type": "for_rent",
+                "$or": [
+                    {"dates.list_date": {"$lt": rent_cutoff}},
+                    {"last_updated": {"$lt": rent_cutoff}},  # Fallback to last_updated
+                ],
+            }
+            rent_result = await self.properties_collection.delete_many(rent_query)
+            results["rent_deleted"] = rent_result.deleted_count
+            
+            # 3. Delete all other properties (for_sale, pending, off_market) with last updated listing date more than 1 year ago
+            other_cutoff = now - timedelta(days=365)
+            # Get the most recent date from list_date, last_sold_date, or last_updated
+            other_query = {
+                "listing_type": {"$in": ["for_sale", "pending", "off_market"]},
+                "$or": [
+                    {"dates.list_date": {"$lt": other_cutoff}},
+                    {"dates.last_sold_date": {"$lt": other_cutoff}},
+                    {"last_updated": {"$lt": other_cutoff}},
+                    {"last_content_updated": {"$lt": other_cutoff}},
+                ],
+            }
+            other_result = await self.properties_collection.delete_many(other_query)
+            results["other_deleted"] = other_result.deleted_count
+            
+            results["total_deleted"] = results["sold_deleted"] + results["rent_deleted"] + results["other_deleted"]
+            
+            if results["total_deleted"] > 0:
+                logger.info(
+                    f"[Daily Cleanup] Deleted {results['total_deleted']} old properties: "
+                    f"{results['sold_deleted']} sold (>1yr), "
+                    f"{results['rent_deleted']} rent (>2yr), "
+                    f"{results['other_deleted']} other (>1yr)"
+                )
+            else:
+                logger.info("[Daily Cleanup] No old properties to delete")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"[Daily Cleanup] Failed to cleanup old properties: {e}")
+            return {
+                "sold_deleted": 0,
+                "rent_deleted": 0,
+                "other_deleted": 0,
+                "total_deleted": 0,
+                "error": str(e)
             }
     
     async def redetect_keywords_all(self, limit: Optional[int] = None) -> Dict[str, Any]:

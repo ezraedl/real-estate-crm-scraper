@@ -79,6 +79,14 @@ class JobScheduler:
                 try:
                     # Check if it's time to run this scheduled job
                     if await self.should_run_scheduled_job(scheduled_job, now):
+                        # Special handling for cleanup job
+                        if scheduled_job.scheduled_job_id == "daily_property_cleanup":
+                            logger.info(f"Running daily property cleanup job")
+                            await db.update_scheduled_job(scheduled_job.scheduled_job_id, {"last_run_at": now})
+                            # Run cleanup directly (not as a scraping job)
+                            asyncio.create_task(self._run_cleanup_job(scheduled_job))
+                            continue
+                        
                         job_instances = await self.create_scheduled_job_instances(scheduled_job)
 
                         if not job_instances:
@@ -550,6 +558,33 @@ class JobScheduler:
         except Exception as e:
             logger.error(f"Error calculating next run time: {e}")
             return datetime.utcnow() + timedelta(hours=1)
+    
+    async def _run_cleanup_job(self, scheduled_job: ScheduledJob):
+        """Run the daily property cleanup job"""
+        try:
+            logger.info(f"Starting daily property cleanup job")
+            result = await db.cleanup_old_properties()
+            
+            # Update scheduled job run history
+            # Note: update_scheduled_job_run_history expects properties_scraped/saved, but cleanup has properties_deleted
+            await db.update_scheduled_job_run_history(
+                scheduled_job.scheduled_job_id,
+                f"cleanup_{int(datetime.utcnow().timestamp())}",
+                JobStatus.COMPLETED,
+                properties_scraped=result.get("total_deleted", 0),
+                properties_saved=0,  # No properties saved in cleanup
+                error_message=None
+            )
+            
+            logger.info(f"Daily property cleanup completed: {result}")
+        except Exception as e:
+            logger.error(f"Error running cleanup job: {e}")
+            await db.update_scheduled_job_run_history(
+                scheduled_job.scheduled_job_id,
+                f"cleanup_{int(datetime.utcnow().timestamp())}",
+                JobStatus.FAILED,
+                error_message=str(e)
+            )
 
 # Global scheduler instance
 scheduler = JobScheduler()
