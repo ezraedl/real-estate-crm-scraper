@@ -505,8 +505,14 @@ class RentcastService:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = None
+                context = None
+                page = None
                 try:
+                    browser = await p.chromium.launch(headless=True)
+                    if not browser:
+                        raise Exception("Failed to launch browser")
+                    
                     ctx_opts: Dict[str, Any] = {"ignore_https_errors": True}
                     if proxy_dict:
                         ctx_opts["proxy"] = proxy_dict
@@ -514,8 +520,41 @@ class RentcastService:
                         ctx_opts["user_agent"] = user_agent
                     if extra_http_headers:
                         ctx_opts["extra_http_headers"] = extra_http_headers
-                    context = await browser.new_context(**ctx_opts)
-                    page = await context.new_page()
+                    
+                    # Create context and page with proper error handling
+                    try:
+                        context = await browser.new_context(**ctx_opts)
+                        if not context:
+                            raise Exception("Failed to create browser context")
+                    except Exception as ctx_err:
+                        logger.debug("Rentcast: failed to create browser context: %s", ctx_err)
+                        # Ensure browser is closed if context creation fails
+                        try:
+                            if browser:
+                                await browser.close()
+                        except Exception:
+                            pass
+                        raise
+                    
+                    try:
+                        page = await context.new_page()
+                        if not page:
+                            raise Exception("Failed to create page")
+                    except Exception as page_err:
+                        logger.debug("Rentcast: failed to create page (context may be closed): %s", page_err)
+                        # Clean up context if page creation failed
+                        try:
+                            if context:
+                                await context.close()
+                        except Exception:
+                            pass
+                        try:
+                            if browser:
+                                await browser.close()
+                        except Exception:
+                            pass
+                        raise
+                    
                     api_responses: List[Any] = []
 
                     def collect_response(resp: Any) -> None:
@@ -579,8 +618,20 @@ class RentcastService:
                     elif not data.get("comparables"):
                         data["comparables"] = await _parse_comps_from_page(page)
                 finally:
+                    # Clean up resources in reverse order: page -> context -> browser
                     try:
-                        await browser.close()
+                        if page:
+                            await page.close()
+                    except Exception:
+                        pass
+                    try:
+                        if context:
+                            await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        if browser:
+                            await browser.close()
                     except Exception:
                         pass
         except ImportError as e:
