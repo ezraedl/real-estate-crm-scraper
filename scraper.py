@@ -2954,13 +2954,26 @@ class MLSScraper:
                 property_type=safe_get('style')  # Use style as property_type since type field is None
             )
             
+            # Last sold: use multiple sources so we don't miss data (Realtor/HomeHarvest may use
+            # last_sold_price/last_sold_date at top level or sold_price/last_sold_date in description/dates)
+            last_sold_price = safe_get('last_sold_price') or safe_get('sold_price')
+            if last_sold_price is None:
+                desc = safe_get('description')
+                if isinstance(desc, dict):
+                    last_sold_price = desc.get('sold_price') or desc.get('last_sold_price')
+            last_sold_date = safe_get('last_sold_date')
+            if last_sold_date is None:
+                dates_val = safe_get('dates')
+                if isinstance(dates_val, dict):
+                    last_sold_date = dates_val.get('last_sold_date')
+
             # Extract financial information
             financial = PropertyFinancial(
                 list_price=safe_get('list_price'),
                 list_price_min=safe_get('list_price_min'),
                 list_price_max=safe_get('list_price_max'),
                 sold_price=safe_get('sold_price'),
-                last_sold_price=safe_get('last_sold_price'),
+                last_sold_price=last_sold_price,
                 price_per_sqft=safe_get('price_per_sqft'),
                 estimated_value=safe_get('estimated_value'),
                 tax_assessed_value=safe_get('assessed_value'),
@@ -2972,7 +2985,7 @@ class MLSScraper:
             dates = PropertyDates(
                 list_date=safe_get('list_date'),
                 pending_date=safe_get('pending_date'),
-                last_sold_date=safe_get('last_sold_date')
+                last_sold_date=last_sold_date
             )
             
             # Extract location information
