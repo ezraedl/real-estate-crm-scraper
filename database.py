@@ -541,6 +541,15 @@ class Database:
                     if property_data.last_scraped:
                         update_fields["last_scraped"] = property_data.last_scraped
                     
+                    # When content is unchanged but new scrape has last_sold data and existing doesn't,
+                    # backfill so ARV and UI have it (Realtor may add sold history after first scrape)
+                    existing_fin = existing_property.get("financial") or {}
+                    existing_dates = existing_property.get("dates") or {}
+                    if property_data.financial and property_data.financial.last_sold_price is not None and existing_fin.get("last_sold_price") is None:
+                        update_fields["financial.last_sold_price"] = property_data.financial.last_sold_price
+                    if property_data.dates and property_data.dates.last_sold_date is not None and existing_dates.get("last_sold_date") is None:
+                        update_fields["dates.last_sold_date"] = property_data.dates.last_sold_date
+                    
                     # FIXED: Check both scraped data AND existing nested data in database
                     # This handles cases where existing property has nested data but scraped data doesn't include it
                     needs_contact_processing = False
