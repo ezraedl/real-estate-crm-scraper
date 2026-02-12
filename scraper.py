@@ -2940,6 +2940,8 @@ class MLSScraper:
             garage_value = safe_get('parking_garage')
             garage_str = str(garage_value) if garage_value is not None else None
             
+            # property_type: prefer 'property_type' column, then 'style' (HomeHarvest/Realtor may use either)
+            description_property_type = safe_get('property_type') or safe_get('style')
             description = PropertyDescription(
                 style=safe_get('style'),
                 beds=safe_get('beds'),
@@ -2951,7 +2953,7 @@ class MLSScraper:
                 garage=garage_str,
                 lot_sqft=safe_get('lot_sqft'),
                 text=safe_get('text'),
-                property_type=safe_get('style')  # Use style as property_type since type field is None
+                property_type=description_property_type
             )
             
             # Last sold: use multiple sources so we don't miss data (Realtor/HomeHarvest may use
