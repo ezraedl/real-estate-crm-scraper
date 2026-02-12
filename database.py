@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # job_id, scheduled_job_id, last_scraped, source, is_comp, crm_property_ids (handled separately).
 _PRESERVE_ON_RECSCRAPE = frozenset([
     # RentCast
-    "rent_estimation",
+    "rent_estimation", "rent_estimation_custom",
     # Enrichment
     "enrichment", "is_motivated_seller", "has_price_reduction", "has_distress_signals", "last_enriched_at",
     # Change / price history (embedded)
@@ -42,6 +42,8 @@ _PRESERVE_ON_RECSCRAPE = frozenset([
     # CRM / frontend / GHL
     "comps", "crm_status", "ghl_final_update_sent", "is_favorite",
     "margin_percent", "renovation_cost_per_sqft", "renovation_enabled",
+    # ARV Calculation
+    "arv",
     "updatedAt",
 ])
 
@@ -538,6 +540,15 @@ class Database:
                         update_fields["scheduled_job_id"] = property_data.scheduled_job_id
                     if property_data.last_scraped:
                         update_fields["last_scraped"] = property_data.last_scraped
+                    
+                    # When content is unchanged but new scrape has last_sold data and existing doesn't,
+                    # backfill so ARV and UI have it (Realtor may add sold history after first scrape)
+                    existing_fin = existing_property.get("financial") or {}
+                    existing_dates = existing_property.get("dates") or {}
+                    if property_data.financial and property_data.financial.last_sold_price is not None and existing_fin.get("last_sold_price") is None:
+                        update_fields["financial.last_sold_price"] = property_data.financial.last_sold_price
+                    if property_data.dates and property_data.dates.last_sold_date is not None and existing_dates.get("last_sold_date") is None:
+                        update_fields["dates.last_sold_date"] = property_data.dates.last_sold_date
                     
                     # FIXED: Check both scraped data AND existing nested data in database
                     # This handles cases where existing property has nested data but scraped data doesn't include it
