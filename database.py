@@ -2,6 +2,7 @@ import motor.motor_asyncio
 from pymongo import ASCENDING, DESCENDING
 from pymongo.operations import InsertOne, UpdateOne, ReplaceOne
 from pymongo.errors import BulkWriteError
+from bson import ObjectId
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 import asyncio
@@ -46,6 +47,18 @@ _PRESERVE_ON_RECSCRAPE = frozenset([
     "arv",
     "updatedAt",
 ])
+
+
+def _normalize_bson_for_pydantic(value: Any) -> Any:
+    """Recursively convert BSON types (e.g. ObjectId) to JSON-serializable types for Pydantic.
+    Prevents validation errors when building Property from MongoDB documents."""
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _normalize_bson_for_pydantic(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_bson_for_pydantic(v) for v in value]
+    return value
 
 
 def _merge_preserved_fields_on_rescrape(existing: dict, target: dict) -> None:
@@ -891,10 +904,15 @@ class Database:
 
             # Merge updates onto existing document for hash recalculation
             merged = {**existing_property, **update_fields}
+            # Normalize BSON types (ObjectId -> str) so Pydantic validation succeeds
+            merged = _normalize_bson_for_pydantic(merged)
 
             # Filter to Property model fields for hash generation
             model_fields = set(Property.model_fields.keys())
             prop_payload = {k: merged.get(k) for k in model_fields if k in merged}
+            # MongoDB uses _id; Property model uses id (alias _id)
+            if "_id" in merged and "id" not in prop_payload:
+                prop_payload["id"] = merged["_id"]
 
             prop_model = Property(**prop_payload)
             new_hash = prop_model.generate_content_hash()
@@ -1502,7 +1520,8 @@ class Database:
             
             if property_data:
                 print(f"[DEBUG] Found property: {property_data.get('property_id')}")
-                property_data["_id"] = str(property_data["_id"])
+                property_data = _normalize_bson_for_pydantic(property_data)
+                property_data["_id"] = str(property_data.get("_id", ""))
                 return Property(**property_data)
             else:
                 print(f"[DEBUG] Property not found: {property_id}")
@@ -1544,7 +1563,8 @@ class Database:
                 properties = []
                 
                 async for prop_data in cursor:
-                    prop_data["_id"] = str(prop_data["_id"])
+                    prop_data = _normalize_bson_for_pydantic(prop_data)
+                    prop_data["_id"] = str(prop_data.get("_id", ""))
                     properties.append(Property(**prop_data))
                 
                 print(f"[DB DEBUG] Query {i+1} returned {len(properties)} properties")
@@ -1566,7 +1586,8 @@ class Database:
             
             properties = []
             async for prop_data in cursor:
-                prop_data["_id"] = str(prop_data["_id"])
+                prop_data = _normalize_bson_for_pydantic(prop_data)
+                prop_data["_id"] = str(prop_data.get("_id", ""))
                 properties.append(Property(**prop_data))
             
             return properties
@@ -1592,16 +1613,8 @@ class Database:
             
             properties = []
             async for prop_data in cursor:
-                prop_data["_id"] = str(prop_data["_id"])
-                # Convert ObjectId fields to strings
-                if "agent_id" in prop_data and prop_data["agent_id"]:
-                    prop_data["agent_id"] = str(prop_data["agent_id"])
-                if "broker_id" in prop_data and prop_data["broker_id"]:
-                    prop_data["broker_id"] = str(prop_data["broker_id"])
-                if "office_id" in prop_data and prop_data["office_id"]:
-                    prop_data["office_id"] = str(prop_data["office_id"])
-                if "builder_id" in prop_data and prop_data["builder_id"]:
-                    prop_data["builder_id"] = str(prop_data["builder_id"])
+                prop_data = _normalize_bson_for_pydantic(prop_data)
+                prop_data["_id"] = str(prop_data.get("_id", ""))
                 properties.append(Property(**prop_data))
             
             return properties
