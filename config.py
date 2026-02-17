@@ -39,8 +39,9 @@ class Settings:
     API_PORT = int(os.getenv("PORT", "8000"))  # Use Railway's PORT variable
     
     # Scraping Configuration - Default values
-    MAX_CONCURRENT_JOBS = int(get_required_env("MAX_CONCURRENT_JOBS", "3"))
-    THREAD_POOL_WORKERS = int(get_required_env("THREAD_POOL_WORKERS", "2"))
+    # Keep concurrency low to avoid "can't start new thread" (HomeHarvest/Playwright spawn many threads per request)
+    MAX_CONCURRENT_JOBS = int(get_required_env("MAX_CONCURRENT_JOBS", "2"))
+    THREAD_POOL_WORKERS = int(get_required_env("THREAD_POOL_WORKERS", "1"))
     REQUEST_DELAY = float(get_required_env("REQUEST_DELAY", "1.0"))
     MAX_RETRIES = int(get_required_env("MAX_RETRIES", "3"))
     # Location timeout: if a location hasn't added/updated properties in this many minutes, mark it as failed
@@ -62,13 +63,13 @@ class Settings:
     # Logging Configuration - Default values
     LOG_LEVEL = get_required_env("LOG_LEVEL", "INFO")
     
-    # Enrichment Configuration - Default values
-    ENRICHMENT_WORKERS = int(get_required_env("ENRICHMENT_WORKERS", "3"))  # Number of parallel enrichment threads
+    # Enrichment Configuration - Default values (kept moderate to avoid thread exhaustion)
+    ENRICHMENT_WORKERS = int(get_required_env("ENRICHMENT_WORKERS", "2"))  # Number of parallel enrichment threads
     _enrichment_batch_size = os.getenv("ENRICHMENT_BATCH_SIZE")
     ENRICHMENT_BATCH_SIZE = int(_enrichment_batch_size) if _enrichment_batch_size else None  # None = process all properties from location
     
-    # RentCast Configuration - Default values
-    RENTCAST_WORKERS = int(get_required_env("RENTCAST_WORKERS", "2"))  # Number of parallel RentCast workers (kept low to prioritize HomeHarvest)
+    # RentCast Configuration - Default values (kept low to avoid thread/browser exhaustion)
+    RENTCAST_WORKERS = int(get_required_env("RENTCAST_WORKERS", "1"))  # Number of parallel RentCast workers (kept low to prioritize HomeHarvest)
     RENTCAST_API_TIMEOUT = int(get_required_env("RENTCAST_API_TIMEOUT", "30"))  # Timeout for direct API calls (seconds)
     RENTCAST_USE_PLAYWRIGHT_FALLBACK = os.getenv("RENTCAST_USE_PLAYWRIGHT_FALLBACK", "true").lower() in ("true", "1", "yes", "on")  # Use Playwright if API fails
     RENTCAST_API_RETRIES = int(get_required_env("RENTCAST_API_RETRIES", "2"))  # Number of retries for direct API before falling back
