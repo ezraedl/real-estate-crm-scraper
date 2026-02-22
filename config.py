@@ -73,6 +73,8 @@ class Settings:
     RENTCAST_API_TIMEOUT = int(get_required_env("RENTCAST_API_TIMEOUT", "30"))  # Timeout for direct API calls (seconds)
     RENTCAST_USE_PLAYWRIGHT_FALLBACK = os.getenv("RENTCAST_USE_PLAYWRIGHT_FALLBACK", "true").lower() in ("true", "1", "yes", "on")  # Use Playwright if API fails
     RENTCAST_API_RETRIES = int(get_required_env("RENTCAST_API_RETRIES", "2"))  # Number of retries for direct API before falling back
+    RENTCAST_429_BACKOFF_SECONDS = int(get_required_env("RENTCAST_429_BACKOFF_SECONDS", "60"))  # Sleep before retry when rate limited
+    RENTCAST_403_BACKOFF_SECONDS = int(get_required_env("RENTCAST_403_BACKOFF_SECONDS", "5"))   # Sleep before retry when forbidden (new proxy)
     
     # Additional Configuration - Default values
     PORT = int(get_required_env("PORT", "8000"))

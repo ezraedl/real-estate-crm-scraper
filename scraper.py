@@ -291,34 +291,39 @@ class MLSScraper:
         queue = self._get_rentcast_retry_queue(job_id)
         if queue is None:
             return
-        # Best-effort: keep this lightweight and yield to HomeHarvest if it resumes.
-        while not queue.empty():
-            if await self._is_homeharvest_busy():
-                await asyncio.sleep(2)
-                continue
-            try:
-                await asyncio.wait_for(self.rentcast_semaphore.acquire(), timeout=0.5)
-            except asyncio.TimeoutError:
-                await asyncio.sleep(1)
-                continue
-            try:
-                item = await queue.get()
-            except Exception:
-                self.rentcast_semaphore.release()
-                continue
-            try:
-                from services.rentcast_service import RentcastService
-                if not hasattr(self, "_rentcast_service"):
-                    self._rentcast_service = RentcastService(db)
-                await self._rentcast_service.fetch_and_save_rent_estimate(
-                    item["property_id"],
-                    item["property_dict"],
-                )
-            except Exception as e:
-                logger.warning(f"Rentcast retry failed for {item.get('property_id')}: {e}")
-            finally:
-                self.rentcast_semaphore.release()
-                queue.task_done()
+        try:
+            # Best-effort: keep this lightweight and yield to HomeHarvest if it resumes.
+            while not queue.empty():
+                if await self._is_homeharvest_busy():
+                    await asyncio.sleep(2)
+                    continue
+                try:
+                    await asyncio.wait_for(self.rentcast_semaphore.acquire(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    item = await queue.get()
+                except Exception:
+                    self.rentcast_semaphore.release()
+                    continue
+                try:
+                    from services.rentcast_service import RentcastService
+                    if not hasattr(self, "_rentcast_service"):
+                        self._rentcast_service = RentcastService(db)
+                    await self._rentcast_service.fetch_and_save_rent_estimate(
+                        item["property_id"],
+                        item["property_dict"],
+                    )
+                except Exception as e:
+                    logger.warning(f"Rentcast retry failed for {item.get('property_id')}: {e}")
+                finally:
+                    self.rentcast_semaphore.release()
+                    queue.task_done()
+        finally:
+            # Always clean up so retry state does not grow unbounded (fixes "stops after a while" until restart)
+            self._rentcast_retry_queues.pop(job_id, None)
+            self._rentcast_retry_tasks.pop(job_id, None)
 
     async def process_job(self, job: ScrapingJob):
         """Process a single scraping job"""
@@ -1066,12 +1071,16 @@ class MLSScraper:
                     # Job doesn't exist, nothing to do
                     if job.job_id in self.current_jobs:
                         del self.current_jobs[job.job_id]
+                        self._rentcast_retry_queues.pop(job.job_id, None)
+                        self._rentcast_retry_tasks.pop(job.job_id, None)
                 elif current_job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
                     # If status is already final, just remove from current_jobs
                     if job.job_id in self.current_jobs:
                         del self.current_jobs[job.job_id]
-                        # Clean up job run flags
+                        # Clean up job run flags and Rentcast retry state
                         self.job_run_flags.pop(job.job_id, None)
+                        self._rentcast_retry_queues.pop(job.job_id, None)
+                        self._rentcast_retry_tasks.pop(job.job_id, None)
                         status_str = current_job.status.value if hasattr(current_job.status, 'value') else str(current_job.status)
                         logger.debug(f"Removed job {job.job_id} from current_jobs (status: {status_str})")
                 elif cancel_flag.get("cancelled", False):
