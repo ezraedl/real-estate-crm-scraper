@@ -254,8 +254,9 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
     Try GET https://app.rentcast.io/api/getRentData?{params} with proxy and browser-like headers.
     Uses curl_cffi (TLS fingerprinting) if available, else httpx. Returns the same shape as
     _extract_from_getrentdata_response (rent, rent_range_low, rent_range_high, comparables,
-    subject_property) or None.
+    subject_property) or None. On 429/403 retries once after backoff (avoids "stops after a while" until restart).
     """
+    from config import settings
     params = _build_rentcast_params(property_dict)
     if not params:
         return None
@@ -305,8 +306,18 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                 logger.debug("Rentcast: API returned 200 but JSON parse failed: %s", json_err)
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking) for %s", params.get("address", "")[:50])
+            if retry_count == 0:
+                backoff = getattr(settings, "RENTCAST_403_BACKOFF_SECONDS", 5)
+                logger.info("Rentcast: 403 forbidden, backing off %ds then retrying once with new proxy", backoff)
+                await asyncio.sleep(backoff)
+                return await _fetch_getrentdata_direct(property_dict, timeout=timeout, retry_count=1)
         elif r.status_code == 429:
             logger.warning("Rentcast: API returned 429 Too Many Requests (rate limited) for %s", params.get("address", "")[:50])
+            if retry_count == 0:
+                backoff = getattr(settings, "RENTCAST_429_BACKOFF_SECONDS", 60)
+                logger.info("Rentcast: 429 rate limited, backing off %ds then retrying once with new proxy", backoff)
+                await asyncio.sleep(backoff)
+                return await _fetch_getrentdata_direct(property_dict, timeout=timeout, retry_count=1)
         else:
             logger.debug("Rentcast: API returned status %d (curl_cffi) for %s", r.status_code, params.get("address", "")[:50])
     except ImportError:
@@ -340,8 +351,18 @@ async def _fetch_getrentdata_direct(property_dict: dict, timeout: int = 30, retr
                 logger.debug("Rentcast: API returned 200 but JSON parse failed (httpx): %s", json_err)
         elif r.status_code == 403:
             logger.warning("Rentcast: API returned 403 Forbidden (anti-bot blocking, httpx) for %s", params.get("address", "")[:50])
+            if retry_count == 0:
+                backoff = getattr(settings, "RENTCAST_403_BACKOFF_SECONDS", 5)
+                logger.info("Rentcast: 403 forbidden, backing off %ds then retrying once with new proxy", backoff)
+                await asyncio.sleep(backoff)
+                return await _fetch_getrentdata_direct(property_dict, timeout=timeout, retry_count=1)
         elif r.status_code == 429:
             logger.warning("Rentcast: API returned 429 Too Many Requests (rate limited, httpx) for %s", params.get("address", "")[:50])
+            if retry_count == 0:
+                backoff = getattr(settings, "RENTCAST_429_BACKOFF_SECONDS", 60)
+                logger.info("Rentcast: 429 rate limited, backing off %ds then retrying once with new proxy", backoff)
+                await asyncio.sleep(backoff)
+                return await _fetch_getrentdata_direct(property_dict, timeout=timeout, retry_count=1)
         else:
             logger.debug("Rentcast: API returned status %d (httpx) for %s", r.status_code, params.get("address", "")[:50])
     except Exception as e:
