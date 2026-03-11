@@ -39,8 +39,9 @@ class Settings:
     API_PORT = int(os.getenv("PORT", "8000"))  # Use Railway's PORT variable
     
     # Scraping Configuration - Default values
-    # Keep concurrency low to avoid "can't start new thread" (HomeHarvest/Playwright spawn many threads per request)
-    MAX_CONCURRENT_JOBS = int(get_required_env("MAX_CONCURRENT_JOBS", "2"))
+    # Keep concurrency low to avoid "can't start new thread" / OOM (HomeHarvest/curl_cffi spawn many threads per request)
+    # Use MAX_CONCURRENT_JOBS=1 and THREAD_POOL_WORKERS=1 in memory-limited environments (e.g. Railway).
+    MAX_CONCURRENT_JOBS = int(get_required_env("MAX_CONCURRENT_JOBS", "1"))
     THREAD_POOL_WORKERS = int(get_required_env("THREAD_POOL_WORKERS", "1"))
     REQUEST_DELAY = float(get_required_env("REQUEST_DELAY", "1.0"))
     MAX_RETRIES = int(get_required_env("MAX_RETRIES", "3"))
@@ -63,8 +64,8 @@ class Settings:
     # Logging Configuration - Default values
     LOG_LEVEL = get_required_env("LOG_LEVEL", "INFO")
     
-    # Enrichment Configuration - Default values (kept moderate to avoid thread exhaustion)
-    ENRICHMENT_WORKERS = int(get_required_env("ENRICHMENT_WORKERS", "2"))  # Number of parallel enrichment threads
+    # Enrichment Configuration - Default values (kept low to avoid thread exhaustion / OOM)
+    ENRICHMENT_WORKERS = int(get_required_env("ENRICHMENT_WORKERS", "1"))  # Number of parallel enrichment tasks
     _enrichment_batch_size = os.getenv("ENRICHMENT_BATCH_SIZE")
     ENRICHMENT_BATCH_SIZE = int(_enrichment_batch_size) if _enrichment_batch_size else None  # None = process all properties from location
     

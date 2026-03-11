@@ -29,6 +29,13 @@ def _is_realtor_block_exception(exc: Exception) -> bool:
         return True
     return False
 
+
+def _is_thread_exhaustion(exc: Exception) -> bool:
+    """True if the exception indicates the process cannot create more threads (OOM / resource exhaustion)."""
+    if isinstance(exc, RuntimeError) and "can't start new thread" in str(exc).lower():
+        return True
+    return False
+
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -2230,6 +2237,11 @@ class MLSScraper:
                     error_msg = f"HomeHarvest/Realtor error for all listing types in {location}: {str(e)}"
                     error_type = type(e).__name__
                     logger.error(f"   [HOMEHARVEST ERROR] {error_msg} (Type: {error_type})")
+                    if _is_thread_exhaustion(e):
+                        logger.warning(
+                            "   [RESOURCE] Thread exhaustion detected (can't start new thread). "
+                            "Set MAX_CONCURRENT_JOBS=1 and THREAD_POOL_WORKERS=1 to reduce memory/thread usage."
+                        )
                     try:
                         import traceback as tb
                         logger.debug(f"   [HOMEHARVEST ERROR] Full traceback: {tb.format_exc()}")
@@ -2319,7 +2331,14 @@ class MLSScraper:
                     except Exception as e:
                         error_type = type(e).__name__
                         blocked_by_realtor = _is_realtor_block_exception(e)
+                        thread_exhaustion = _is_thread_exhaustion(e)
                         logger.error(f"   [FALLBACK] Error in individual call for '{listing_type}': {e} (Type: {error_type}, Blocked: {blocked_by_realtor})")
+                        if thread_exhaustion:
+                            logger.warning(
+                                "   [RESOURCE] Thread exhaustion in fallback. Stopping fallback for this location. "
+                                "Set MAX_CONCURRENT_JOBS=1 and THREAD_POOL_WORKERS=1 to avoid OOM."
+                            )
+                            break  # Don't retry more listing types; we're out of threads
                         try:
                             import traceback as tb
                             logger.debug(f"   [FALLBACK] Full traceback: {tb.format_exc()}")
